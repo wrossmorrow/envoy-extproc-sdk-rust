@@ -1,0 +1,32 @@
+[package]
+name = "extproc"
+version = "0.1.0"
+edition = "2021"
+description = "Envoy External Processor SDK for Rust (gRPC, tokio/tonic)"
+license = "MIT"
+repository = "https://github.com/wrossmorrow/envoy-extproc-sdk-go"
+readme = "README.md"
+keywords = ["envoy", "grpc", "proxy", "ext_proc", "external-processor"]
+categories = ["network-programming", "web-programming"]
+
+[lib]
+name = "extproc"
+path = "src/lib.rs"
+
+[dependencies]
+envoy-types = "0.7.7"
+tonic = { version = "0.14", features = ["server", "transport", "codegen"] }
+tonic-prost = "0.14"
+tonic-health = "0.14"
+tokio = { version = "1", features = ["full"] }
+prometheus = "0.14"
+axum = "0.8"
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
