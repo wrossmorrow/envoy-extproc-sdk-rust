@@ -124,7 +124,7 @@ mod tests {
             .iter()
             .map(|(k, v)| EnvoyHeaderValue {
                 key: k.to_string(),
-                value: v.to_string(),
+                value: String::new(),
                 raw_value: v.as_bytes().to_vec(),
             })
             .collect();
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(h.get("X-FOO").as_deref(), Some("bar"));
         assert_eq!(h.values("x-foo"), vec!["bar".to_string()]);
         assert_eq!(h.raw_values("x-foo"), vec![b"bar".to_vec()]);
-        assert_eq!(h.split_list("x-foo"), Vec::<String>::new());
+        assert_eq!(h.split_list("x-foo"), vec!["bar".to_string()]);
         assert!(!h.has("x-nope"));
     }
 

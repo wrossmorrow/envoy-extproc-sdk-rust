@@ -72,7 +72,7 @@ pub struct HeaderValue {
 impl HeaderValue {
     /// A header value may set either `value` or `raw_value`, but not both.
     pub fn is_valid(&self) -> bool {
-        !(self.value.is_empty() == false && self.raw_value.is_some())
+        !(!self.value.is_empty() && self.raw_value.is_some())
     }
 
     /// Convert to the envoy [`HeaderValue`] wire format, using `raw_value`.
@@ -647,6 +647,12 @@ impl RequestContext {
     }
 }
 
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,7 +749,11 @@ mod tests {
         };
         assert!(!hv.is_valid());
 
-        let opt = hv
+        let valid = HeaderValue {
+            value: "hello".to_string(),
+            raw_value: None,
+        };
+        let opt = valid
             .to_envoy_header_value_option("x-foo", "ADD_IF_ABSENT")
             .unwrap();
         assert_eq!(opt.append_action, 1);
@@ -752,8 +762,8 @@ mod tests {
             .to_envoy_header_value_option("x-foo", "NOT_A_REAL_ACTION")
             .is_err());
         let bad = HeaderValue {
-            value: String::new(),
-            raw_value: None,
+            value: "both".to_string(),
+            raw_value: Some(b"raw".to_vec()),
         };
         assert!(bad
             .to_envoy_header_value_option("x-foo", "ADD_IF_ABSENT")
@@ -777,14 +787,16 @@ mod tests {
 
     #[test]
     fn test_phase_response_reset() {
-        let mut pr = PhaseResponse::default();
-        pr.header_mutation = Some(HeaderMutation {
-            set_headers: vec![],
-            remove_headers: vec![],
-        });
-        pr.immediate_response = None;
-        pr.continue_request = None;
-        pr.clear_route_cache = true;
+        let mut pr = PhaseResponse {
+            header_mutation: Some(HeaderMutation {
+                set_headers: vec![],
+                remove_headers: vec![],
+            }),
+            body_mutation: None,
+            immediate_response: None,
+            continue_request: None,
+            clear_route_cache: true,
+        };
         pr.reset();
         assert!(pr.header_mutation.is_some());
         assert!(pr.continue_request.is_none());
@@ -937,6 +949,10 @@ mod tests {
     #[test]
     fn test_body_mutations() {
         let mut rc = RequestContext::new();
+        rc.response.header_mutation = Some(HeaderMutation {
+            set_headers: Vec::new(),
+            remove_headers: Vec::new(),
+        });
         rc.replace_body_chunk(b"abc").unwrap();
         assert!(rc.response.body_mutation.is_some());
         rc.replace_body(b"abcdef").unwrap();

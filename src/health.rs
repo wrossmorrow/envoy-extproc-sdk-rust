@@ -42,6 +42,12 @@ pub struct HealthServer {
     status: HealthStatus,
 }
 
+impl Default for HealthServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HealthServer {
     /// Create a health server reporting `NotServing`.
     pub fn new() -> Self {

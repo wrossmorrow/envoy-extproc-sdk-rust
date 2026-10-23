@@ -9,19 +9,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ServerOptions {
     /// Port the ext_proc gRPC server listens on.
-    #[serde(rename = "extproc_port")]
+    #[serde(rename = "extproc_port", default)]
     pub ext_proc_port: u16,
     /// Port the Prometheus metrics HTTP server listens on.
-    #[serde(rename = "metrics_http_port")]
+    #[serde(rename = "metrics_http_port", default)]
     pub metrics_http_port: u16,
     /// Maximum number of concurrent gRPC streams.
-    #[serde(rename = "max_concurrent_streams")]
+    #[serde(rename = "max_concurrent_streams", default)]
     pub max_concurrent_streams: u32,
     /// Seconds to wait for unready propagation after shutdown begins.
-    #[serde(rename = "unready_propagation_delay_seconds")]
+    #[serde(rename = "unready_propagation_delay_seconds", default)]
     pub unready_propagation_delay_seconds: u32,
     /// Seconds to wait for graceful shutdown before forcing stop.
-    #[serde(rename = "termination_grace_period_seconds")]
+    #[serde(rename = "termination_grace_period_seconds", default)]
     pub termination_grace_period_seconds: i32,
 }
 
@@ -57,13 +57,13 @@ impl ServerOptions {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProcessingOptions {
     /// Whether to append an `x-extproc-names` header to responses.
-    #[serde(rename = "UpdateExtProcHeader")]
+    #[serde(rename = "UpdateExtProcHeader", default)]
     pub update_ext_proc_header: bool,
     /// Whether to append an `x-extproc-duration-ns` header to responses.
-    #[serde(rename = "UpdateDurationHeader")]
+    #[serde(rename = "UpdateDurationHeader", default)]
     pub update_duration_header: bool,
     /// Whether to abort the stream when the processor fails.
-    #[serde(rename = "AbortOnProcessorFailure")]
+    #[serde(rename = "AbortOnProcessorFailure", default)]
     pub abort_on_processor_failure: bool,
 }
 
