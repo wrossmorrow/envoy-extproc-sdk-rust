@@ -149,7 +149,11 @@ impl GenericExtProcServer {
                 Some(ProcessingRequestOneof::RequestHeaders(h)) => {
                     *phase = REQUEST_PHASE_REQUEST_HEADERS;
                     metrics.total_request_headers.inc();
-                    init_req_ctx(rc, h)?;
+                    let init = init_req_ctx(rc, h);
+                    if let Err(e) = init {
+                        self.processor.error_handler(rc, *phase, e);
+                        return Err("request context initialization failed".into());
+                    }
                     rc.end_of_stream = h.end_of_stream;
                     rc.set_phase(*phase);
                     let headers = rc.all_headers.clone();
@@ -167,25 +171,37 @@ impl GenericExtProcServer {
                     *phase = REQUEST_PHASE_REQUEST_TRAILERS;
                     rc.set_phase(*phase);
                     metrics.total_request_trailers.inc();
-                    let trailers = gen_headers(
+                    let trailers = match gen_headers(
                         t.trailers
                             .as_ref()
                             .ok_or_else(|| "missing trailers".to_string())?,
-                    )?;
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.processor.error_handler(rc, *phase, e);
+                            return Err("failed to generate request trailers".into());
+                        }
+                    };
                     self.processor.process_request_trailers(rc, &trailers)?;
                 }
                 Some(ProcessingRequestOneof::ResponseHeaders(h)) => {
                     *phase = REQUEST_PHASE_RESPONSE_HEADERS;
                     rc.set_phase(*phase);
                     metrics.total_response_headers.inc();
-                    let headers = gen_headers(
+                    let headers = match gen_headers(
                         h.headers
                             .as_ref()
                             .ok_or_else(|| "missing headers".to_string())?,
-                    )?;
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.processor.error_handler(rc, *phase, e);
+                            return Err("failed to generate response headers".into());
+                        }
+                    };
                     rc.end_of_stream = h.end_of_stream;
                     self.processor.process_response_headers(rc, &headers)?;
-                    if options.as_ref().map_or(false, |o| o.update_ext_proc_header) {
+                    if options.as_ref().is_some_and(|o| o.update_ext_proc_header) {
                         rc.append_header(
                             "x-extproc-names",
                             &HeaderValue {
@@ -195,7 +211,7 @@ impl GenericExtProcServer {
                         )?;
                     }
                     if rc.end_of_stream
-                        && options.as_ref().map_or(false, |o| o.update_duration_header)
+                        && options.as_ref().is_some_and(|o| o.update_duration_header)
                     {
                         rc.append_header(
                             "x-extproc-duration-ns",
@@ -214,7 +230,7 @@ impl GenericExtProcServer {
                     rc.end_of_stream = b.end_of_stream;
                     self.processor.process_response_body(rc, &b.body)?;
                     if rc.end_of_stream
-                        && options.as_ref().map_or(false, |o| o.update_duration_header)
+                        && options.as_ref().is_some_and(|o| o.update_duration_header)
                     {
                         rc.append_header(
                             "x-extproc-duration-ns",
@@ -229,11 +245,17 @@ impl GenericExtProcServer {
                     *phase = REQUEST_PHASE_RESPONSE_TRAILERS;
                     rc.set_phase(*phase);
                     metrics.total_response_trailers.inc();
-                    let trailers = gen_headers(
+                    let trailers = match gen_headers(
                         t.trailers
                             .as_ref()
                             .ok_or_else(|| "missing trailers".to_string())?,
-                    )?;
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.processor.error_handler(rc, *phase, e);
+                            return Err("failed to generate response trailers".into());
+                        }
+                    };
                     self.processor.process_response_trailers(rc, &trailers)?;
                 }
                 None => {
@@ -245,6 +267,10 @@ impl GenericExtProcServer {
             let response = rc.get_response(*phase)?;
             Ok((response, *phase))
         })();
+
+        if outcome.is_err() {
+            metrics.phase_errors.inc_by(1.0);
+        }
 
         outcome
     }
@@ -432,5 +458,532 @@ impl ExternalProcessor for GenericExtProcServer {
             incoming,
             pending: None,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use crate::metrics::Metrics;
+    use crate::options::{ProcessingOptions, ServerOptions};
+    use envoy_types::pb::envoy::service::ext_proc::v3::processing_request::Request as ProcessingRequestOneof;
+    use envoy_types::pb::envoy::service::ext_proc::v3::processing_response::Response as ResponseOneof;
+    use envoy_types::pb::envoy::service::ext_proc::v3::HttpBody;
+    use envoy_types::pb::envoy::service::ext_proc::v3::HttpHeaders;
+    use envoy_types::pb::envoy::service::ext_proc::v3::HttpTrailers;
+    use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest;
+
+    use envoy_types::pb::envoy::config::core::v3::HeaderMap as EnvoyHeaderMap;
+    use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
+
+    use prometheus::Registry;
+
+    use crate::context::{default_phase_if_invalid, request_phase_to_string, RequestContext};
+    use crate::headers::AllHeaders;
+
+    fn processing_request(request: Option<ProcessingRequestOneof>) -> ProcessingRequest {
+        ProcessingRequest {
+            metadata_context: None,
+            attributes: HashMap::new(),
+            observability_mode: false,
+            protocol_config: None,
+            flow_control_init: None,
+            client_window_update: None,
+            request,
+        }
+    }
+
+    fn http_headers(headers: Option<&EnvoyHeaderMap>, end_of_stream: bool) -> HttpHeaders {
+        HttpHeaders {
+            headers: headers.cloned(),
+            attributes: HashMap::new(),
+            end_of_stream,
+        }
+    }
+
+    fn envoy_header_map(pairs: &[(&str, &str)]) -> EnvoyHeaderMap {
+        EnvoyHeaderMap {
+            headers: pairs
+                .iter()
+                .map(|(k, v)| EnvoyHeaderValue {
+                    key: k.to_string(),
+                    value: String::new(),
+                    raw_value: v.as_bytes().to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestProcessor {
+        name: String,
+        opts: Option<ProcessingOptions>,
+        phases: Arc<Mutex<Vec<u32>>>,
+        bodies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        errors: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl TestProcessor {
+        fn new(name: &str, opts: Option<ProcessingOptions>) -> Self {
+            Self {
+                name: name.to_string(),
+                opts,
+                phases: Arc::new(Mutex::new(Vec::new())),
+                bodies: Arc::new(Mutex::new(HashMap::new())),
+                errors: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded_phases(&self) -> Vec<u32> {
+            self.phases.lock().unwrap().clone()
+        }
+
+        fn recorded_bodies(&self) -> HashMap<String, Vec<u8>> {
+            self.bodies.lock().unwrap().clone()
+        }
+
+        fn recorded_errors(&self) -> Vec<u32> {
+            self.errors.lock().unwrap().clone()
+        }
+    }
+
+    impl RequestProcessor for TestProcessor {
+        fn get_name(&self) -> String {
+            self.name.clone()
+        }
+        fn get_options(&self) -> &ProcessingOptions {
+            self.opts.as_ref().unwrap()
+        }
+        fn process_request_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(REQUEST_PHASE_REQUEST_HEADERS);
+            ctx.continue_request()
+        }
+        fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(REQUEST_PHASE_REQUEST_TRAILERS);
+            ctx.continue_request()
+        }
+        fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+            self.phases.lock().unwrap().push(REQUEST_PHASE_REQUEST_BODY);
+            self.bodies
+                .lock()
+                .unwrap()
+                .insert("request".to_string(), body.to_vec());
+            ctx.continue_request()
+        }
+        fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(REQUEST_PHASE_RESPONSE_HEADERS);
+            ctx.continue_request()
+        }
+        fn process_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            body: &[u8],
+        ) -> Result<(), Error> {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(REQUEST_PHASE_RESPONSE_BODY);
+            self.bodies
+                .lock()
+                .unwrap()
+                .insert("response".to_string(), body.to_vec());
+            ctx.continue_request()
+        }
+        fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(REQUEST_PHASE_RESPONSE_TRAILERS);
+            ctx.continue_request()
+        }
+        fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, _err: Error) {
+            self.errors.lock().unwrap().push(phase);
+        }
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct ErroringProcessor {
+        opts: ProcessingOptions,
+    }
+
+    impl RequestProcessor for ErroringProcessor {
+        fn get_name(&self) -> String {
+            "test".to_string()
+        }
+        fn get_options(&self) -> &ProcessingOptions {
+            &self.opts
+        }
+        fn process_request_headers(
+            &self,
+            _ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            Err("processor exploded".into())
+        }
+        fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        fn process_response_body(
+            &self,
+            _ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            Err("processor exploded".into())
+        }
+        fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        fn error_handler(&self, _ctx: &mut RequestContext, _phase: u32, _err: Error) {}
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_rejects_nil_processor() {
+        let err = serve(ServerOptions::new(), None).await.unwrap_err();
+        assert_eq!(err.to_string(), "processor is nil");
+    }
+
+    #[test]
+    fn test_process_phase_request_headers() {
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "POST")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::RequestHeaders(_))
+        ));
+        assert_eq!(rc.method, "POST");
+        assert!(!rc.end_of_stream);
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+        assert_eq!(proc.recorded_phases(), vec![REQUEST_PHASE_REQUEST_HEADERS]);
+    }
+
+    #[test]
+    fn test_process_phase_request_body() {
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestBody(HttpBody {
+            body: b"{\"hello\":\"world\"}".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_BODY);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::RequestBody(_))
+        ));
+        assert!(rc.end_of_stream);
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_BODY);
+        assert_eq!(
+            proc.recorded_bodies().get("request").unwrap(),
+            &b"{\"hello\":\"world\"}".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_process_phase_response_headers_updates_context() {
+        let options = ProcessingOptions {
+            update_ext_proc_header: true,
+            update_duration_header: true,
+            abort_on_processor_failure: false,
+        };
+        let proc = Arc::new(TestProcessor::new("myproc", Some(options.clone())));
+        let server = GenericExtProcServer::new(
+            "myproc".to_string(),
+            proc.clone(),
+            Some(options),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.duration = std::time::Duration::from_secs(5);
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseHeaders(http_headers(
+            Some(&envoy_header_map(&[("x-foo", "bar")])),
+            true,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::ResponseHeaders(_))
+        ));
+        assert!(rc.end_of_stream);
+
+        let mutation = rc.response.header_mutation.as_ref().unwrap();
+        assert_eq!(mutation.set_headers.len(), 2);
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-extproc-names"
+        );
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().raw_value,
+            b"myproc".to_vec()
+        );
+        assert_eq!(
+            mutation.set_headers[1].header.as_ref().unwrap().key,
+            "x-extproc-duration-ns"
+        );
+        let dur_str =
+            String::from_utf8_lossy(&mutation.set_headers[1].header.as_ref().unwrap().raw_value)
+                .to_string();
+        let dur = dur_str.parse::<i64>().unwrap();
+        assert!(dur > 0);
+    }
+
+    #[test]
+    fn test_process_phase_response_body_does_not_add_extproc_name() {
+        let options = ProcessingOptions {
+            update_ext_proc_header: true,
+            update_duration_header: true,
+            abort_on_processor_failure: false,
+        };
+        let proc = Arc::new(TestProcessor::new("myproc", Some(options.clone())));
+        let server = GenericExtProcServer::new(
+            "myproc".to_string(),
+            proc.clone(),
+            Some(options),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseBody(HttpBody {
+            body: b"hello".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::ResponseBody(_))
+        ));
+        assert!(rc.end_of_stream);
+
+        let mutation = rc.response.header_mutation.as_ref().unwrap();
+        assert_eq!(mutation.set_headers.len(), 1);
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-extproc-duration-ns"
+        );
+    }
+
+    #[test]
+    fn test_process_phase_response_trailers() {
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseTrailers(
+            HttpTrailers {
+                trailers: Some(envoy_header_map(&[("x-trailer", "yes")])),
+            },
+        )));
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_TRAILERS);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::ResponseTrailers(_))
+        ));
+    }
+
+    #[test]
+    fn test_process_phase_processor_error_propagates() {
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            Arc::new(ErroringProcessor {
+                opts: ProcessingOptions::new(),
+            }),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let err = server.process_phase(&req, &mut rc).unwrap_err();
+        assert!(err.to_string().contains("processor exploded"));
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+    }
+
+    #[test]
+    fn test_process_phase_init_req_ctx_error_invokes_error_handler() {
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let bad = EnvoyHeaderValue {
+            key: "x-bad".to_string(),
+            value: "a".to_string(),
+            raw_value: b"b".to_vec(),
+        };
+        let hm = EnvoyHeaderMap { headers: vec![bad] };
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&hm),
+            false,
+        ))));
+        let err = server.process_phase(&req, &mut rc).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("request context initialization failed"));
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+        assert_eq!(proc.recorded_errors(), vec![REQUEST_PHASE_REQUEST_HEADERS]);
+    }
+
+    #[test]
+    fn test_process_phase_unknown_request_type() {
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let err = server
+            .process_phase(&processing_request(None), &mut rc)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown request type"));
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+    }
+
+    #[test]
+    fn test_process_phase_metrics_increment() {
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseBody(HttpBody {
+            body: b"abc".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert!(resp.is_some());
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_response_body_bytes_total")
+            .unwrap();
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 3.0);
+    }
+
+    #[test]
+    fn test_phase_helpers() {
+        assert_eq!(default_phase_if_invalid(42), REQUEST_PHASE_UNDETERMINED);
+        assert_eq!(
+            request_phase_to_string(REQUEST_PHASE_RESPONSE_BODY),
+            "RESPONSE_BODY"
+        );
+        assert_eq!(REQUEST_PHASE_RESPONSE_BODY, 5);
+        assert_eq!(REQUEST_PHASE_RESPONSE_TRAILERS, 6);
+        assert_eq!(REQUEST_PHASE_RESPONSE_HEADERS, 4);
     }
 }
