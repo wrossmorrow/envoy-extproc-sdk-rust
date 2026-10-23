@@ -38,13 +38,13 @@ Suggested stage breakdown (adjust as reality hits):
 - `tonic-health = "0.14"` — health service helpers:
   - `ServingStatus` at `tonic_health::ServingStatus`
   - `HealthReporter`, `HealthService`, `WatchStream` at `tonic_health::server::{...}`
-  - trait `Health` at `tonic_health::pb::grpc_health_v1::health_server::Health`
-  - messages at `tonic_health::pb::grpc_health_v1::health::{HealthCheckRequest, HealthCheckResponse, ServingStatus}`
-  (verify exact paths via compiler errors.)
+  - trait `Health` at `tonic_health::server::Health`
+  - messages at `tonic_health::pb::HealthCheckRequest/HealthCheckResponse/ServingStatus`
+  (verify exact paths via compiler errors).
 - `prometheus = "0.14"` — `Registry`, `register`, `gather`, `Counter`, `Gauge`,
   `Histogram`, `HistogramOpts`, `Encoder`, `TextEncoder`; raw proto model at
   `prometheus::proto::{MetricFamily, Metric, MetricType, ...}`.
-- `axum = "0.8"` — planned metrics HTTP server (Go uses net/http; axum can wrap it).
+- `axum = "0.8"` — metrics HTTP server (Go uses net/http; axum wraps it).
 - `serde`, `serde_json`, `serde_yaml = "0.9"`, `tracing`, `tracing-subscriber` —
   planned logger/options wiring.
 
@@ -66,74 +66,44 @@ Suggested stage breakdown (adjust as reality hits):
 - `HeaderValueOption` has fields `HeaderValue { value, raw_value }` and action
   `HeaderAppendAction`; action variants and constructor names may differ from
   the Go ones — check generated source before implementing.
-- prometheus `Histogram::observe(f64)`, `Counter::inc/inc_by`, `Gauge::set/inc/add`,
-  `HistogramOpts::new(name, help)`.
-- `prometheus::Registry::gather() -> Vec<MetricFamily>`; family name via
-  `.name()`, type via `type_` (MetricType), values via message getters
-  (`.counter.get_value()`, `.gauge.get_value()`, ...).
-- `prometheus::Encoder::encode(&self, mfs: &[MetricFamily], w: &mut W)` and
-  `TextEncoder::new().encode_to_string(&mfs)`.
 
-### Current compile-error state (known, being fixed iteratively)
+### Current state (post green gate — 2026-10-23)
 
-- `/work/repo/src/lib.rs` — re-exports and `Error` alias (`Box<dyn Error + Send + Sync>`)
-  and module declarations. Was being reconciled with the other modules.
-- `/work/repo/src/context.rs` — phase constants (u32, UNDETERMINED=0 .. 6),
-  `default_phase_if_invalid`, `request_phase_to_string`, `HeaderValue`
-  (with `is_valid`, `to_envoy_header_value`, `to_envoy_header_value_option`),
-  `PhaseResponse`, `RequestContext`. Had duplicate `Error`, missing
-  `use std::error::Error;`, stray text, `HeaderAppendAction::from_str_name`
-  signature drift, `CommonResponse.trailers` required `None` field, brace
-  syntax errors in `get_response`/`empty_continue_response` (fixed via scripted
-  replacement). `RequestContext` should NOT derive Clone.
-- `/work/repo/src/headers.rs` — `AllHeaders` (HashMap-based,
-  `headers: HashMap<String, Vec<String>>`, `raw_headers: HashMap<String, Vec<Vec<u8>>>`,
-  add/values/get/has/split_list, `gen_headers(&HeaderMap) -> Result<AllHeaders, Error>`).
-  Had an error: `return Err(format!(...).into())` missing error conversion.
-- `/work/repo/src/options.rs` — `ServerOptions` (ports u16/u32, defaults
-  50051/9090/1000/5/10), `ProcessingOptions` (bools, defaults false).
-- `/work/repo/src/metrics.rs` — full implementation written: `Metrics` with 14
-  public collector fields (`active_streams: Gauge`, `errored_streams: Counter`,
-  `phase_errors: Counter`, `total_streams: Counter`, `stream_duration_seconds:
-  Histogram`, `total_request_headers`, `total_request_body`, `total_request_trailers`,
-  `total_response_headers`, `total_response_body`, `total_response_trailers`,
-  `total_empty_responses`, `request_body_bytes`, `response_body_bytes`,
-  `response_send_errors`), `new()`, `register(&Registry) -> Result<(), Error>`,
-  `collectors() -> Vec<&dyn Collector>`. Stubbed in an earlier draft, now full.
-- `/work/repo/src/health.rs` — rewritten: `HealthStatus` enum, `HealthServer`
-  (fields `reporter: HealthReporter`, `status: HealthStatus`; `new() -> NotServing`,
-  `new_ready() -> Serving`, `with_status`, `get_status`, `mark_ready/mark_not_ready`),
-  `health_service() -> HealthService`. Trait-impl sketch used tentative paths
-  (`tonic_health::pb::grpc_health_v1::health_server::Health`, etc.) — paths to be
-  validated by the compiler. **NOT yet compiled** (module was just written).
-- `/work/repo/src/server.rs` — **rewrite in progress**. Current content has the
-  trait and struct, plus a deliberately broken placeholder
-  (`if rc == ... // placeholder`). Needs a full rewrite:
-  - `trait RequestProcessor: Send + Sync + 'static` (object-safe; methods:
-    `get_name`, `get_options`, `process_request_headers/trailers/body`,
-    `process_response_headers/body/trailers`, `error_handler`, `close`).
-  - `struct GenericExtProcServer<P: RequestProcessor>` (fields `name`, `processor: Arc<P>`,
-    `options: Option<ProcessingOptions>`, `metrics: Metrics`).
-  - `process_phase(&self, proc_req: &ProcessingRequest, processor: &dyn RequestProcessor, rc: &mut RequestContext) -> Result<(Option<ProcessingResponse>, u32), Error>`
-    — port of Go `processPhase`.
-  - `#[tonic::async_trait] impl<P: RequestProcessor> ExternalProcessor for P` with
-    `type ProcessStream = Pin<Box<dyn Stream<Item = Result<ProcessingResponse, tonic::Status>> + Send + 'static>>;`
-  - `process` handler implementing the trait, wiring phases to the right methods.
-  - `Serve`, graceful shutdown, health registration (pending).
-- **Not yet created**: `src/lib.rs` module wiring finalized, `src/options.rs` finalized,
-  `src/server.rs` finalized, tests.
+The port now compiles and the full test suite passes:
+
+- `cargo check --all-targets` ✓, `cargo fmt --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓, `cargo test` ✓ (33 tests passing).
+
+- Implemented modules: `context`, `headers`, `options`, `metrics`, `health`, `server`,
+  plus `lib.rs` re-exports and `Error` alias.
+
+- Server behavior ported from Go `processPhase`:
+  - phase dispatch via oneof arms (`RequestHeaders`, `ResponseHeaders`, `RequestBody`,
+    `ResponseBody`, `RequestTrailers`, `ResponseTrailers`).
+  - metrics incremented per phase; phase errors counted via `phase_errors`.
+  - init errors / gen-headers errors invoke the processor `error_handler` and propagate.
+  - processor errors propagate out of `process_phase`.
+
+### Remaining known gaps (draft)
+
+- Metrics HTTP endpoint wiring in `GenericExtProcServer::serve` (metrics registry +
+  axum router are set up but the router is currently dropped/unused).
+- Graceful shutdown wiring in `serve` (signal handling, `serve_with_shutdown`, close
+  notification) — partially scaffolded, not finalized.
+- Envoy `FullDuplexStreamed` body flow-control handling is marked not-implemented in
+  envoy-types (`HttpBody.drain_complete`, flow-control fields).
+- Local response streaming (`StreamedImmediateResponse`) not yet implemented.
+- `Serve`/`MustServe` wrappers and `close` wiring finalized at the time of the green gate,
+  but the end-to-end server lifecycle still needs a final review pass.
 
 ### Next steps
 
-1. Rewrite `/work/repo/src/server.rs` completely and carefully.
-2. Finish `lib.rs`, `options.rs`; make `cargo check` pass.
-3. Add missing deps to `Cargo.toml`: `tokio-stream`, maybe `prost-types`.
-4. Implement `Serve` (grpc server, health, metrics HTTP via axum, signal handling,
-   graceful stop) — likely in `server.rs` or a separate `grpc_server.rs`.
-5. Write tests replicating Go tests (context, headers, options, phase, metrics, health, server).
-6. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+1. Finalize metrics HTTP endpoint wiring and graceful shutdown in `server.rs`.
+2. Implement full-duplex streaming response handling if needed.
+3. Re-run full gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+   `cargo test`.
+4. Add the `Justfile` targets (`fmt`, `build`, `test`, …) — done.
 
-## Go test inventory (to port)
+## Go test inventory (ported so far)
 
 - context_test.go: phase constants values/names, `default_phase_if_invalid`,
   `request_phase_to_string`, HeaderValue isValid/to_envoy conversions, PhaseResponse,
