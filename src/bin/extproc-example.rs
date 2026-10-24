@@ -18,6 +18,7 @@ fn build_processor(
         "trivial" => Ok(Arc::new(processors::trivial::TrivialRequestProcessor {
             opts,
         })),
+        "timer" => Ok(Arc::new(processors::timer::TimerRequestProcessor { opts })),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
