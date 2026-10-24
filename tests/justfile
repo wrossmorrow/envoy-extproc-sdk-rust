@@ -31,8 +31,8 @@ containerize tag=image_tag *flags="":
 
 # run the test server in a container setup with envoy and an echo server
 up *flags:
-    docker compose -f tests/compose.yaml up --build {{flags}}
+    cd .. && docker compose -f tests/compose.yaml up --build {{flags}}
 
 # stop the test server setup
 down *flags:
-    docker compose -f tests/compose.yaml down {{flags}}
+    cd .. && docker compose -f tests/compose.yaml down {{flags}}
