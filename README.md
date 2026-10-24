@@ -114,7 +114,6 @@ that work together to allow processing of requests and responses.
 
 Phase processing methods are async (via the [`async_trait`](https://crates.io/crates/async-trait) crate): implementations may perform asynchronous work such as downstream HTTP calls or database lookups without blocking the stream task. Phase messages within a single request/response exchange are still processed sequentially, matching the ordered envoy ext_proc protocol flow; concurrency is available across concurrent streams.
 
-
 An ExtProc service can be run with the `must_serve` convenience function as in
 ```rust
 use std::sync::Arc;
