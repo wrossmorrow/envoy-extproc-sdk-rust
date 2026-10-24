@@ -319,3 +319,66 @@ Inspired by the Go SDK's `test/` directory (github.com/wrossmorrow/envoy-extproc
 
 - /tmp/go_sdk/*.go (re-fetched 2026-10-24) — context.go, extproc.go (RequestProcessor trait),
   headers.go, health.go, options.go, server.go, metrics.go, tests.
+
+## Session log (2026-10-24 — integration harness, port fix, envoy.yaml fix, bind logging)
+
+### Changes made this session (2026-10-24, on `test/integration-envoy-e2e`)
+
+- Added `tests/Dockerfile` (rust builder → runtime; installs
+  `github.com/grpc-ecosystem/grpc-health-probe@v0.4.39`; exposes 50051/9090; entrypoint
+  `/extproc`). Commit `aed4285`.
+- Added `tests/justfile` (build/test/containerize/up/down recipes mirroring the Go
+  `test/justfile`, image `ghcr.io/wrossmorrow/envoy-extproc-sdk-rust`). Commit
+  `1fcf550`.
+- Added `tests/compose.yaml` (envoy + upstream echo + extproc `test` service; envoy
+  waits on extproc health). Commit `1fcf550`.
+- Added `tests/envoy.yaml` (envoy static config; fixed malformed indentation in the
+  `http_protocol_options`/`http2_protocol_options` and `admin:` blocks via commit
+  `d8a5c9f`, `fix: invalid envoy.yaml, bad reconstruction not copy`). Commit `d8a5c9f`.
+- Added `tests/extproc_integration.rs` (the integration harness: spawned server via
+  `GenericExtProcServer`, tonic client, wire-format helpers, metrics fetch, 8 tests).
+- Added `src/bin/extproc-tester.rs` (tester-backed server binary used by the integration
+  tests). Commit `f385741` (switched to `ServerOptions::new()`).
+
+### Root-cause fix (2026-10-24, the big one)
+
+- **Discovery via new startup-bind logging** (`src/server.rs`: `tracing::info!` at metrics and
+  gRPC bind sites + default subscriber init in `GenericExtProcServer::serve`): the spawned
+  test server logged `port=0` for both listeners — i.e. it was binding to **ephemeral ports**
+  rather than the SDK defaults. Root cause: the test binary used
+  `ServerOptions::default()`, which (because `ServerOptions` *derives* `Default` with
+  `u16` fields defaulting to `0`) yields ports `0`/`0`; the SDK-correct constructor is
+  `ServerOptions::new()`. Fix: switched `src/bin/extproc-tester.rs` to
+  `ServerOptions::new()`. Commit `f385741`.
+
+### Harness hygiene fixes (2026-10-24)
+
+- Cleaned up orphaned `extproc-tester` server processes leaked by failed/hung integration
+  runs (now defunct; no listeners remain).
+- Added child-kill guard (`ChildGuard`) in the noop test so a failed test can't leak a
+  spawned server. Commit `dee351d`.
+
+### Current state at session end (2026-10-24)
+
+- Gate: `cargo fmt --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓,
+  `cargo test --lib` 33/33 ✓ (full `cargo test` still red on the 8 integration tests).
+- Integration tests: noop now gets **past** the gRPC stream-open and receives a response
+  (server binds `50051`/`9090`, health check would now report `SERVING`); the noop test now
+  fails at the `header_mutation.is_none()` assertion instead. Remaining integration-test
+  failures are due to the pre-existing gRPC transport issue and/or the now-resolved port bug.
+- `tests/` now contains: `Dockerfile`, `justfile`, `compose.yaml`, `envoy.yaml`,
+  `extproc_integration.rs`.
+
+### Next steps (new session)
+
+1. **Resolve the noop `header_mutation.is_none()` assertion** now that the server responds
+   (inspect the actual `CommonResponse.header_mutation` content; decide whether the server
+   should be attaching one or the test expectation is wrong).
+2. Continue the integration-test execution investigation (the transport issue that caused the
+   earlier `DispatchGone` / h2 errors should now be re-checked now that the server binds the
+   SDK defaults and responds).
+3. Consider fixing the latent derived-`Default` footgun for `ServerOptions` (u16 port fields
+   default to `0`) — followup, since the fix was switching to `ServerOptions::new()`.
+4. Re-run the full gate and update the Go test inventory to cover the newly ported tests.
+
+## Go source inventory (2026-10-24)
