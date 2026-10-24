@@ -27,7 +27,7 @@ integration-test:
 
 # run a specific example
 run example="noop" *flags="":
-    cargo run --bin extproc-example -- {{example}} {{flags}}
+    cd .. && cargo run --bin extproc-example -- {{example}} {{flags}}
 
 # build the example binary
 build *flags="":
@@ -35,15 +35,15 @@ build *flags="":
 
 # containerize the examples
 containerize tag=image_tag *flags="":
-    docker build -f examples/Dockerfile -t {{image_name}}:{{tag}} . {{flags}}
+    cd .. && docker build -f examples/Dockerfile -t {{image_name}}:{{tag}} . {{flags}}
 
 # run the examples in a container setup with envoy and an echo server
 up:
-    docker compose -f examples/compose.yaml up --build
+    cd .. && docker compose -f examples/compose.yaml up --build
 
 # stop the examples in a container setup with envoy and an echo server
 down:
-    docker compose -f examples/compose.yaml down
+    cd .. && docker compose -f examples/compose.yaml down
 
 # run a curl command against the example envoy setup; use flags for extra data
 call method="GET" path="/" *flags="": 
