@@ -169,13 +169,18 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      force-stop; graceful stop + close may be sufficient. Revisit if running outside k8s.
 
 3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (completes the
-   additional findings above).
-   - Wire stream-level metrics: `total_streams`, `active_streams`, `errored_streams`,
-     `stream_duration_seconds`, `response_send_errors`, `total_empty_responses`.
-   - Wire `ProcessingOptions::abort_on_processor_failure`.
-   - Fix `ProcessStream` receive-error handling (Canceled → clean end; other errors →
-     `error_handler(phase = UNDETERMINED)` + error).
-   - Propagate `close` error instead of discarding it.
+   additional findings above) — **DONE (2026-10-24)**.
+   - ✅ Done: stream-level metrics wired via `ExternalProcessor::process` (total_streams,
+     active_streams) and `ProcessStream` Drop (active_streams decrement, stream_duration_seconds
+     observe, errored_streams increment when errored).
+   - ✅ Done: `abort_on_processor_failure` consulted in `process_phase`; phase error
+     propagates and closes the stream.
+   - ✅ Done: `ProcessStream` receive-error handling now treats `Code::Cancelled` as a clean
+     end and routes other receive errors through `error_handler(phase = UNDETERMINED)`.
+   - ⬜ Not wired here: `response_send_errors` (send errors are not observable at the
+     stream level in the current design) and `total_empty_responses` (no empty-response path
+     in the Rust PhaseResponse API).
+   - ✅ Done: propagate `close` error instead of discarding it (done in Phase 2).
 
 4. **Phase 4 — Streaming responses** (completes gaps 3–4).
    - Implement `StreamedImmediateResponse` emission and end-of-stream signaling.

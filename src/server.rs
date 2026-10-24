@@ -134,6 +134,17 @@ impl GenericExtProcServer {
         let mut phase = REQUEST_PHASE_UNDETERMINED;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
         rc.duration += phase_start.elapsed();
+        if outcome.is_err()
+            && self
+                .options
+                .as_ref()
+                .is_some_and(|o| o.abort_on_processor_failure)
+        {
+            // Abort requested: propagate the phase error, which the
+            // ProcessStream turns into a stream error, closing the stream.
+            return Err(outcome.expect_err("phase error checked above"));
+        }
+
         outcome
     }
 
@@ -464,6 +475,21 @@ pub struct ProcessStream {
         Box<dyn tokio_stream::Stream<Item = Result<ProcessingRequest, tonic::Status>> + Send>,
     >,
     pending: Option<Result<ProcessingResponse, tonic::Status>>,
+    /// Whether the stream was ended by a processing error, for metrics.
+    errored: bool,
+}
+
+impl Drop for ProcessStream {
+    fn drop(&mut self) {
+        self.server
+            .metrics
+            .stream_duration_seconds
+            .observe((Instant::now() - self.rc.started).as_secs_f64());
+        self.server.metrics.active_streams.dec();
+        if self.errored {
+            self.server.metrics.errored_streams.inc();
+        }
+    }
 }
 
 impl Stream for ProcessStream {
@@ -481,6 +507,7 @@ impl Stream for ProcessStream {
                 match outcome {
                     Ok((resp, _phase)) => this.pending = resp.map(Ok),
                     Err(e) => {
+                        this.errored = true;
                         this.pending = Some(Err(Status::internal(format!(
                             "failed to process phase: {}",
                             e
@@ -489,7 +516,19 @@ impl Stream for ProcessStream {
                 }
                 Poll::Ready(Some(this.pending.take().unwrap()))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Err(e))) => {
+                if e.code() == tonic::Code::Cancelled {
+                    // Clean stream end, matching the Go SDK.
+                    return Poll::Ready(None);
+                }
+                this.errored = true;
+                this.server.processor.error_handler(
+                    &mut this.rc,
+                    REQUEST_PHASE_UNDETERMINED,
+                    Box::new(e.clone()),
+                );
+                Poll::Ready(Some(Err(e)))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -504,12 +543,15 @@ impl ExternalProcessor for GenericExtProcServer {
         &self,
         request: Request<Streaming<ProcessingRequest>>,
     ) -> Result<Response<Self::ProcessStream>, Status> {
+        self.metrics.total_streams.inc();
+        self.metrics.active_streams.inc();
         let incoming = Box::pin(request.into_inner());
         Ok(Response::new(ProcessStream {
             server: Arc::new(self.clone()),
             rc: RequestContext::new(),
             incoming,
             pending: None,
+            errored: false,
         }))
     }
 }
