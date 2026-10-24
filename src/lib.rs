@@ -41,9 +41,7 @@ pub mod tester;
 pub use context::HeaderAppendAction;
 pub use context::{
     default_phase_if_invalid, request_phase_to_string, HeaderValue, PhaseResponse, RequestContext,
-    REQUEST_PHASE_REQUEST_BODY, REQUEST_PHASE_REQUEST_HEADERS, REQUEST_PHASE_REQUEST_TRAILERS,
-    REQUEST_PHASE_RESPONSE_BODY, REQUEST_PHASE_RESPONSE_HEADERS, REQUEST_PHASE_RESPONSE_TRAILERS,
-    REQUEST_PHASE_UNDETERMINED,
+    RequestPhase,
 };
 pub use headers::AllHeaders;
 pub use health::HealthServer;

@@ -1,7 +1,9 @@
 use std::any::Any;
 use std::collections::HashMap;
 
-use extproc::{AllHeaders, Error, ProcessingOptions, RequestContext, RequestProcessor};
+use extproc::{
+    AllHeaders, Error, ProcessingOptions, RequestContext, RequestPhase, RequestProcessor,
+};
 use serde_json::{Map, Value};
 
 pub struct MaskerRequestProcessor {
@@ -62,11 +64,11 @@ fn set_at_path(map: &mut Map<String, Value>, parts: &[&str], value: &Value) -> b
 }
 
 impl RequestProcessor for MaskerRequestProcessor {
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         "masker".to_string()
     }
 
-    fn get_options(&self) -> &ProcessingOptions {
+    fn options(&self) -> &ProcessingOptions {
         &self.opts
     }
 
@@ -133,8 +135,8 @@ impl RequestProcessor for MaskerRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, err: Error) {
-        tracing::error!("Error in phase {}: {:?}", phase, err);
+    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+        tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 
     fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {

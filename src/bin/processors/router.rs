@@ -1,7 +1,8 @@
 use std::any::Any;
 
 use extproc::{
-    AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestProcessor,
+    AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
+    RequestProcessor,
 };
 use serde::Deserialize;
 
@@ -15,11 +16,11 @@ pub struct RoutingRequestProcessor {
 }
 
 impl RequestProcessor for RoutingRequestProcessor {
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         "router".to_string()
     }
 
-    fn get_options(&self) -> &ProcessingOptions {
+    fn options(&self) -> &ProcessingOptions {
         &self.opts
     }
 
@@ -101,8 +102,8 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, err: Error) {
-        tracing::error!("Error in phase {}: {:?}", phase, err);
+    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+        tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 
     fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {

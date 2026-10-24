@@ -13,7 +13,7 @@ for gRPC and the `envoy-types` crate for compiled protobuf types.
 Suggested stage breakdown (adjust as reality hits):
 
 1. **Stage 1** — Proto/types layer: `ProcessingRequest/Response`, `AllHeaders`,
-   `HeaderValue`, `PhaseResponse`, `RequestContext`, phase constants, helpers.
+   `HeaderValue`, `PhaseResponse`, `RequestContext`, phase enum, helpers.
 2. **Stage 2** — Options/health/metrics: `ProcessingOptions`, `ServerOptions`,
    `HealthServer`, `Metrics`.
 3. **Stage 3** — gRPC server: `RequestProcessor` trait, `GenericExtProcServer`,
@@ -79,8 +79,8 @@ Remaining plan items:
   `HttpStatus { code: i32 }` from `envoy_types::pb::envoy::r#type::v3::HttpStatus`.
 - `HeaderMutation { set_headers: Vec<HeaderValueOption>, remove_headers: Vec<String> }`.
 - `HeaderValueOption` has fields `HeaderValue { value, raw_value }` and action
-  `HeaderAppendAction`; action variants and constructor names may differ from
-  the Go ones — check generated source before implementing.
+  `HeaderAppendAction`; the SDK now takes the typed `HeaderAppendAction` enum in
+  `update_header`/`update_headers`, so invalid actions are not representable.
 
 ## Current status
 
@@ -173,13 +173,13 @@ Summary of the agreed port plan:
   `src/bin/processors/`. Takes the processor name as the first argument and mirrors the Go
   `examples/main.go` flags (`-port`, `-update-extproc-header`, `-update-duration-header`).
 - The Rust `RequestProcessor` trait has no `Init`; options live in each processor struct and
-  flow via `get_options`.
+  flow via `options`.
 - Errors are `Box<dyn Error + Send + Sync>` (`extproc::Error`).
 - Phase helpers: `continue_request`, `cancel_request(status, &HashMap<String, HeaderValue>, body: &[u8])`,
   `add/append/overwrite/remove_header`, `replace_body/clear_body/replace_body_chunk/clear_body_chunk`,
   `clear_route_cache`, `set_value/get_value` (values are `Box<dyn Any + Send + Sync>`, downcast via
   `DynAny = dyn Any + Send + Sync`), `end_of_stream`, `started: Instant`, `duration: Duration`, phase
-  consts, `get_response`.
+  enum, `get_response`.
 - Immediate responses are valid for request-headers/request-body/response-headers/response-body
   phases; trailers phases ignore them.
 - Digest example needs interior mutability for the shared hasher across phases

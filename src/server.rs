@@ -11,18 +11,11 @@ use envoy_types::pb::envoy::service::ext_proc::v3::processing_request::Request a
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse;
 
-use crate::context::{HeaderValue, RequestContext};
+use crate::context::{HeaderValue, RequestContext, RequestPhase};
 use crate::headers::{gen_headers, AllHeaders};
 use crate::metrics::Metrics;
 use crate::options::ProcessingOptions;
 use crate::Error;
-use crate::REQUEST_PHASE_REQUEST_BODY;
-use crate::REQUEST_PHASE_REQUEST_HEADERS;
-use crate::REQUEST_PHASE_REQUEST_TRAILERS;
-use crate::REQUEST_PHASE_RESPONSE_BODY;
-use crate::REQUEST_PHASE_RESPONSE_HEADERS;
-use crate::REQUEST_PHASE_RESPONSE_TRAILERS;
-use crate::REQUEST_PHASE_UNDETERMINED;
 use prometheus::Encoder;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
@@ -36,10 +29,10 @@ use tonic::{Request, Response, Status, Streaming};
 pub trait RequestProcessor: Send + Sync + 'static {
     /// The name of the processor, reported to `envoy` via the
     /// `x-extproc-names` response header.
-    fn get_name(&self) -> String;
+    fn name(&self) -> String;
 
     /// The processor's [`ProcessingOptions`](crate::options::ProcessingOptions).
-    fn get_options(&self) -> &ProcessingOptions;
+    fn options(&self) -> &ProcessingOptions;
 
     /// Process the request headers phase.
     fn process_request_headers(
@@ -77,7 +70,7 @@ pub trait RequestProcessor: Send + Sync + 'static {
 
     /// Called when the SDK hits an error during request processing. An
     /// implemented handler can implement any logic it likes.
-    fn error_handler(&self, ctx: &mut RequestContext, phase: u32, err: Error);
+    fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
 
     /// Called on shutdown, after in-flight streams have drained.
     fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
@@ -114,8 +107,13 @@ impl GenericExtProcServer {
     }
 
     /// The name of the processor.
-    pub fn get_name(&self) -> String {
-        self.processor.get_name()
+    pub fn name(&self) -> String {
+        self.processor.name()
+    }
+
+    /// The processor's [`ProcessingOptions`](crate::options::ProcessingOptions).
+    pub fn options(&self) -> &ProcessingOptions {
+        self.processor.options()
     }
 
     /// Called on shutdown, after in-flight streams have drained.
@@ -129,12 +127,12 @@ impl GenericExtProcServer {
         &self,
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
-    ) -> Result<(Option<ProcessingResponse>, u32), Error> {
+    ) -> Result<(Option<ProcessingResponse>, RequestPhase), Error> {
         // Reset phase-scoped state at the start of every phase, mirroring the
         // Go SDK's per-message reset (and `initReqCtx`'s reset for the
         // request-headers phase).
         rc.reset_phase()?;
-        let mut phase = REQUEST_PHASE_UNDETERMINED;
+        let mut phase = RequestPhase::Undetermined;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
         if let Err(e) = outcome {
             if self
@@ -159,16 +157,16 @@ impl GenericExtProcServer {
         &self,
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
-        phase: &mut u32,
-    ) -> Result<(Option<ProcessingResponse>, u32), Error> {
+        phase: &mut RequestPhase,
+    ) -> Result<(Option<ProcessingResponse>, RequestPhase), Error> {
         let phase_start = Instant::now();
         let metrics = &self.metrics;
         let options = &self.options;
 
-        let outcome = (|| -> Result<(Option<ProcessingResponse>, u32), Error> {
+        let outcome = (|| -> Result<(Option<ProcessingResponse>, RequestPhase), Error> {
             match &proc_req.request {
                 Some(ProcessingRequestOneof::RequestHeaders(h)) => {
-                    *phase = REQUEST_PHASE_REQUEST_HEADERS;
+                    *phase = RequestPhase::RequestHeaders;
                     rc.set_phase(*phase);
                     metrics.total_request_headers.inc();
                     let init = init_req_ctx(rc, h);
@@ -183,7 +181,7 @@ impl GenericExtProcServer {
                     self.processor.process_request_headers(rc, &headers)?;
                 }
                 Some(ProcessingRequestOneof::RequestBody(b)) => {
-                    *phase = REQUEST_PHASE_REQUEST_BODY;
+                    *phase = RequestPhase::RequestBody;
                     rc.set_phase(*phase);
                     metrics.total_request_body.inc();
                     metrics.request_body_bytes.inc_by(b.body.len() as f64);
@@ -192,7 +190,7 @@ impl GenericExtProcServer {
                     self.processor.process_request_body(rc, &b.body)?;
                 }
                 Some(ProcessingRequestOneof::RequestTrailers(t)) => {
-                    *phase = REQUEST_PHASE_REQUEST_TRAILERS;
+                    *phase = RequestPhase::RequestTrailers;
                     rc.set_phase(*phase);
                     metrics.total_request_trailers.inc();
                     let trailers = match gen_headers(
@@ -210,7 +208,7 @@ impl GenericExtProcServer {
                     self.processor.process_request_trailers(rc, &trailers)?;
                 }
                 Some(ProcessingRequestOneof::ResponseHeaders(h)) => {
-                    *phase = REQUEST_PHASE_RESPONSE_HEADERS;
+                    *phase = RequestPhase::ResponseHeaders;
                     rc.set_phase(*phase);
                     metrics.total_response_headers.inc();
                     let headers = match gen_headers(
@@ -249,7 +247,7 @@ impl GenericExtProcServer {
                     }
                 }
                 Some(ProcessingRequestOneof::ResponseBody(b)) => {
-                    *phase = REQUEST_PHASE_RESPONSE_BODY;
+                    *phase = RequestPhase::ResponseBody;
                     rc.set_phase(*phase);
                     metrics.total_response_body.inc();
                     metrics.response_body_bytes.inc_by(b.body.len() as f64);
@@ -269,7 +267,7 @@ impl GenericExtProcServer {
                     }
                 }
                 Some(ProcessingRequestOneof::ResponseTrailers(t)) => {
-                    *phase = REQUEST_PHASE_RESPONSE_TRAILERS;
+                    *phase = RequestPhase::ResponseTrailers;
                     rc.set_phase(*phase);
                     metrics.total_response_trailers.inc();
                     let trailers = match gen_headers(
@@ -402,8 +400,8 @@ pub async fn serve(
         Some(p) => p,
         None => return Err("processor is nil".into()),
     };
-    let name = processor.get_name();
-    let options = processor.get_options().clone();
+    let name = processor.name();
+    let options = processor.options().clone();
     let server = GenericExtProcServer::new(name, processor, Some(options), Metrics::new());
     server.serve(server_options).await
 }
@@ -551,7 +549,7 @@ impl Stream for ProcessStream {
                 this.errored = true;
                 this.server.processor.error_handler(
                     &mut this.rc,
-                    REQUEST_PHASE_UNDETERMINED,
+                    RequestPhase::Undetermined,
                     Box::new(e.clone()),
                 );
                 Poll::Ready(Some(Err(e)))
@@ -603,7 +601,9 @@ mod tests {
 
     use prometheus::Registry;
 
-    use crate::context::{default_phase_if_invalid, request_phase_to_string, RequestContext};
+    use crate::context::{
+        default_phase_if_invalid, request_phase_to_string, RequestContext, RequestPhase,
+    };
     use crate::headers::AllHeaders;
 
     fn processing_request(request: Option<ProcessingRequestOneof>) -> ProcessingRequest {
@@ -643,9 +643,9 @@ mod tests {
     struct TestProcessor {
         name: String,
         opts: Option<ProcessingOptions>,
-        phases: Arc<Mutex<Vec<u32>>>,
+        phases: Arc<Mutex<Vec<RequestPhase>>>,
         bodies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-        errors: Arc<Mutex<Vec<u32>>>,
+        errors: Arc<Mutex<Vec<RequestPhase>>>,
     }
 
     impl TestProcessor {
@@ -659,7 +659,7 @@ mod tests {
             }
         }
 
-        fn recorded_phases(&self) -> Vec<u32> {
+        fn recorded_phases(&self) -> Vec<RequestPhase> {
             self.phases.lock().unwrap().clone()
         }
 
@@ -667,16 +667,16 @@ mod tests {
             self.bodies.lock().unwrap().clone()
         }
 
-        fn recorded_errors(&self) -> Vec<u32> {
+        fn recorded_errors(&self) -> Vec<RequestPhase> {
             self.errors.lock().unwrap().clone()
         }
     }
 
     impl RequestProcessor for TestProcessor {
-        fn get_name(&self) -> String {
+        fn name(&self) -> String {
             self.name.clone()
         }
-        fn get_options(&self) -> &ProcessingOptions {
+        fn options(&self) -> &ProcessingOptions {
             self.opts.as_ref().unwrap()
         }
         fn process_request_headers(
@@ -687,7 +687,7 @@ mod tests {
             self.phases
                 .lock()
                 .unwrap()
-                .push(REQUEST_PHASE_REQUEST_HEADERS);
+                .push(RequestPhase::RequestHeaders);
             ctx.continue_request()
         }
         fn process_request_trailers(
@@ -698,11 +698,11 @@ mod tests {
             self.phases
                 .lock()
                 .unwrap()
-                .push(REQUEST_PHASE_REQUEST_TRAILERS);
+                .push(RequestPhase::RequestTrailers);
             ctx.continue_request()
         }
         fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
-            self.phases.lock().unwrap().push(REQUEST_PHASE_REQUEST_BODY);
+            self.phases.lock().unwrap().push(RequestPhase::RequestBody);
             self.bodies
                 .lock()
                 .unwrap()
@@ -717,7 +717,7 @@ mod tests {
             self.phases
                 .lock()
                 .unwrap()
-                .push(REQUEST_PHASE_RESPONSE_HEADERS);
+                .push(RequestPhase::ResponseHeaders);
             ctx.continue_request()
         }
         fn process_response_body(
@@ -725,10 +725,7 @@ mod tests {
             ctx: &mut RequestContext,
             body: &[u8],
         ) -> Result<(), Error> {
-            self.phases
-                .lock()
-                .unwrap()
-                .push(REQUEST_PHASE_RESPONSE_BODY);
+            self.phases.lock().unwrap().push(RequestPhase::ResponseBody);
             self.bodies
                 .lock()
                 .unwrap()
@@ -743,10 +740,10 @@ mod tests {
             self.phases
                 .lock()
                 .unwrap()
-                .push(REQUEST_PHASE_RESPONSE_TRAILERS);
+                .push(RequestPhase::ResponseTrailers);
             ctx.continue_request()
         }
-        fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, _err: Error) {
+        fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, _err: Error) {
             self.errors.lock().unwrap().push(phase);
         }
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
@@ -759,10 +756,10 @@ mod tests {
     }
 
     impl RequestProcessor for ErroringProcessor {
-        fn get_name(&self) -> String {
+        fn name(&self) -> String {
             "test".to_string()
         }
-        fn get_options(&self) -> &ProcessingOptions {
+        fn options(&self) -> &ProcessingOptions {
             &self.opts
         }
         fn process_request_headers(
@@ -807,7 +804,7 @@ mod tests {
         ) -> Result<(), Error> {
             ctx.continue_request()
         }
-        fn error_handler(&self, _ctx: &mut RequestContext, _phase: u32, _err: Error) {}
+        fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
             Ok(())
         }
@@ -836,7 +833,7 @@ mod tests {
             false,
         ))));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
         assert!(matches!(
             resp.as_ref().unwrap().response,
@@ -844,8 +841,8 @@ mod tests {
         ));
         assert_eq!(rc.method, "POST");
         assert!(!rc.end_of_stream);
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
-        assert_eq!(proc.recorded_phases(), vec![REQUEST_PHASE_REQUEST_HEADERS]);
+        assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
+        assert_eq!(proc.recorded_phases(), vec![RequestPhase::RequestHeaders]);
     }
 
     #[test]
@@ -867,14 +864,14 @@ mod tests {
             drain_complete: false,
         })));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_REQUEST_BODY);
+        assert_eq!(phase, RequestPhase::RequestBody);
         assert!(resp.is_some());
         assert!(matches!(
             resp.as_ref().unwrap().response,
             Some(ResponseOneof::RequestBody(_))
         ));
         assert!(rc.end_of_stream);
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_BODY);
+        assert_eq!(rc.get_phase(), RequestPhase::RequestBody);
         assert_eq!(
             proc.recorded_bodies().get("request").unwrap(),
             &b"{\"hello\":\"world\"}".to_vec()
@@ -903,7 +900,7 @@ mod tests {
             true,
         ))));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        assert_eq!(phase, RequestPhase::ResponseHeaders);
         assert!(resp.is_some());
         assert!(matches!(
             resp.as_ref().unwrap().response,
@@ -956,7 +953,7 @@ mod tests {
             drain_complete: false,
         })));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert_eq!(phase, RequestPhase::ResponseBody);
         assert!(resp.is_some());
         assert!(matches!(
             resp.as_ref().unwrap().response,
@@ -989,7 +986,7 @@ mod tests {
             },
         )));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_TRAILERS);
+        assert_eq!(phase, RequestPhase::ResponseTrailers);
         assert!(resp.is_some());
         assert!(matches!(
             resp.as_ref().unwrap().response,
@@ -1022,7 +1019,7 @@ mod tests {
             false,
         ))));
         let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        assert_eq!(phase, RequestPhase::ResponseHeaders);
         let mutation = rc.response.header_mutation.as_ref().unwrap();
         assert_eq!(mutation.set_headers.len(), 1);
         assert_eq!(
@@ -1055,7 +1052,7 @@ mod tests {
             false,
         ))));
         let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        assert_eq!(phase, RequestPhase::ResponseHeaders);
         assert_eq!(
             rc.response
                 .header_mutation
@@ -1074,7 +1071,7 @@ mod tests {
             drain_complete: false,
         })));
         let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert_eq!(phase, RequestPhase::ResponseBody);
         assert_eq!(
             rc.response
                 .header_mutation
@@ -1110,7 +1107,7 @@ mod tests {
         ))));
         let err = server.process_phase(&req, &mut rc).unwrap_err();
         assert!(err.to_string().contains("processor exploded"));
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+        assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
     }
 
     #[test]
@@ -1132,7 +1129,7 @@ mod tests {
             false,
         ))));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
         assert!(matches!(
             resp.as_ref().unwrap().response,
@@ -1174,10 +1171,10 @@ mod tests {
         // Without AbortOnProcessorFailure, an init error sends an empty
         // continue response (Go semantics) while the error handler still runs.
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
-        assert_eq!(proc.recorded_errors(), vec![REQUEST_PHASE_REQUEST_HEADERS]);
+        assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
+        assert_eq!(proc.recorded_errors(), vec![RequestPhase::RequestHeaders]);
     }
 
     #[test]
@@ -1195,7 +1192,7 @@ mod tests {
             .process_phase(&processing_request(None), &mut rc)
             .unwrap_err();
         assert!(!err.to_string().is_empty());
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+        assert_eq!(rc.get_phase(), RequestPhase::Undetermined);
     }
 
     #[test]
@@ -1217,7 +1214,7 @@ mod tests {
             drain_complete: false,
         })));
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert_eq!(phase, RequestPhase::ResponseBody);
         assert!(resp.is_some());
 
         let registry = Registry::new();
@@ -1232,13 +1229,13 @@ mod tests {
 
     #[test]
     fn test_phase_helpers() {
-        assert_eq!(default_phase_if_invalid(42), REQUEST_PHASE_UNDETERMINED);
+        assert_eq!(default_phase_if_invalid(42), RequestPhase::Undetermined);
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_RESPONSE_BODY),
+            request_phase_to_string(RequestPhase::ResponseBody),
             "RESPONSE_BODY"
         );
-        assert_eq!(REQUEST_PHASE_RESPONSE_BODY, 5);
-        assert_eq!(REQUEST_PHASE_RESPONSE_TRAILERS, 6);
-        assert_eq!(REQUEST_PHASE_RESPONSE_HEADERS, 4);
+        assert_eq!(RequestPhase::ResponseBody.as_u32(), 5);
+        assert_eq!(RequestPhase::ResponseTrailers.as_u32(), 6);
+        assert_eq!(RequestPhase::ResponseHeaders.as_u32(), 4);
     }
 }
