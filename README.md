@@ -1,0 +1,216 @@
+# An Envoy ExternalProcessor SDK (rust)
+
+## Overview
+
+[`envoy`](https://www.envoyproxy.io/), one of the most powerful and widely used reverse proxies, is able to query an [ExternalProcessor](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter) in it's filter chain. Such a processor is a gRPC service that streams messages back and forth to modify HTTP requests being processed by `envoy`. This functionality opens the door to quickly and robustly implemently customized functionality at the edge, instead of in targeted services. While powerful, implementing these services still requires dealing with complicated `envoy` specs, managing information sharing across request phases, and an understanding of gRPC, none of which are exactly straightforward.
+
+**The purpose of this SDK is to make development of ExternalProcessors (more) easy**. This SDK _certainly_ won't supply the most _performant_ edge functions. Much better performance will come from eschewing the ease-of-use functionality here by using a [WASM plugin](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/wasm/v3/wasm.proto) or registered [custom filter binary](https://github.com/envoyproxy/envoy-filter-example). Optimal performance isn't necessarily our goal; usability, maintainability, and low time-to-functionality is, and those aspects can often be more important than minimal request latency.
+
+We attempt to achieve this ease largely by masking some of the details behind the datastructures `envoy` uses, which are effective but verbose and idiosyncratic. Each request generates a bidirectional gRPC stream (with at most 6 messages) and sends, in turn, data concerning request headers, request body, request trailers, response headers, response body, and response trailers (if `envoy` is configured to send all phases). The idea here is to supply functions for each phase that operate on a context and more generically typed data suitable for each phase. (See details below.)
+
+The SDK is implemented as the `extproc` crate and uses the [`envoy-types`](https://crates.io/crates/envoy-types) crate for the compiled `envoy.service.ext_proc.v3` protobuf types and [`tonic`](https://crates.io/crates/tonic) for the gRPC transport and server scaffolding.
+
+## Usage
+
+### TL;DR
+
+Implement the `extproc::RequestProcessor` trait, and pass an instance to the `extproc::serve` function.
+
+### Details
+
+This SDK uses a `struct`
+```rust
+use std::sync::Arc;
+
+use extproc::{Metrics, ProcessingOptions, RequestProcessor};
+
+pub struct GenericExtProcServer {
+    /// The name of the processor, as reported to `envoy`.
+    pub name: String,
+    /// The processor handling phases.
+    pub processor: Arc<dyn RequestProcessor>,
+    /// The options controlling SDK behavior for the current phase, if set.
+    pub options: Option<ProcessingOptions>,
+    /// Metrics collected during processing.
+    pub metrics: Metrics,
+}
+```
+an interface
+```rust
+pub trait RequestProcessor: Send + Sync + 'static {
+    /// The name of the processor, reported to `envoy` via the `x-extproc-names` response header.
+    fn get_name(&self) -> String;
+
+    /// The processor's `ProcessingOptions`.
+    fn get_options(&self) -> &ProcessingOptions;
+
+    /// Process the request headers phase.
+    fn process_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &AllHeaders,
+    ) -> Result<(), Error>;
+
+    /// Process the request trailers phase.
+    fn process_request_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        trailers: &AllHeaders,
+    ) -> Result<(), Error>;
+
+    /// Process the request body phase.
+    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
+
+    /// Process the response headers phase.
+    fn process_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &AllHeaders,
+    ) -> Result<(), Error>;
+
+    /// Process the response body phase.
+    fn process_response_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
+
+    /// Process the response trailers phase.
+    fn process_response_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        trailers: &AllHeaders,
+    ) -> Result<(), Error>;
+
+    /// Called when the SDK hits an error during request processing. An
+    /// implemented handler can implement any logic it likes.
+    fn error_handler(&self, ctx: &mut RequestContext, phase: u32, err: Error);
+
+    /// Called on shutdown, after in-flight streams have drained.
+    fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
+}
+```
+and a context object
+```rust
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use extproc::{AllHeaders, PhaseResponse, RequestContext};
+
+pub struct RequestContext {
+    // parsed from headers
+    pub scheme: String,
+    pub authority: String,
+    pub method: String,
+    pub path: String,
+    pub full_path: String,
+    pub request_id: String,
+    pub all_headers: AllHeaders,
+    pub started: Instant,
+    pub duration: Duration,
+    pub end_of_stream: bool,
+    pub data: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
+    pub phase: u32,
+    pub response: PhaseResponse,
+}
+```
+that work together to allow processing of requests and responses.
+
+An ExtProc service can be run with the `must_serve` convenience function as in
+```rust
+use std::sync::Arc;
+
+use extproc::{must_serve, ServerOptions};
+
+// define serverOptions, setup your tracing subscriber...
+// (ProcessingOptions are supplied by your processor's get_options method)
+
+#[tokio::main]
+async fn main() {
+    // ...
+    let processor = Arc::new(MyProcessor::default());
+    must_serve(ServerOptions::default(), Some(processor)).await;
+}
+```
+or, more explicitly,
+```rust
+use std::sync::Arc;
+
+use extproc::{GenericExtProcServer, Metrics, ProcessingOptions, ServerOptions};
+
+// define serverOptions, setup your tracing subscriber...
+// (ProcessingOptions are supplied by your processor's get_options method)
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let processor = Arc::new(MyProcessor::default());
+    GenericExtProcServer::new(
+        "my-processor".to_string(),
+        processor,
+        Some(ProcessingOptions::default()),
+        Metrics::new(),
+    )
+    .serve(ServerOptions::default())
+    .await
+}
+```
+Internally the `GenericExtProcServer` constructed in `must_serve` handles the gRPC streaming and shared context, parsing the processing phase in the gRPC stream and calling the right `RequestProcessor` method. The header and body messages can be responded to with either a "common" or "immediate" response object (or error); the trailer methods can only mutate headers. But that should be opaque to the user of this SDK; the `RequestContext` and `RequestProcessor` are more important.
+
+### Context Data
+
+The `RequestContext` is initialized with request data when request headers are received, implying that the `envoy` configuration should always have `processing_mode.request_header_mode: SEND`. Basic request data (method, path etc) are only available in this phase. As shown in the spec above, this data includes
+* the HTTP `Scheme`
+* the `Authority` (host)
+* the HTTP `Method`
+* the URL `Path`
+* `envoy`'s `RequestId` (a UUID from the `x-request-id` header)
+* the request processing stream start time in `Started`
+* an accumulator `Duration` _for the time spent in external processing_
+* a flag `EndOfStream` from gRPC messages for header and body phases
+
+This context is carried through every request phase, meaning that data can be shared _across_ phases particularly in the generic slot `data` for arbitrary values. Define and access data with the `RequestContext::set_value` and `RequestContext::get_value` methods. Values are stored generically as `Box<dyn Any + Send + Sync>`, so to use them you must re-type the data upon retrieval. See the [data](#data) or [digest](#digest) examples.
+
+### Forming Responses
+
+We also provide some convenience routines for operating on process phase stream responses, so that users of this SDK need to learn less about the specifics of the `envoy` datastructures. The gRPC stream response datastructures are complicated, and our aim is to utilize the `RequestContext` to guard and simplify the construction of responses with a simpler user interface.
+
+In particular, the methods
+```rust
+(rc: &mut RequestContext).continue_request() -> Result<(), Error>
+(rc: &mut RequestContext).cancel_request(status: i32, headers: &HashMap<String, HeaderValue>, body: &[u8]) -> Result<(), Error>
+```
+define request phase responses for "continuing" and "responding immediately". Note that "cancelling" does not mean request failure; just "we know the response now, and don't need to process further". See the [echo](#echo) example for "OK" (200) responses from cancelling.
+
+### Modifying Headers
+
+You can add headers to a response with the convenience methods
+```rust
+(rc: &mut RequestContext).add_header(name: &str, hv: &HeaderValue) -> Result<(), Error>
+(rc: &mut RequestContext).add_headers(headers: &HashMap<String, HeaderValue>) -> Result<(), Error>
+(rc: &mut RequestContext).append_header(name: &str, hv: &HeaderValue) -> Result<(), Error>
+(rc: &mut RequestContext).append_headers(headers: &HashMap<String, HeaderValue>) -> Result<(), Error>
+(rc: &mut RequestContext).overwrite_header(name: &str, hv: &HeaderValue) -> Result<(), Error>
+(rc: &mut RequestContext).overwrite_headers(headers: &HashMap<String, HeaderValue>) -> Result<(), Error>
+(rc: &mut RequestContext).update_header(name: &str, hv: &HeaderValue, action: &str) -> Result<(), Error>
+(rc: &mut RequestContext).update_headers(headers: &HashMap<String, HeaderValue>, action: &str) -> Result<(), Error>
+```
+where `append` adds header values if they exist, `add` adds a new value only if the header doesn't exist, and `overwrite` will add or overwrite if a header exists. The `RequestContext` should keep track of these headers and include them in a `continue_request` or `cancel_request` call. `update_header`/`update_headers` is a generic method that should accept any action in protobuf enums wrapped or not in a specific method. Note though using this will error on invalid header update actions.
+
+Headers can be removed with the
+```rust
+(rc: &mut RequestContext).remove_header(name: &str) -> Result<(), Error>
+(rc: &mut RequestContext).remove_headers(headers: &[String]) -> Result<(), Error>
+(rc: &mut RequestContext).remove_headers_variadic(headers: &[String]) -> Result<(), Error>
+```
+methods, requiring only names of headers to remove.
+
+### Modifying Bodies
+
+Two methods help modify bodies:
+```rust
+(rc: &mut RequestContext).replace_body_chunk(body: &[u8]) -> Result<(), Error>
+(rc: &mut RequestContext).clear_body_chunk() -> Result<(), Error>
+```
+These are the two options currently available in `envoy` ExtProcs: replace a chunk and clear the entire chunk. Note that with buffered bodies the "chunks" should be the entire body. See the [masker](#masker) example discussed below.
+
+The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/extproc/latest/extproc/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/extproc/latest/extproc/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
+
+## Examples
+
+The examples from the Go SDK (`examples/noop.go`, `examples/trivial.go`, `examples/timer.go`, `examples/data.go`, `examples/digest.go`, `examples/dedup.go`, `examples/masker.go`, and `examples/echo.go`) have not yet been ported to Rust. Until then, the [`tester`](https://docs.rs/extproc/latest/extproc/) module and the integration harness in [`tests/`](tests/) exercise the SDK end to end.
