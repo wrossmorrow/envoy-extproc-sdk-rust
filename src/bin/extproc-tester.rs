@@ -9,7 +9,7 @@ use extproc::{
 
 #[tokio::main]
 async fn main() {
-    let mut server_options = ServerOptions::default();
+    let mut server_options = ServerOptions::new();
     // Optional CLI args: --extproc-port <port> --metrics-http-port <port>
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
