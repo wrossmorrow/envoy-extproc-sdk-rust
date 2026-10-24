@@ -30,3 +30,10 @@ tracing-subscriber = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "extproc-tester"
+path = "tests/bin/extproc-tester.rs"

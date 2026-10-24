@@ -294,7 +294,118 @@ Suggested order, updated per maintainer prioritization:
 - server_test.go: TestProcessPhaseMetricsErrorPath (processor error increments phase_errors
   and propagates).
 
+## Integration tests (proposed — Phase 6, new branch `test/integration-envoy-e2e`)
+
+Inspired by the Go SDK's `test/` directory (github.com/wrossmorrow/envoy-extproc-sdk-go
+`test/`), planned for the Rust port:
+
+- Go-side fixtures: `test/cases.yaml` (parametrized cases: noop, clear/append/
+  remove/overwrite request & response headers/body, cancel), `test/compose.yaml`
+  (envoy + upstream echo + extproc), `test/envoy.yaml`, `test/justfile`,
+  `test/Dockerfile` (golang:1.25-alpine builder → runtime, grpc-health-probe),
+  `test/main.go` (tester binary), `test/tester.go` (`TesterRequestProcessor`),
+  `test/tester_test.go`, `test/test.py`, `test/README.md`.
+- Rust side plan: new `test/` directory mirroring the layout; Rust Dockerfile for
+  the compose build (rust builder, likely minimal); compose file wiring envoy +
+  upstream echo + the Rust extproc server; Rust tester processor implementing the
+  same cases.yaml action schema (append/add/overwrite/remove headers, clear/replace
+  body, cancel) via the Rust PhaseResponse APIs (AppendHeader/AddHeader/Overwrite/
+  RemoveHeader/ClearBody/ReplaceBody/CancelRequest, GetValue typed access).
+- Notes: Go tester has `# TODO: requires work` for cancel; the Rust port may need
+  equivalent handling. Envoy config uses BUFFERED body modes, 2s message timeout,
+  `/no-extproc` bypass route, etc.
+
 ## Go source inventory
 
 - /tmp/go_sdk/*.go (re-fetched 2026-10-24) — context.go, extproc.go (RequestProcessor trait),
   headers.go, health.go, options.go, server.go, metrics.go, tests.
+
+## Session log (2026-10-24 — integration harness, port fix, envoy.yaml fix, bind logging)
+
+### Changes made this session (2026-10-24, on `test/integration-envoy-e2e`)
+
+- Added `tests/Dockerfile` (rust builder → runtime; installs
+  `github.com/grpc-ecosystem/grpc-health-probe@v0.4.39`; exposes 50051/9090; entrypoint
+  `/extproc`). Commit `aed4285`.
+- Added `tests/justfile` (build/test/containerize/up/down recipes mirroring the Go
+  `test/justfile`, image `ghcr.io/wrossmorrow/envoy-extproc-sdk-rust`). Commit
+  `1fcf550`.
+- Added `tests/compose.yaml` (envoy + upstream echo + extproc `test` service; envoy
+  waits on extproc health). Commit `1fcf550`.
+- Added `tests/envoy.yaml` (envoy static config; fixed malformed indentation in the
+  `http_protocol_options`/`http2_protocol_options` and `admin:` blocks via commit
+  `d8a5c9f`, `fix: invalid envoy.yaml, bad reconstruction not copy`). Commit `d8a5c9f`.
+- Added `tests/extproc_integration.rs` (the integration harness: spawned server via
+  `GenericExtProcServer`, tonic client, wire-format helpers, metrics fetch, 8 tests).
+- Added `src/bin/extproc-tester.rs` (tester-backed server binary used by the integration
+  tests). Commit `f385741` (switched to `ServerOptions::new()`).
+
+### Root-cause fix (2026-10-24, the big one)
+
+- **Discovery via new startup-bind logging** (`src/server.rs`: `tracing::info!` at metrics and
+  gRPC bind sites + default subscriber init in `GenericExtProcServer::serve`): the spawned
+  test server logged `port=0` for both listeners — i.e. it was binding to **ephemeral ports**
+  rather than the SDK defaults. Root cause: the test binary used
+  `ServerOptions::default()`, which (because `ServerOptions` *derives* `Default` with
+  `u16` fields defaulting to `0`) yields ports `0`/`0`; the SDK-correct constructor is
+  `ServerOptions::new()`. Fix: switched `src/bin/extproc-tester.rs` to
+  `ServerOptions::new()`. Commit `f385741`.
+
+### Harness hygiene fixes (2026-10-24)
+
+- Cleaned up orphaned `extproc-tester` server processes leaked by failed/hung integration
+  runs (now defunct; no listeners remain).
+- Added child-kill guard (`ChildGuard`) in the noop test so a failed test can't leak a
+  spawned server. Commit `dee351d`.
+
+### Current state at session end (2026-10-24)
+
+- Gate: `cargo fmt --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓,
+  `cargo test --lib` 33/33 ✓ (full `cargo test` still red on the 8 integration tests).
+- Integration tests: noop now gets **past** the gRPC stream-open and receives a response
+  (server binds `50051`/`9090`, health check would now report `SERVING`); the noop test now
+  fails at the `header_mutation.is_none()` assertion instead. Remaining integration-test
+  failures are due to the pre-existing gRPC transport issue and/or the now-resolved port bug.
+- `tests/` now contains: `Dockerfile`, `justfile`, `compose.yaml`, `envoy.yaml`,
+  `extproc_integration.rs`.
+
+### Next steps (new session)
+
+1. **Resolve the noop `header_mutation.is_none()` assertion** now that the server responds
+   (inspect the actual `CommonResponse.header_mutation` content; decide whether the server
+   should be attaching one or the test expectation is wrong).
+2. Continue the integration-test execution investigation (the transport issue that caused the
+   earlier `DispatchGone` / h2 errors should now be re-checked now that the server binds the
+   SDK defaults and responds).
+3. Consider fixing the latent derived-`Default` footgun for `ServerOptions` (u16 port fields
+   default to `0`) — followup, since the fix was switching to `ServerOptions::new()`.
+4. Re-run the full gate and update the Go test inventory to cover the newly ported tests.
+
+## Session log (2026-10-24 — plain-http envoy integration tests migrated, gateway 301 root cause fixed)
+
+### Changes made this session (2026-10-24, on `test/integration-envoy-e2e`, PR #7)
+
+- Added `tests/http_integration.rs`: clean plain-HTTP end-to-end integration tests
+  against a running envoy (docker compose harness), ported from the Go SDK's
+  `test/tester_test.go` and `test/cases.yaml`. 11 tests: noop, clear request/response
+  body, add/remove/overwrite request & response headers, cancel, header parsing.
+  Gateway base URL via `EXTO_PROC_ECHO_URL` (default `http://localhost:8080`).
+- `src/tester.rs`: `TesterRequestBody` now derives `Serialize` and skips `None`
+  fields on serialization (action JSON without nulls, matching the Go SDK's
+  omission of unset fields).
+
+### Root cause of the mass `301` failures (fixed)
+
+- Tester gateway URIs were built with `format!("{}/{}", base, path)` where the paths
+  (`/test`, `/no-extproc`) already begin with `/`, producing `//test` and `//no-extproc`.
+  Envoy canonicalized and answered `301 → Location: /test`.
+- Fixed to single-slash URIs; re-ran the plain-HTTP suite.
+
+### Test results (live harness, after fix)
+
+- `cargo test --test http_integration -- --test-threads=1` → 10/11 pass.
+- `http_remove_response_header` still red; the add-then-remove rewrite also failed
+  (final encoded response still carried the added header), so the original remove-`date`
+  variant was restored in `b03adbe`.
+
+## Go source inventory (2026/10/24)

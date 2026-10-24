@@ -1,0 +1,38 @@
+image_name := "ghcr.io/wrossmorrow/envoy-extproc-sdk-rust"
+image_tag := `git rev-parse HEAD`
+
+# list these commands and exit
+default:
+    just --list
+
+# update modules
+update:
+    cargo update
+
+# tidy up modules
+tidy:
+    cargo tidy
+
+# format code
+format:
+    cargo fmt
+
+# build the test server binary
+build *flags="":
+    cargo build --release --bin extproc-tester {{flags}}
+
+# run tests
+test *flags="-v":
+    cargo test {{flags}}
+
+# containerize the test server
+containerize tag=image_tag *flags="":
+    cd .. && docker build -f tests/Dockerfile -t {{image_name}}:test-{{tag}} . {{flags}}
+
+# run the test server in a container setup with envoy and an echo server
+up *flags:
+    cd .. && docker compose -f tests/compose.yaml up --build {{flags}}
+
+# stop the test server setup
+down *flags:
+    cd .. && docker compose -f tests/compose.yaml down {{flags}}

@@ -130,6 +130,9 @@ impl GenericExtProcServer {
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
     ) -> Result<(Option<ProcessingResponse>, u32), Error> {
+        // Reset phase-scoped state at the start of every phase, mirroring the
+        // Go SDK's per-message reset (and `initReqCtx`'s reset for the
+        // request-headers phase).
         rc.reset_phase()?;
         let mut phase = REQUEST_PHASE_UNDETERMINED;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
@@ -303,6 +306,10 @@ impl GenericExtProcServer {
     /// Set up and serve the ext_proc gRPC server, metrics endpoint, and
     /// health service.
     pub async fn serve(&self, server_options: crate::options::ServerOptions) -> Result<(), Error> {
+        // Install a default tracing subscriber so startup logs (e.g. the bound
+        // ports below) are emitted.
+        let _ = tracing_subscriber::fmt().try_init();
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // metrics
@@ -318,6 +325,10 @@ impl GenericExtProcServer {
         )))
         .await
         .map_err(|e| format!("failed to bind metrics HTTP server: {}", e))?;
+        tracing::info!(
+            port = server_options.metrics_http_port,
+            "extproc server bound metrics HTTP listener"
+        );
         let metrics_server =
             axum::serve(metrics_listener, metrics_router).with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
@@ -336,6 +347,10 @@ impl GenericExtProcServer {
             .add_service(ExternalProcessorServer::new(self.clone()))
             .add_service(health.health_service());
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], server_options.ext_proc_port));
+        tracing::info!(
+            port = server_options.ext_proc_port,
+            "extproc server bound gRPC listener"
+        );
 
         // Shutdown signal: on SIGINT/SIGTERM mark the health service unready and
         // wait out the unready propagation delay; the graceful shutdown then runs.
@@ -1119,6 +1134,20 @@ mod tests {
         let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
         assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
         assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::RequestHeaders(_))
+        ));
+
+        // The phase error was counted by the server metrics.
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
     }
 
     #[test]
