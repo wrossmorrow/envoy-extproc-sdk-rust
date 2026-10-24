@@ -29,3 +29,7 @@ test:
 
 # Run the full gate: format check, clippy, tests.
 all: fmt-check clippy test
+
+# Run the extproc server locally (gRPC on :50051, metrics on :9090).
+run:
+    cargo run
