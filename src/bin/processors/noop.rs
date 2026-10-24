@@ -1,15 +1,17 @@
-use extproc::{AllHeaders, Error, ProcessingOptions, RequestContext, RequestProcessor};
+use extproc::{
+    AllHeaders, Error, ProcessingOptions, RequestContext, RequestPhase, RequestProcessor,
+};
 
 pub struct NoopRequestProcessor {
     pub opts: ProcessingOptions,
 }
 
 impl RequestProcessor for NoopRequestProcessor {
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         "noop".to_string()
     }
 
-    fn get_options(&self) -> &ProcessingOptions {
+    fn options(&self) -> &ProcessingOptions {
         &self.opts
     }
 
@@ -53,8 +55,8 @@ impl RequestProcessor for NoopRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, err: Error) {
-        tracing::error!("Error in phase {}: {:?}", phase, err);
+    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+        tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 
     fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {

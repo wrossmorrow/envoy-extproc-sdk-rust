@@ -23,39 +23,64 @@ use crate::Error;
 /// Phase in which a request is being processed, as numbered by the
 /// `envoy.service.ext_proc.v3` protocol. Values are the protocol's phase
 /// numbers, as used by `envoy`'s ext_proc filter.
-pub const REQUEST_PHASE_UNDETERMINED: u32 = 0;
-pub const REQUEST_PHASE_REQUEST_HEADERS: u32 = 1;
-pub const REQUEST_PHASE_REQUEST_BODY: u32 = 2;
-pub const REQUEST_PHASE_REQUEST_TRAILERS: u32 = 3;
-pub const REQUEST_PHASE_RESPONSE_HEADERS: u32 = 4;
-pub const REQUEST_PHASE_RESPONSE_BODY: u32 = 5;
-pub const REQUEST_PHASE_RESPONSE_TRAILERS: u32 = 6;
+///
+/// This is a typed enum rather than the raw protocol numbers used by the Go
+/// SDK, so that phase handling is checked at compile time instead of relying
+/// on integer constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum RequestPhase {
+    /// The phase is unknown, e.g. the request headers phase was skipped via
+    /// `processing_mode.request_header_mode: SKIP`.
+    #[default]
+    Undetermined = 0,
+    /// The request headers phase.
+    RequestHeaders = 1,
+    /// The request body phase.
+    RequestBody = 2,
+    /// The request trailers phase.
+    RequestTrailers = 3,
+    /// The response headers phase.
+    ResponseHeaders = 4,
+    /// The response body phase.
+    ResponseBody = 5,
+    /// The response trailers phase.
+    ResponseTrailers = 6,
+}
 
-const K_CONTENT_LENGTH: &str = "content-length";
-
-pub fn default_phase_if_invalid(phase: u32) -> u32 {
-    match phase {
-        REQUEST_PHASE_UNDETERMINED
-        | REQUEST_PHASE_REQUEST_HEADERS
-        | REQUEST_PHASE_REQUEST_BODY
-        | REQUEST_PHASE_REQUEST_TRAILERS
-        | REQUEST_PHASE_RESPONSE_HEADERS
-        | REQUEST_PHASE_RESPONSE_BODY
-        | REQUEST_PHASE_RESPONSE_TRAILERS => phase,
-        _ => REQUEST_PHASE_UNDETERMINED,
+impl RequestPhase {
+    /// The protocol phase number for this phase.
+    pub const fn as_u32(self) -> u32 {
+        self as u32
     }
 }
 
-pub fn request_phase_to_string(phase: u32) -> String {
+const K_CONTENT_LENGTH: &str = "content-length";
+
+/// Map a protocol phase number onto the typed phase, defaulting to
+/// [`RequestPhase::Undetermined`] when the number is not a known phase.
+pub fn default_phase_if_invalid(phase: u32) -> RequestPhase {
     match phase {
-        REQUEST_PHASE_UNDETERMINED => "UNDETERMINED".to_string(),
-        REQUEST_PHASE_REQUEST_HEADERS => "REQUEST_HEADERS".to_string(),
-        REQUEST_PHASE_REQUEST_BODY => "REQUEST_BODY".to_string(),
-        REQUEST_PHASE_REQUEST_TRAILERS => "REQUEST_TRAILERS".to_string(),
-        REQUEST_PHASE_RESPONSE_HEADERS => "RESPONSE_HEADERS".to_string(),
-        REQUEST_PHASE_RESPONSE_BODY => "RESPONSE_BODY".to_string(),
-        REQUEST_PHASE_RESPONSE_TRAILERS => "RESPONSE_TRAILERS".to_string(),
-        _ => format!("UNKNOWN({})", phase),
+        0 => RequestPhase::Undetermined,
+        1 => RequestPhase::RequestHeaders,
+        2 => RequestPhase::RequestBody,
+        3 => RequestPhase::RequestTrailers,
+        4 => RequestPhase::ResponseHeaders,
+        5 => RequestPhase::ResponseBody,
+        6 => RequestPhase::ResponseTrailers,
+        _ => RequestPhase::Undetermined,
+    }
+}
+
+/// The name of a phase, e.g. `REQUEST_HEADERS`.
+pub fn request_phase_to_string(phase: RequestPhase) -> String {
+    match phase {
+        RequestPhase::Undetermined => "UNDETERMINED".to_string(),
+        RequestPhase::RequestHeaders => "REQUEST_HEADERS".to_string(),
+        RequestPhase::RequestBody => "REQUEST_BODY".to_string(),
+        RequestPhase::RequestTrailers => "REQUEST_TRAILERS".to_string(),
+        RequestPhase::ResponseHeaders => "RESPONSE_HEADERS".to_string(),
+        RequestPhase::ResponseBody => "RESPONSE_BODY".to_string(),
+        RequestPhase::ResponseTrailers => "RESPONSE_TRAILERS".to_string(),
     }
 }
 
@@ -92,24 +117,26 @@ impl HeaderValue {
     /// Validate and convert to a
     /// [`HeaderValueOption`](envoy_types::pb::envoy::config::core::v3::HeaderValueOption).
     ///
-    /// `action` must be one of the actions the envoy protocol defines, e.g.
-    /// `ADD_IF_ABSENT`, `APPEND_IF_EXISTS_OR_ADD`, `OVERWRITE_IF_EXISTS`,
-    /// `OVERWRITE_IF_EXISTS_OR_ADD`.
+    /// `action` is one of the [`HeaderAppendAction`] values the envoy protocol
+    /// defines, e.g. [`HeaderAppendAction::AddIfAbsent`],
+    /// [`HeaderAppendAction::AppendIfExistsOrAdd`] or
+    /// [`HeaderAppendAction::OverwriteIfExistsOrAdd`]. Because the action is a
+    /// typed enum, values outside the protocol's set are not representable
+    /// here and cannot produce a runtime error; invalid header values are
+    /// still rejected.
     #[allow(deprecated)]
     pub fn to_envoy_header_value_option(
         &self,
         name: &str,
-        action: &str,
+        action: HeaderAppendAction,
     ) -> Result<HeaderValueOption, Error> {
         if !self.is_valid() {
             return Err(format!("invalid header value for {}", name).into());
         }
-        let action_enum = HeaderAppendAction::from_str_name(action)
-            .ok_or_else(|| format!("unknown header append action {:?}", action))?;
         Ok(HeaderValueOption {
             header: Some(self.to_envoy_header_value(name)),
             append: None,
-            append_action: action_enum as i32,
+            append_action: action as i32,
             keep_empty_value: false,
         })
     }
@@ -192,7 +219,7 @@ pub struct RequestContext {
     pub data: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
 
     /// Current processing phase.
-    pub phase: u32,
+    pub phase: RequestPhase,
     /// Response being assembled for the current phase.
     pub response: PhaseResponse,
 }
@@ -212,7 +239,7 @@ impl RequestContext {
             duration: Duration::ZERO,
             end_of_stream: false,
             data: HashMap::new(),
-            phase: REQUEST_PHASE_UNDETERMINED,
+            phase: RequestPhase::Undetermined,
             response: PhaseResponse::default(),
         }
     }
@@ -220,20 +247,19 @@ impl RequestContext {
     /// Reset the phase and response state. Called at the start of each
     /// processing phase.
     pub fn reset_phase(&mut self) -> Result<(), Error> {
-        self.phase = REQUEST_PHASE_UNDETERMINED;
+        self.phase = RequestPhase::Undetermined;
         self.end_of_stream = false;
         self.response.reset();
         Ok(())
     }
 
-    /// Set the phase, mapping invalid values to
-    /// [`REQUEST_PHASE_UNDETERMINED`](crate::REQUEST_PHASE_UNDETERMINED).
-    pub fn set_phase(&mut self, phase: u32) {
-        self.phase = default_phase_if_invalid(phase);
+    /// Set the current phase.
+    pub fn set_phase(&mut self, phase: RequestPhase) {
+        self.phase = phase;
     }
 
-    /// The current phase, as a number.
-    pub fn get_phase(&self) -> u32 {
+    /// The current phase.
+    pub fn get_phase(&self) -> RequestPhase {
         self.phase
     }
 
@@ -275,12 +301,15 @@ impl RequestContext {
     /// Build the [`ProcessingResponse`] for the given phase, honoring an
     /// immediate response set by the processor when the phase allows it, and
     /// otherwise returning a "continue" response.
-    pub fn get_response(&mut self, phase: u32) -> Result<Option<ProcessingResponse>, Error> {
+    pub fn get_response(
+        &mut self,
+        phase: RequestPhase,
+    ) -> Result<Option<ProcessingResponse>, Error> {
         if let Some(immediate) = &self.response.immediate_response {
-            if phase == REQUEST_PHASE_REQUEST_HEADERS
-                || phase == REQUEST_PHASE_REQUEST_BODY
-                || phase == REQUEST_PHASE_RESPONSE_HEADERS
-                || phase == REQUEST_PHASE_RESPONSE_BODY
+            if phase == RequestPhase::RequestHeaders
+                || phase == RequestPhase::RequestBody
+                || phase == RequestPhase::ResponseHeaders
+                || phase == RequestPhase::ResponseBody
             {
                 return Ok(Some(ProcessingResponse {
                     response: Some(ProcessingResponseResponse::ImmediateResponse(
@@ -300,37 +329,39 @@ impl RequestContext {
         });
 
         let response: Option<ProcessingResponseResponse> = match phase {
-            REQUEST_PHASE_REQUEST_HEADERS => Some(ProcessingResponseResponse::RequestHeaders(
+            RequestPhase::RequestHeaders => Some(ProcessingResponseResponse::RequestHeaders(
                 envoy_types::pb::envoy::service::ext_proc::v3::HeadersResponse {
                     response: self.response.continue_request.clone(),
                 },
             )),
-            REQUEST_PHASE_RESPONSE_HEADERS => Some(ProcessingResponseResponse::ResponseHeaders(
+            RequestPhase::ResponseHeaders => Some(ProcessingResponseResponse::ResponseHeaders(
                 envoy_types::pb::envoy::service::ext_proc::v3::HeadersResponse {
                     response: self.response.continue_request.clone(),
                 },
             )),
-            REQUEST_PHASE_REQUEST_BODY => Some(ProcessingResponseResponse::RequestBody(
+            RequestPhase::RequestBody => Some(ProcessingResponseResponse::RequestBody(
                 envoy_types::pb::envoy::service::ext_proc::v3::BodyResponse {
                     response: self.response.continue_request.clone(),
                 },
             )),
-            REQUEST_PHASE_RESPONSE_BODY => Some(ProcessingResponseResponse::ResponseBody(
+            RequestPhase::ResponseBody => Some(ProcessingResponseResponse::ResponseBody(
                 envoy_types::pb::envoy::service::ext_proc::v3::BodyResponse {
                     response: self.response.continue_request.clone(),
                 },
             )),
-            REQUEST_PHASE_REQUEST_TRAILERS => Some(ProcessingResponseResponse::RequestTrailers(
+            RequestPhase::RequestTrailers => Some(ProcessingResponseResponse::RequestTrailers(
                 envoy_types::pb::envoy::service::ext_proc::v3::TrailersResponse {
                     header_mutation: self.response.header_mutation.clone(),
                 },
             )),
-            REQUEST_PHASE_RESPONSE_TRAILERS => Some(ProcessingResponseResponse::ResponseTrailers(
+            RequestPhase::ResponseTrailers => Some(ProcessingResponseResponse::ResponseTrailers(
                 envoy_types::pb::envoy::service::ext_proc::v3::TrailersResponse {
                     header_mutation: self.response.header_mutation.clone(),
                 },
             )),
-            _ => return Err(format!("unknown request phase {}", phase).into()),
+            RequestPhase::Undetermined => {
+                return Err(format!("unknown request phase {}", phase.as_u32()).into());
+            }
         };
 
         Ok(Some(ProcessingResponse {
@@ -341,9 +372,12 @@ impl RequestContext {
 
     /// An empty "continue" response, as used when a phase produced no
     /// response at all.
-    pub fn empty_continue_response(&self, phase: u32) -> Result<Option<ProcessingResponse>, Error> {
+    pub fn empty_continue_response(
+        &self,
+        phase: RequestPhase,
+    ) -> Result<Option<ProcessingResponse>, Error> {
         let response: Option<ProcessingResponseResponse> = match phase {
-            REQUEST_PHASE_REQUEST_HEADERS => Some(ProcessingResponseResponse::RequestHeaders(
+            RequestPhase::RequestHeaders => Some(ProcessingResponseResponse::RequestHeaders(
                 envoy_types::pb::envoy::service::ext_proc::v3::HeadersResponse {
                     response: Some(CommonResponse {
                         status: 0,
@@ -357,7 +391,7 @@ impl RequestContext {
                     }),
                 },
             )),
-            REQUEST_PHASE_REQUEST_BODY => Some(ProcessingResponseResponse::RequestBody(
+            RequestPhase::RequestBody => Some(ProcessingResponseResponse::RequestBody(
                 envoy_types::pb::envoy::service::ext_proc::v3::BodyResponse {
                     response: Some(CommonResponse {
                         status: 0,
@@ -371,7 +405,7 @@ impl RequestContext {
                     }),
                 },
             )),
-            REQUEST_PHASE_REQUEST_TRAILERS => Some(ProcessingResponseResponse::RequestTrailers(
+            RequestPhase::RequestTrailers => Some(ProcessingResponseResponse::RequestTrailers(
                 envoy_types::pb::envoy::service::ext_proc::v3::TrailersResponse {
                     header_mutation: Some(HeaderMutation {
                         set_headers: Vec::new(),
@@ -379,7 +413,7 @@ impl RequestContext {
                     }),
                 },
             )),
-            REQUEST_PHASE_RESPONSE_HEADERS => Some(ProcessingResponseResponse::ResponseHeaders(
+            RequestPhase::ResponseHeaders => Some(ProcessingResponseResponse::ResponseHeaders(
                 envoy_types::pb::envoy::service::ext_proc::v3::HeadersResponse {
                     response: Some(CommonResponse {
                         status: 0,
@@ -393,7 +427,7 @@ impl RequestContext {
                     }),
                 },
             )),
-            REQUEST_PHASE_RESPONSE_BODY => Some(ProcessingResponseResponse::ResponseBody(
+            RequestPhase::ResponseBody => Some(ProcessingResponseResponse::ResponseBody(
                 envoy_types::pb::envoy::service::ext_proc::v3::BodyResponse {
                     response: Some(CommonResponse {
                         status: 0,
@@ -407,7 +441,7 @@ impl RequestContext {
                     }),
                 },
             )),
-            REQUEST_PHASE_RESPONSE_TRAILERS => Some(ProcessingResponseResponse::ResponseTrailers(
+            RequestPhase::ResponseTrailers => Some(ProcessingResponseResponse::ResponseTrailers(
                 envoy_types::pb::envoy::service::ext_proc::v3::TrailersResponse {
                     header_mutation: Some(HeaderMutation {
                         set_headers: Vec::new(),
@@ -415,7 +449,9 @@ impl RequestContext {
                     }),
                 },
             )),
-            _ => return Err(format!("unknown request phase {}", phase).into()),
+            RequestPhase::Undetermined => {
+                return Err(format!("unknown request phase {}", phase.as_u32()).into());
+            }
         };
 
         Ok(Some(ProcessingResponse {
@@ -466,15 +502,13 @@ impl RequestContext {
         &mut self,
         name: &str,
         hv: &HeaderValue,
-        action: &str,
+        action: HeaderAppendAction,
     ) -> Result<(), Error> {
-        let action_enum = HeaderAppendAction::from_str_name(action)
-            .ok_or_else(|| format!("unknown header append action {:?}", action))?;
         let envoy_hv = hv.to_envoy_header_value(name);
         let option = HeaderValueOption {
             header: Some(envoy_hv),
             append: None,
-            append_action: action_enum as i32,
+            append_action: action as i32,
             keep_empty_value: false,
         };
         let mutation = self
@@ -489,19 +523,19 @@ impl RequestContext {
     /// Append a header value if it exists, or add it if absent. See
     /// [`update_header`](RequestContext::update_header).
     pub fn append_header(&mut self, name: &str, hv: &HeaderValue) -> Result<(), Error> {
-        self.update_header(name, hv, "APPEND_IF_EXISTS_OR_ADD")
+        self.update_header(name, hv, HeaderAppendAction::AppendIfExistsOrAdd)
     }
 
     /// Add a header value only if the header is absent. See
     /// [`update_header`](RequestContext::update_header).
     pub fn add_header(&mut self, name: &str, hv: &HeaderValue) -> Result<(), Error> {
-        self.update_header(name, hv, "ADD_IF_ABSENT")
+        self.update_header(name, hv, HeaderAppendAction::AddIfAbsent)
     }
 
     /// Overwrite a header value. See
     /// [`update_header`](RequestContext::update_header).
     pub fn overwrite_header(&mut self, name: &str, hv: &HeaderValue) -> Result<(), Error> {
-        self.update_header(name, hv, "OVERWRITE_IF_EXISTS_OR_ADD")
+        self.update_header(name, hv, HeaderAppendAction::OverwriteIfExistsOrAdd)
     }
 
     /// Update multiple headers with the given action. See
@@ -510,16 +544,14 @@ impl RequestContext {
     pub fn update_headers(
         &mut self,
         headers: &HashMap<String, HeaderValue>,
-        action: &str,
+        action: HeaderAppendAction,
     ) -> Result<(), Error> {
-        let action_enum = HeaderAppendAction::from_str_name(action)
-            .ok_or_else(|| format!("unknown header append action {:?}", action))?;
         let mut options = Vec::new();
         for (n, hv) in headers {
             options.push(HeaderValueOption {
                 header: Some(hv.to_envoy_header_value(n)),
                 append: None,
-                append_action: action_enum as i32,
+                append_action: action as i32,
                 keep_empty_value: false,
             });
         }
@@ -534,12 +566,12 @@ impl RequestContext {
 
     /// Append multiple headers. See [`update_headers`](RequestContext::update_headers).
     pub fn append_headers(&mut self, headers: &HashMap<String, HeaderValue>) -> Result<(), Error> {
-        self.update_headers(headers, "APPEND_IF_EXISTS_OR_ADD")
+        self.update_headers(headers, HeaderAppendAction::AppendIfExistsOrAdd)
     }
 
     /// Add multiple headers if absent. See [`update_headers`](RequestContext::update_headers).
     pub fn add_headers(&mut self, headers: &HashMap<String, HeaderValue>) -> Result<(), Error> {
-        self.update_headers(headers, "ADD_IF_ABSENT")
+        self.update_headers(headers, HeaderAppendAction::AddIfAbsent)
     }
 
     /// Overwrite multiple headers. See [`update_headers`](RequestContext::update_headers).
@@ -547,7 +579,7 @@ impl RequestContext {
         &mut self,
         headers: &HashMap<String, HeaderValue>,
     ) -> Result<(), Error> {
-        self.update_headers(headers, "OVERWRITE_IF_EXISTS_OR_ADD")
+        self.update_headers(headers, HeaderAppendAction::OverwriteIfExistsOrAdd)
     }
 
     /// Queue a header for removal. Removing a header that was never set is not
@@ -571,12 +603,6 @@ impl RequestContext {
             self.remove_header(h)?;
         }
         Ok(())
-    }
-
-    /// Queue multiple headers for removal, without duplicates. See
-    /// [`remove_header`](RequestContext::remove_header).
-    pub fn remove_headers_variadic(&mut self, headers: &[String]) -> Result<(), Error> {
-        self.remove_headers(headers)
     }
 
     /// Replace the body bytes of the current message.
@@ -660,67 +686,66 @@ mod tests {
     #[test]
     fn test_default_phase_if_invalid() {
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_UNDETERMINED),
-            REQUEST_PHASE_UNDETERMINED
+            default_phase_if_invalid(RequestPhase::Undetermined.as_u32()),
+            RequestPhase::Undetermined
         );
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_REQUEST_HEADERS),
-            REQUEST_PHASE_REQUEST_HEADERS
+            default_phase_if_invalid(RequestPhase::RequestHeaders.as_u32()),
+            RequestPhase::RequestHeaders
         );
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_REQUEST_BODY),
-            REQUEST_PHASE_REQUEST_BODY
+            default_phase_if_invalid(RequestPhase::RequestBody.as_u32()),
+            RequestPhase::RequestBody
         );
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_REQUEST_TRAILERS),
-            REQUEST_PHASE_REQUEST_TRAILERS
+            default_phase_if_invalid(RequestPhase::RequestTrailers.as_u32()),
+            RequestPhase::RequestTrailers
         );
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_RESPONSE_HEADERS),
-            REQUEST_PHASE_RESPONSE_HEADERS
+            default_phase_if_invalid(RequestPhase::ResponseHeaders.as_u32()),
+            RequestPhase::ResponseHeaders
         );
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_RESPONSE_BODY),
-            REQUEST_PHASE_RESPONSE_BODY
+            default_phase_if_invalid(RequestPhase::ResponseBody.as_u32()),
+            RequestPhase::ResponseBody
         );
         assert_eq!(
-            default_phase_if_invalid(REQUEST_PHASE_RESPONSE_TRAILERS),
-            REQUEST_PHASE_RESPONSE_TRAILERS
+            default_phase_if_invalid(RequestPhase::ResponseTrailers.as_u32()),
+            RequestPhase::ResponseTrailers
         );
-        assert_eq!(default_phase_if_invalid(99), REQUEST_PHASE_UNDETERMINED);
+        assert_eq!(default_phase_if_invalid(99), RequestPhase::Undetermined);
     }
 
     #[test]
     fn test_request_phase_to_string() {
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_UNDETERMINED),
+            request_phase_to_string(RequestPhase::Undetermined),
             "UNDETERMINED"
         );
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_REQUEST_HEADERS),
+            request_phase_to_string(RequestPhase::RequestHeaders),
             "REQUEST_HEADERS"
         );
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_REQUEST_BODY),
+            request_phase_to_string(RequestPhase::RequestBody),
             "REQUEST_BODY"
         );
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_REQUEST_TRAILERS),
+            request_phase_to_string(RequestPhase::RequestTrailers),
             "REQUEST_TRAILERS"
         );
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_RESPONSE_HEADERS),
+            request_phase_to_string(RequestPhase::ResponseHeaders),
             "RESPONSE_HEADERS"
         );
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_RESPONSE_BODY),
+            request_phase_to_string(RequestPhase::ResponseBody),
             "RESPONSE_BODY"
         );
         assert_eq!(
-            request_phase_to_string(REQUEST_PHASE_RESPONSE_TRAILERS),
+            request_phase_to_string(RequestPhase::ResponseTrailers),
             "RESPONSE_TRAILERS"
         );
-        assert_eq!(request_phase_to_string(99), "UNKNOWN(99)");
     }
 
     #[test]
@@ -754,19 +779,19 @@ mod tests {
             raw_value: None,
         };
         let opt = valid
-            .to_envoy_header_value_option("x-foo", "ADD_IF_ABSENT")
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::AddIfAbsent)
             .unwrap();
         assert_eq!(opt.append_action, 1);
 
         assert!(hv
-            .to_envoy_header_value_option("x-foo", "NOT_A_REAL_ACTION")
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::AddIfAbsent)
             .is_err());
         let bad = HeaderValue {
             value: "both".to_string(),
             raw_value: Some(b"raw".to_vec()),
         };
         assert!(bad
-            .to_envoy_header_value_option("x-foo", "ADD_IF_ABSENT")
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::AddIfAbsent)
             .is_err());
     }
 
@@ -807,13 +832,13 @@ mod tests {
     #[test]
     fn test_request_context_phase_lifecycle() {
         let mut rc = RequestContext::new();
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+        assert_eq!(rc.get_phase(), RequestPhase::Undetermined);
         assert_eq!(rc.get_phase_name(), "UNDETERMINED");
-        rc.set_phase(REQUEST_PHASE_RESPONSE_BODY);
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_RESPONSE_BODY);
+        rc.set_phase(RequestPhase::ResponseBody);
+        assert_eq!(rc.get_phase(), RequestPhase::ResponseBody);
         assert_eq!(rc.get_phase_name(), "RESPONSE_BODY");
-        rc.set_phase(42);
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+        rc.set_phase(default_phase_if_invalid(42));
+        assert_eq!(rc.get_phase(), RequestPhase::Undetermined);
 
         rc.set_value(
             "foo",
@@ -840,7 +865,7 @@ mod tests {
             clear_route_cache: false,
         });
         let resp = rc
-            .get_response(REQUEST_PHASE_REQUEST_HEADERS)
+            .get_response(RequestPhase::RequestHeaders)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -849,7 +874,7 @@ mod tests {
         ));
 
         let resp = rc
-            .get_response(REQUEST_PHASE_RESPONSE_TRAILERS)
+            .get_response(RequestPhase::ResponseTrailers)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -857,7 +882,7 @@ mod tests {
             Some(ProcessingResponseResponse::ResponseTrailers(_))
         ));
 
-        assert!(rc.get_response(99).is_err());
+        assert!(rc.get_response(RequestPhase::Undetermined).is_err());
     }
 
     #[test]
@@ -870,17 +895,14 @@ mod tests {
             grpc_status: None,
             details: String::new(),
         });
-        let resp = rc
-            .get_response(REQUEST_PHASE_REQUEST_BODY)
-            .unwrap()
-            .unwrap();
+        let resp = rc.get_response(RequestPhase::RequestBody).unwrap().unwrap();
         assert!(matches!(
             resp.response,
             Some(ProcessingResponseResponse::ImmediateResponse(_))
         ));
         // trailers phases ignore immediate responses
         let resp = rc
-            .get_response(REQUEST_PHASE_RESPONSE_TRAILERS)
+            .get_response(RequestPhase::ResponseTrailers)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -902,7 +924,7 @@ mod tests {
                 value: "bar".to_string(),
                 raw_value: Some(b"bar".to_vec()),
             },
-            "OVERWRITE_IF_EXISTS_OR_ADD",
+            HeaderAppendAction::OverwriteIfExistsOrAdd,
         )
         .unwrap();
         assert_eq!(
@@ -934,14 +956,16 @@ mod tests {
                 .len(),
             1
         );
+        // Without a header mutation in progress, update_header errors.
+        rc.response.header_mutation = None;
         assert!(rc
             .update_header(
                 "x-foo",
                 &HeaderValue {
                     value: "bar".to_string(),
-                    raw_value: Some(b"bar".to_vec())
+                    raw_value: None,
                 },
-                "NOT_A_REAL_ACTION"
+                HeaderAppendAction::AddIfAbsent
             )
             .is_err());
     }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use extproc::{
     AllHeaders, Error, GenericExtProcServer, Metrics, ProcessingOptions, RequestContext,
-    RequestProcessor, ServerOptions,
+    RequestPhase, RequestProcessor, ServerOptions,
 };
 
 struct LocalProcessor {
@@ -21,11 +21,11 @@ impl LocalProcessor {
 }
 
 impl RequestProcessor for LocalProcessor {
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         "local".to_string()
     }
 
-    fn get_options(&self) -> &ProcessingOptions {
+    fn options(&self) -> &ProcessingOptions {
         &self.options
     }
 
@@ -77,7 +77,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, _phase: u32, _err: Error) {}
+    fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
 
     fn close(
         &self,

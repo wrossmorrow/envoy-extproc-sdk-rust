@@ -1,5 +1,6 @@
 use extproc::{
-    AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestProcessor,
+    AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
+    RequestProcessor,
 };
 
 pub struct TrivialRequestProcessor {
@@ -7,11 +8,11 @@ pub struct TrivialRequestProcessor {
 }
 
 impl RequestProcessor for TrivialRequestProcessor {
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         "trivial".to_string()
     }
 
-    fn get_options(&self) -> &ProcessingOptions {
+    fn options(&self) -> &ProcessingOptions {
         &self.opts
     }
 
@@ -69,8 +70,8 @@ impl RequestProcessor for TrivialRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, err: Error) {
-        tracing::error!("Error in phase {}: {:?}", phase, err);
+    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+        tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 
     fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {

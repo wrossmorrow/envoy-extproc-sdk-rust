@@ -90,8 +90,8 @@ async fn run() -> Result<(), Error> {
         ..Default::default()
     };
     let processor = build_processor(&cmd, opts)?;
-    let name = processor.get_name();
-    let options = processor.get_options().clone();
+    let name = processor.name();
+    let options = processor.options().clone();
     let server = GenericExtProcServer::new(name, processor, Some(options), Metrics::new());
     server.serve(server_options).await
 }

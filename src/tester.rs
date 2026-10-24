@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::{HeaderValue, RequestContext};
+use crate::context::{HeaderAppendAction, HeaderValue, RequestContext, RequestPhase};
 use crate::headers::AllHeaders;
 use crate::options::ProcessingOptions;
 use crate::Error;
@@ -209,11 +209,11 @@ impl TesterRequestProcessor {
 }
 
 impl RequestProcessor for TesterRequestProcessor {
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         "testing".to_string()
     }
 
-    fn get_options(&self) -> &ProcessingOptions {
+    fn options(&self) -> &ProcessingOptions {
         &self.opts
     }
 
@@ -304,7 +304,7 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, _phase: u32, _err: Error) {}
+    fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
 
     fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
         Ok(())
@@ -321,24 +321,28 @@ fn report_header_parsing(ctx: &mut RequestContext, headers: &AllHeaders) {
     let _ = ctx.update_header(
         "x-parsed-str-count",
         &str(headers.headers.len().to_string()),
-        "ADD_IF_ABSENT",
+        HeaderAppendAction::AddIfAbsent,
     );
     let _ = ctx.update_header(
         "x-parsed-raw-count",
         &str(headers.raw_headers.len().to_string()),
-        "ADD_IF_ABSENT",
+        HeaderAppendAction::AddIfAbsent,
     );
     if let Some(v) = headers.get("x-probe-list") {
-        let _ = ctx.update_header("x-parsed-list-value", &str(v.clone()), "ADD_IF_ABSENT");
+        let _ = ctx.update_header(
+            "x-parsed-list-value",
+            &str(v.clone()),
+            HeaderAppendAction::AddIfAbsent,
+        );
         let _ = ctx.update_header(
             "x-parsed-list-count",
             &str(headers.values("x-probe-list").len().to_string()),
-            "ADD_IF_ABSENT",
+            HeaderAppendAction::AddIfAbsent,
         );
         let _ = ctx.update_header(
             "x-parsed-list-split",
             &str(headers.split_list("x-probe-list").join("|")),
-            "ADD_IF_ABSENT",
+            HeaderAppendAction::AddIfAbsent,
         );
     }
 }

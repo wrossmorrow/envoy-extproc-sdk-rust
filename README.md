@@ -39,10 +39,10 @@ an interface
 ```rust
 pub trait RequestProcessor: Send + Sync + 'static {
     /// The name of the processor, reported to `envoy` via the `x-extproc-names` response header.
-    fn get_name(&self) -> String;
+    fn name(&self) -> String;
 
     /// The processor's `ProcessingOptions`.
-    fn get_options(&self) -> &ProcessingOptions;
+    fn options(&self) -> &ProcessingOptions;
 
     /// Process the request headers phase.
     fn process_request_headers(
@@ -80,7 +80,7 @@ pub trait RequestProcessor: Send + Sync + 'static {
 
     /// Called when the SDK hits an error during request processing. An
     /// implemented handler can implement any logic it likes.
-    fn error_handler(&self, ctx: &mut RequestContext, phase: u32, err: Error);
+    fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
 
     /// Called on shutdown, after in-flight streams have drained.
     fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
@@ -91,7 +91,7 @@ and a context object
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use extproc::{AllHeaders, PhaseResponse, RequestContext};
+use extproc::{AllHeaders, PhaseResponse, RequestContext, RequestPhase};
 
 pub struct RequestContext {
     // parsed from headers
@@ -106,7 +106,7 @@ pub struct RequestContext {
     pub duration: Duration,
     pub end_of_stream: bool,
     pub data: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
-    pub phase: u32,
+    pub phase: RequestPhase,
     pub response: PhaseResponse,
 }
 ```
@@ -119,7 +119,7 @@ use std::sync::Arc;
 use extproc::{must_serve, ServerOptions};
 
 // define serverOptions, setup your tracing subscriber...
-// (ProcessingOptions are supplied by your processor's get_options method)
+// (ProcessingOptions are supplied by your processor's options method)
 
 #[tokio::main]
 async fn main() {
@@ -135,7 +135,7 @@ use std::sync::Arc;
 use extproc::{GenericExtProcServer, Metrics, ProcessingOptions, ServerOptions};
 
 // define serverOptions, setup your tracing subscriber...
-// (ProcessingOptions are supplied by your processor's get_options method)
+// (ProcessingOptions are supplied by your processor's options method)
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -187,16 +187,15 @@ You can add headers to a response with the convenience methods
 (rc: &mut RequestContext).append_headers(headers: &HashMap<String, HeaderValue>) -> Result<(), Error>
 (rc: &mut RequestContext).overwrite_header(name: &str, hv: &HeaderValue) -> Result<(), Error>
 (rc: &mut RequestContext).overwrite_headers(headers: &HashMap<String, HeaderValue>) -> Result<(), Error>
-(rc: &mut RequestContext).update_header(name: &str, hv: &HeaderValue, action: &str) -> Result<(), Error>
-(rc: &mut RequestContext).update_headers(headers: &HashMap<String, HeaderValue>, action: &str) -> Result<(), Error>
+(rc: &mut RequestContext).update_header(name: &str, hv: &HeaderValue, action: HeaderAppendAction) -> Result<(), Error>
+(rc: &mut RequestContext).update_headers(headers: &HashMap<String, HeaderValue>, action: HeaderAppendAction) -> Result<(), Error>
 ```
-where `append` adds header values if they exist, `add` adds a new value only if the header doesn't exist, and `overwrite` will add or overwrite if a header exists. The `RequestContext` should keep track of these headers and include them in a `continue_request` or `cancel_request` call. `update_header`/`update_headers` is a generic method that should accept any action in protobuf enums wrapped or not in a specific method. Note though using this will error on invalid header update actions.
+where `append` adds header values if they exist, `add` adds a new value only if the header doesn't exist, and `overwrite` will add or overwrite if a header exists. The `RequestContext` should keep track of these headers and include them in a `continue_request` or `cancel_request` call. `update_header`/`update_headers` take a typed [`HeaderAppendAction`](https://docs.rs/envoy-types/latest/envoy_types/pb/envoy/config/core/v3/header_value_option/enum.HeaderAppendAction.html) from the envoy protocol, so an action outside the protocol's set is not representable and cannot produce a runtime error; invalid header values are still rejected.
 
 Headers can be removed with the
 ```rust
 (rc: &mut RequestContext).remove_header(name: &str) -> Result<(), Error>
 (rc: &mut RequestContext).remove_headers(headers: &[String]) -> Result<(), Error>
-(rc: &mut RequestContext).remove_headers_variadic(headers: &[String]) -> Result<(), Error>
 ```
 methods, requiring only names of headers to remove.
 
