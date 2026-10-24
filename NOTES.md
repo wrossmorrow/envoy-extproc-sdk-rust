@@ -21,6 +21,16 @@ Suggested stage breakdown (adjust as reality hits):
 4. **Stage 4** — Tests replicating the Go test suite (context, headers, options,
    phase, metrics, health, server).
 
+Remaining plan items:
+
+5. **Stage 5** — Implement integration tests. **In progress**: the `tests/` harness
+   now has `extproc_integration.rs` (gRPC) and `http_integration.rs` (plain HTTP;
+   HTTP suite at 10/11 passing, one red), plus `Dockerfile`/`justfile`/`compose.yaml`/
+   `envoy.yaml`. Not yet done: full green gate across all suites, remaining cases.
+6. **Stage 6** — Implement examples. **Not started**: port the Go `examples/`
+   processors (`noop`, `trivial`, `timer`, `data`, `digest`, `dedup`, `masker`,
+   `echo`) to Rust.
+
 ## Environment
 
 - Rust toolchain at `/usr/local/cargo` (rustc/cargo 1.99.1); must run cargo with
