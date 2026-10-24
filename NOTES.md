@@ -149,16 +149,16 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      header. Decide whether to switch to OpenMetrics output or keep TextEncoder.
    - Tests: handler/registry wiring unit tests; keep full gate green.
 
-2. **Phase 2 — Graceful shutdown wiring** (completes gap 2).
-   - Replace the ctrl_c-only signal future with an SIGINT+SIGTERM future via
-     `tokio::signal::unix::{signal, SignalKind}`.
-   - Keep a handle to the `HealthServer` used by the gRPC service; on signal call
-     `mark_not_ready`, wait `unready_propagation_delay_seconds`, then graceful stop, force
-     stop after `termination_grace_period_seconds`, shutdown the metrics server, and call
-     the processor `close`, propagating its error.
-   - Design decision: tonic 0.14 `serve_with_shutdown` performs graceful shutdown without an
+2. **Phase 2 — Graceful shutdown wiring** (completes gap 2) — **IN PROGRESS (2026-10-24)**.
+   - ✅ Done: replaced the ctrl_c-only signal future with an SIGINT+SIGTERM future via
+     `tokio::signal::unix::{signal, SignalKind}`; signal future marks the health service
+     unready and waits out `unready_propagation_delay_seconds`; tonic `serve_with_shutdown`
+     performs the graceful stop; processor `close` error is now propagated.
+   - ⬜ Remaining: force stop after `termination_grace_period_seconds`. Design decision
+     (recorded): tonic 0.14 `serve_with_shutdown` performs graceful shutdown without an
      externally-bounded force-stop. Either accept tonic's semantics or restructure around an
-     incoming stream to implement the bounded force-stop. Decide and document.
+     incoming stream to implement the bounded force-stop. Metrics server shutdown deferred to
+     Phase 1.
 
 3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (completes the
    additional findings above).

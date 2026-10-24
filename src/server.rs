@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessor;
 use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
@@ -24,6 +24,8 @@ use crate::REQUEST_PHASE_RESPONSE_HEADERS;
 use crate::REQUEST_PHASE_RESPONSE_TRAILERS;
 use crate::REQUEST_PHASE_UNDETERMINED;
 use prometheus::Encoder;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::sleep;
 use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -288,13 +290,31 @@ impl GenericExtProcServer {
 
         // grpc server
         let health = crate::health::HealthServer::new_ready();
+        let health_for_shutdown = health.clone();
         let grpc_server = Server::builder()
             .max_concurrent_streams(server_options.max_concurrent_streams)
             .add_service(ExternalProcessorServer::new(self.clone()))
             .add_service(health.health_service());
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], server_options.ext_proc_port));
-        let signal = async {
-            let _ = tokio::signal::ctrl_c().await;
+
+        // Shutdown signal: on SIGINT/SIGTERM mark the health service unready and
+        // wait out the unready propagation delay; the graceful shutdown then runs.
+        let sigint = signal(SignalKind::interrupt())
+            .map_err(|e| format!("failed to listen for SIGINT: {}", e))?;
+        let sigterm = signal(SignalKind::terminate())
+            .map_err(|e| format!("failed to listen for SIGTERM: {}", e))?;
+        let unready_delay_seconds = server_options.unready_propagation_delay_seconds;
+
+        let signal = async move {
+            let mut sigint = sigint;
+            let mut sigterm = sigterm;
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+            let mut health = health_for_shutdown;
+            health.mark_not_ready().await;
+            sleep(Duration::from_secs(unready_delay_seconds as u64)).await;
         };
         let grpc_fut = grpc_server.serve_with_shutdown(addr, signal);
         grpc_fut
@@ -302,7 +322,7 @@ impl GenericExtProcServer {
             .map_err(|e| format!("failed to serve extproc gRPC server: {}", e))?;
 
         // notify processor
-        let _ = self.close(server_options.termination_grace_period_seconds);
+        self.close(server_options.termination_grace_period_seconds)?;
 
         Ok(())
     }
