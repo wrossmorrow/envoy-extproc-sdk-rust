@@ -554,14 +554,20 @@ impl Stream for ProcessStream {
         // The task sends each phase's response (or a terminal error) in order,
         // so relaying preserves envoy's ordered phase flow. A closed channel
         // means the task has finished and the stream is done.
-        if let Poll::Ready(Some(resp)) = this.rx.poll_recv(cx) {
-            return match resp {
-                Ok(resp) => Poll::Ready(Some(Ok(resp))),
-                Err(e) => {
-                    this.errored = true;
-                    Poll::Ready(Some(Err(e)))
-                }
-            };
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(resp)) => {
+                return match resp {
+                    Ok(resp) => Poll::Ready(Some(Ok(resp))),
+                    Err(e) => {
+                        this.errored = true;
+                        Poll::Ready(Some(Err(e)))
+                    }
+                };
+            }
+            // The task has finished and dropped the sender: the exchange is
+            // complete, so end the stream.
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => {}
         }
         Poll::Pending
     }
