@@ -24,6 +24,9 @@ fn build_processor(
             opts,
         })),
         "dedup" => Ok(Arc::new(processors::dedup::DedupRequestProcessor { opts })),
+        "masker" => Ok(Arc::new(processors::masker::MaskerRequestProcessor::new(
+            opts,
+        ))),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
