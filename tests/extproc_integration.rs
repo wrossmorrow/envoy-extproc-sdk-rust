@@ -37,13 +37,6 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 // ---------------------------------------------------------------------------
 
 /// A free TCP port, for binding the server under test.
-async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
 /// A spawned [`GenericExtProcServer`] serving via tonic on a real listener, plus
 /// the addresses it bound and the task handle for shutdown.
 struct RunningServer {
@@ -59,25 +52,15 @@ impl RunningServer {
 }
 
 async fn spawn_server(processor: Arc<dyn RequestProcessor>) -> RunningServer {
-    let ext_proc_port = free_port().await;
-    let metrics_http_port = free_port().await;
     let server = GenericExtProcServer::new(
         "testing".to_string(),
         processor,
         Some(ProcessingOptions::default()),
         Metrics::new(),
     );
-    let task = tokio::spawn(async move {
-        server
-            .serve(ServerOptions {
-                ext_proc_port,
-                metrics_http_port,
-                ..Default::default()
-            })
-            .await
-    });
-    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], ext_proc_port));
-    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], metrics_http_port));
+    let task = tokio::spawn(async move { server.serve(ServerOptions::default()).await });
+    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 50051));
+    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9090));
 
     // Wait for the gRPC server to accept connections.
     let deadline = Duration::from_secs(15);
@@ -257,21 +240,13 @@ fn metrics_counter_value(text: &str, name: &str) -> Option<f64> {
 async fn integration_noop_stream() {
     // Spawn the real server binary as a subprocess.
     let bin = std::env::var("CARGO_BIN_EXE_extproc-tester").expect("CARGO_BIN_EXE_extproc-tester");
-    let ext_proc_port = free_port().await;
-    let metrics_http_port = free_port().await;
     let child = std::process::Command::new(bin)
-        .args([
-            "--extproc-port",
-            &ext_proc_port.to_string(),
-            "--metrics-http-port",
-            &metrics_http_port.to_string(),
-        ])
         .spawn()
         .expect("failed to spawn server binary");
     // Ensure the spawned server is cleaned up even if the test fails.
     let _child_guard = ChildGuard { child };
 
-    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], ext_proc_port));
+    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 50051));
     let deadline = Duration::from_secs(15);
     let start = std::time::Instant::now();
     let mut client = loop {
