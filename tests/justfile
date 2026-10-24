@@ -30,8 +30,10 @@ containerize tag=image_tag *flags="":
     cd .. && docker build -f tests/Dockerfile -t {{image_name}}:test-{{tag}} . {{flags}}
 
 # run the test server in a container setup with envoy and an echo server
+# (detached so it does not block; waits for the extproc healthcheck before
+# returning since envoy depends on it being healthy)
 up *flags:
-    cd .. && docker compose -f tests/compose.yaml up --build {{flags}}
+    cd .. && docker compose -f tests/compose.yaml up -d --build {{flags}}
 
 # stop the test server setup
 down *flags:
