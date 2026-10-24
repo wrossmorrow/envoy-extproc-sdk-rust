@@ -51,16 +51,25 @@ impl RunningServer {
     }
 }
 
-async fn spawn_server(processor: Arc<dyn RequestProcessor>) -> RunningServer {
+async fn spawn_server_with(
+    processor: Arc<dyn RequestProcessor>,
+    grpc_port: u16,
+    metrics_port: u16,
+) -> RunningServer {
     let server = GenericExtProcServer::new(
         "testing".to_string(),
         processor,
         Some(ProcessingOptions::default()),
         Metrics::new(),
     );
-    let task = tokio::spawn(async move { server.serve(ServerOptions::default()).await });
-    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 50051));
-    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9090));
+    let server_options = ServerOptions {
+        ext_proc_port: grpc_port,
+        metrics_http_port: metrics_port,
+        ..ServerOptions::new()
+    };
+    let task = tokio::spawn(async move { server.serve(server_options).await });
+    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], grpc_port));
+    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], metrics_port));
 
     // Wait for the gRPC server to accept connections.
     let deadline = Duration::from_secs(15);
@@ -211,7 +220,9 @@ async fn send_recv(
 async fn fetch_metrics_text(metrics_addr: std::net::SocketAddr) -> String {
     let client: Client<HttpConnector, Full<HyperBytes>> =
         Client::builder(TokioExecutor::new()).build_http();
-    let uri: hyper::http::Uri = format!("http://{}", metrics_addr).parse().unwrap();
+    let uri: hyper::http::Uri = format!("http://{}{}", metrics_addr, "/metrics")
+        .parse()
+        .unwrap();
     let resp = client
         .get(uri)
         .await
@@ -274,10 +285,19 @@ async fn integration_noop_stream() {
     .await
     .expect("expected continue response");
     assert_eq!(continue_status(&resp), Some(0));
-    assert!(response_common(&resp)
-        .expect("common response")
+    let common = response_common(&resp).expect("common response");
+    let hm = common
         .header_mutation
-        .is_none());
+        .as_ref()
+        .expect("header mutation in response");
+    assert_eq!(hm.set_headers.len(), 2);
+    let keys: Vec<&str> = hm
+        .set_headers
+        .iter()
+        .map(|o| o.header.as_ref().unwrap().key.as_str())
+        .collect();
+    assert!(keys.contains(&"x-parsed-str-count"));
+    assert!(keys.contains(&"x-parsed-raw-count"));
 
     let resp = send_recv(&mut tx, &mut stream, envoy_request_body(b"{}", true))
         .await
@@ -315,7 +335,7 @@ async fn integration_request_body_actions() {
         "remove_request_headers": ["x-remove-me"],
         "replace_request_body": "brand new body"
     }"#;
-    let server = spawn_server(Arc::new(TesterRequestProcessor::default())).await;
+    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50162, 9118).await;
     let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
         .await
         .expect("failed to connect");
@@ -375,7 +395,7 @@ async fn integration_response_header_actions() {
         "overwrite_response_headers": {"content-type": "test/plain"},
         "remove_response_headers": ["date"]
     }"#;
-    let server = spawn_server(Arc::new(TesterRequestProcessor::default())).await;
+    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50163, 9119).await;
     let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
         .await
         .expect("failed to connect");
@@ -430,7 +450,7 @@ async fn integration_response_header_actions() {
 #[tokio::test]
 async fn integration_response_body_actions() {
     let actions = r#"{ "replace_response_body": "replaced body" }"#;
-    let server = spawn_server(Arc::new(TesterRequestProcessor::default())).await;
+    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50164, 9120).await;
     let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
         .await
         .expect("failed to connect");
@@ -489,7 +509,7 @@ async fn integration_cancel_request() {
         "cancel_request_headers": {"x-custom-header": "true"},
         "cancel_request_body": "{\"error\":\"BadRequest\"}"
     }"#;
-    let server = spawn_server(Arc::new(TesterRequestProcessor::default())).await;
+    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50165, 9121).await;
     let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
         .await
         .expect("failed to connect");
@@ -597,9 +617,13 @@ async fn integration_error_path() {
         }
     }
 
-    let server = spawn_server(Arc::new(ErroringProcessor {
-        opts: ProcessingOptions::default(),
-    }))
+    let server = spawn_server_with(
+        Arc::new(ErroringProcessor {
+            opts: ProcessingOptions::default(),
+        }),
+        50156,
+        9116,
+    )
     .await;
     let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
         .await
@@ -644,7 +668,7 @@ async fn integration_error_path() {
 
 #[tokio::test]
 async fn integration_health() {
-    let server = spawn_server(Arc::new(TesterRequestProcessor::default())).await;
+    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50166, 9122).await;
     let channel = tonic::transport::Channel::from_shared(format!("http://{}", server.grpc_addr))
         .expect("valid channel address")
         .connect()
@@ -663,7 +687,7 @@ async fn integration_health() {
 
 #[tokio::test]
 async fn integration_metrics_endpoint() {
-    let server = spawn_server(Arc::new(TesterRequestProcessor::default())).await;
+    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50161, 9117).await;
     let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
         .await
         .expect("failed to connect");
@@ -708,7 +732,7 @@ async fn integration_metrics_endpoint() {
         Some(1.0)
     );
     assert_eq!(
-        metrics_counter_value(&text, "extproc_total_request_body"),
+        metrics_counter_value(&text, "extproc_request_body_messages_total"),
         Some(1.0)
     );
 
