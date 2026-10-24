@@ -130,6 +130,9 @@ impl GenericExtProcServer {
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
     ) -> Result<(Option<ProcessingResponse>, u32), Error> {
+        // Reset phase-scoped state at the start of every phase, mirroring the
+        // Go SDK's per-message reset (and `initReqCtx`'s reset for the
+        // request-headers phase).
         rc.reset_phase()?;
         let mut phase = REQUEST_PHASE_UNDETERMINED;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
