@@ -88,7 +88,8 @@ static_resources:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config:
-          http_protocol_options: {}
-  admin:
-    address:
-      socket_address: {address: 0.0.0.0, port_value: 9901}
+          http2_protocol_options: {}
+
+admin:
+  address:
+    socket_address: {address: 0.0.0.0, port_value: 9901}
