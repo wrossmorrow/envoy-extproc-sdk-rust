@@ -15,6 +15,9 @@ fn build_processor(
 ) -> Result<Arc<dyn RequestProcessor>, Error> {
     match name {
         "noop" => Ok(Arc::new(processors::noop::NoopRequestProcessor { opts })),
+        "trivial" => Ok(Arc::new(processors::trivial::TrivialRequestProcessor {
+            opts,
+        })),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
