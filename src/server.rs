@@ -343,7 +343,6 @@ impl GenericExtProcServer {
             let mut health = health_for_shutdown;
             health.mark_not_ready().await;
             sleep(Duration::from_secs(unready_delay_seconds as u64)).await;
-            let _ = shutdown_tx.send(());
         };
         let grpc_fut = grpc_server.serve_with_shutdown(addr, signal);
         let grpc_result = grpc_fut
