@@ -1,11 +1,10 @@
-//! End-to-end integration tests: drive a real [`GenericExtProcServer`] over a
-//! real gRPC stream, using the generated tonic client the way envoy does, and
-//! assert on the [`ProcessingResponse`]s the server produces.
+//! End-to-end integration tests: drive a real ext_proc server over a real gRPC
+//! stream, using the generated tonic client the way envoy does, and assert on
+//! the [`ProcessingResponse`]s the server produces.
 
 #![allow(clippy::too_many_lines)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use envoy_types::pb::envoy::config::core::v3::HeaderMap as EnvoyHeaderMap;
@@ -20,10 +19,6 @@ use envoy_types::pb::envoy::service::ext_proc::v3::{
     CommonResponse, ImmediateResponse, ProcessingRequest, ProcessingResponse,
 };
 
-use extproc::{
-    AllHeaders, Error, GenericExtProcServer, Metrics, ProcessingOptions, RequestContext,
-    RequestProcessor, ServerOptions, TesterRequestProcessor,
-};
 use http_body_util::Full;
 use hyper::body::Bytes as HyperBytes;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -36,61 +31,43 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 // Harness
 // ---------------------------------------------------------------------------
 
-/// A free TCP port, for binding the server under test.
-/// A spawned [`GenericExtProcServer`] serving via tonic on a real listener, plus
-/// the addresses it bound and the task handle for shutdown.
-struct RunningServer {
-    grpc_addr: std::net::SocketAddr,
-    metrics_addr: std::net::SocketAddr,
-    task: tokio::task::JoinHandle<Result<(), extproc::Error>>,
+/// The gRPC address of the ext_proc server under test, from the
+/// `EXTO_PROC_GRPC_ADDR` environment variable and defaulting to the SDK default
+/// (`127.0.0.1:50051`).
+fn grpc_addr() -> std::net::SocketAddr {
+    std::env::var("EXTO_PROC_GRPC_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 50051)))
 }
 
-impl RunningServer {
-    async fn shutdown(self) {
-        self.task.abort();
-    }
+/// The metrics HTTP address of the ext_proc server under test, from the
+/// `EXTO_PROC_METRICS_ADDR` environment variable and defaulting to the SDK
+/// default (`127.0.0.1:9090`).
+fn metrics_addr() -> std::net::SocketAddr {
+    std::env::var("EXTO_PROC_METRICS_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 9090)))
 }
 
-async fn spawn_server_with(
-    processor: Arc<dyn RequestProcessor>,
-    grpc_port: u16,
-    metrics_port: u16,
-) -> RunningServer {
-    let server = GenericExtProcServer::new(
-        "testing".to_string(),
-        processor,
-        Some(ProcessingOptions::default()),
-        Metrics::new(),
-    );
-    let server_options = ServerOptions {
-        ext_proc_port: grpc_port,
-        metrics_http_port: metrics_port,
-        ..ServerOptions::new()
-    };
-    let task = tokio::spawn(async move { server.serve(server_options).await });
-    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], grpc_port));
-    let metrics_addr = std::net::SocketAddr::from(([127, 0, 0, 1], metrics_port));
-
-    // Wait for the gRPC server to accept connections.
+/// Connect to the ext_proc server under test, retrying until it accepts
+/// connections. The tests drive an already-running server and do not own or
+/// spawn one, so they are agnostic of how the server is run (binary, in-process,
+/// or compose).
+async fn connect_grpc(
+    addr: std::net::SocketAddr,
+) -> ExternalProcessorClient<tonic::transport::Channel> {
     let deadline = Duration::from_secs(15);
     let start = std::time::Instant::now();
     loop {
-        if ExternalProcessorClient::connect(format!("http://{}", grpc_addr))
-            .await
-            .is_ok()
-        {
-            break;
+        if let Ok(c) = ExternalProcessorClient::connect(format!("http://{}", addr)).await {
+            return c;
         }
         if start.elapsed() > deadline {
             panic!("extproc server did not become ready in time");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    RunningServer {
-        grpc_addr,
-        metrics_addr,
-        task,
     }
 }
 
@@ -249,26 +226,8 @@ fn metrics_counter_value(text: &str, name: &str) -> Option<f64> {
 
 #[tokio::test]
 async fn integration_noop_stream() {
-    // Spawn the real server binary as a subprocess.
-    let bin = std::env::var("CARGO_BIN_EXE_extproc-tester").expect("CARGO_BIN_EXE_extproc-tester");
-    let child = std::process::Command::new(bin)
-        .spawn()
-        .expect("failed to spawn server binary");
-    // Ensure the spawned server is cleaned up even if the test fails.
-    let _child_guard = ChildGuard { child };
-
-    let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 50051));
-    let deadline = Duration::from_secs(15);
-    let start = std::time::Instant::now();
-    let mut client = loop {
-        if let Ok(c) = ExternalProcessorClient::connect(format!("http://{}", grpc_addr)).await {
-            break c;
-        }
-        if start.elapsed() > deadline {
-            panic!("extproc server did not become ready in time");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
+    let grpc_addr = grpc_addr();
+    let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
     let mut stream = client
         .process(ReceiverStream::new(rx))
@@ -314,19 +273,6 @@ async fn integration_noop_stream() {
     assert!(stream.next().await.is_none());
 }
 
-/// Kills and reaps a spawned server child when dropped, so a failed test
-/// cannot leak a running server process.
-struct ChildGuard {
-    child: std::process::Child,
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 #[tokio::test]
 async fn integration_request_body_actions() {
     let actions = r#"{
@@ -335,10 +281,8 @@ async fn integration_request_body_actions() {
         "remove_request_headers": ["x-remove-me"],
         "replace_request_body": "brand new body"
     }"#;
-    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50162, 9118).await;
-    let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
-        .await
-        .expect("failed to connect");
+    let grpc_addr = grpc_addr();
+    let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
     let mut stream = client
         .process(ReceiverStream::new(rx))
@@ -384,7 +328,6 @@ async fn integration_request_body_actions() {
 
     drop(tx);
     assert!(stream.next().await.is_none());
-    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -395,10 +338,8 @@ async fn integration_response_header_actions() {
         "overwrite_response_headers": {"content-type": "test/plain"},
         "remove_response_headers": ["date"]
     }"#;
-    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50163, 9119).await;
-    let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
-        .await
-        .expect("failed to connect");
+    let grpc_addr = grpc_addr();
+    let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
     let mut stream = client
         .process(ReceiverStream::new(rx))
@@ -444,16 +385,13 @@ async fn integration_response_header_actions() {
 
     drop(tx);
     assert!(stream.next().await.is_none());
-    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn integration_response_body_actions() {
     let actions = r#"{ "replace_response_body": "replaced body" }"#;
-    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50164, 9120).await;
-    let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
-        .await
-        .expect("failed to connect");
+    let grpc_addr = grpc_addr();
+    let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
     let mut stream = client
         .process(ReceiverStream::new(rx))
@@ -498,7 +436,6 @@ async fn integration_response_body_actions() {
 
     drop(tx);
     assert!(stream.next().await.is_none());
-    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -509,10 +446,8 @@ async fn integration_cancel_request() {
         "cancel_request_headers": {"x-custom-header": "true"},
         "cancel_request_body": "{\"error\":\"BadRequest\"}"
     }"#;
-    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50165, 9121).await;
-    let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
-        .await
-        .expect("failed to connect");
+    let grpc_addr = grpc_addr();
+    let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
     let mut stream = client
         .process(ReceiverStream::new(rx))
@@ -553,123 +488,12 @@ async fn integration_cancel_request() {
 
     drop(tx);
     assert!(stream.next().await.is_none());
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn integration_error_path() {
-    struct ErroringProcessor {
-        opts: ProcessingOptions,
-    }
-
-    impl RequestProcessor for ErroringProcessor {
-        fn get_name(&self) -> String {
-            "erroring".to_string()
-        }
-        fn get_options(&self) -> &ProcessingOptions {
-            &self.opts
-        }
-        fn process_request_headers(
-            &self,
-            _ctx: &mut RequestContext,
-            _headers: &AllHeaders,
-        ) -> Result<(), Error> {
-            Err("processor exploded".into())
-        }
-        fn process_request_trailers(
-            &self,
-            ctx: &mut RequestContext,
-            _trailers: &AllHeaders,
-        ) -> Result<(), Error> {
-            ctx.continue_request()
-        }
-        fn process_request_body(
-            &self,
-            ctx: &mut RequestContext,
-            _body: &[u8],
-        ) -> Result<(), Error> {
-            ctx.continue_request()
-        }
-        fn process_response_headers(
-            &self,
-            ctx: &mut RequestContext,
-            _headers: &AllHeaders,
-        ) -> Result<(), Error> {
-            ctx.continue_request()
-        }
-        fn process_response_body(
-            &self,
-            _ctx: &mut RequestContext,
-            _body: &[u8],
-        ) -> Result<(), Error> {
-            Err("processor exploded".into())
-        }
-        fn process_response_trailers(
-            &self,
-            ctx: &mut RequestContext,
-            _trailers: &AllHeaders,
-        ) -> Result<(), Error> {
-            ctx.continue_request()
-        }
-        fn error_handler(&self, _ctx: &mut RequestContext, _phase: u32, _err: Error) {}
-        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
-            Ok(())
-        }
-    }
-
-    let server = spawn_server_with(
-        Arc::new(ErroringProcessor {
-            opts: ProcessingOptions::default(),
-        }),
-        50156,
-        9116,
-    )
-    .await;
-    let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
-        .await
-        .expect("failed to connect");
-    let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
-    let mut stream = client
-        .process(ReceiverStream::new(rx))
-        .await
-        .expect("failed to open process stream")
-        .into_inner();
-    let mut tx = tx;
-
-    let resp = send_recv(
-        &mut tx,
-        &mut stream,
-        envoy_request_headers(false, &[(":method", "GET"), (":path", "/test")]),
-    )
-    .await;
-    let status = resp.expect_err("expected phase error");
-    assert_eq!(status.code(), tonic::Code::Internal);
-
-    drop(tx);
-    assert!(stream.next().await.is_none());
-
-    // The phase error was counted and the stream was marked as errored.
-    let text = fetch_metrics_text(server.metrics_addr).await;
-    assert_eq!(
-        metrics_counter_value(&text, "extproc_phase_errors_total"),
-        Some(1.0)
-    );
-    assert_eq!(
-        metrics_counter_value(&text, "extproc_errored_streams"),
-        Some(1.0)
-    );
-    assert_eq!(
-        metrics_counter_value(&text, "extproc_total_streams"),
-        Some(1.0)
-    );
-
-    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn integration_health() {
-    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50166, 9122).await;
-    let channel = tonic::transport::Channel::from_shared(format!("http://{}", server.grpc_addr))
+    let grpc_addr = grpc_addr();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", grpc_addr))
         .expect("valid channel address")
         .connect()
         .await
@@ -682,15 +506,12 @@ async fn integration_health() {
         .await
         .expect("health check failed");
     assert_eq!(resp.into_inner().status, 1); // Serving
-    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn integration_metrics_endpoint() {
-    let server = spawn_server_with(Arc::new(TesterRequestProcessor::default()), 50161, 9117).await;
-    let mut client = ExternalProcessorClient::connect(format!("http://{}", server.grpc_addr))
-        .await
-        .expect("failed to connect");
+    let grpc_addr = grpc_addr();
+    let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
     let mut stream = client
         .process(ReceiverStream::new(rx))
@@ -698,6 +519,16 @@ async fn integration_metrics_endpoint() {
         .expect("failed to open process stream")
         .into_inner();
     let mut tx = tx;
+
+    // Metrics are cumulative over the lifetime of the server, so assert on
+    // deltas across this test's own stream.
+    let text_before = fetch_metrics_text(metrics_addr()).await;
+    let bytes_before = metrics_counter_value(&text_before, "extproc_request_body_bytes_total")
+        .expect("before: body bytes");
+    let streams_before =
+        metrics_counter_value(&text_before, "extproc_total_streams").expect("before: streams");
+    let msgs_before = metrics_counter_value(&text_before, "extproc_request_body_messages_total")
+        .expect("before: body messages");
 
     let resp = send_recv(
         &mut tx,
@@ -721,20 +552,16 @@ async fn integration_metrics_endpoint() {
     drop(tx);
     assert!(stream.next().await.is_none());
 
-    let text = fetch_metrics_text(server.metrics_addr).await;
+    let text = fetch_metrics_text(metrics_addr()).await;
     assert!(text.contains("# EOF"));
-    assert_eq!(
-        metrics_counter_value(&text, "extproc_request_body_bytes_total"),
-        Some(5.0)
-    );
-    assert_eq!(
-        metrics_counter_value(&text, "extproc_total_streams"),
-        Some(1.0)
-    );
-    assert_eq!(
-        metrics_counter_value(&text, "extproc_request_body_messages_total"),
-        Some(1.0)
-    );
+    let bytes_after = metrics_counter_value(&text, "extproc_request_body_bytes_total")
+        .expect("after: body bytes");
+    let streams_after =
+        metrics_counter_value(&text, "extproc_total_streams").expect("after: streams");
+    let msgs_after = metrics_counter_value(&text, "extproc_request_body_messages_total")
+        .expect("after: body messages");
 
-    server.shutdown().await;
+    assert_eq!(bytes_after, bytes_before + 5.0);
+    assert_eq!(streams_after, streams_before + 1.0);
+    assert_eq!(msgs_after, msgs_before + 1.0);
 }

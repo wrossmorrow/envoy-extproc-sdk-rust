@@ -1131,9 +1131,19 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "GET")])),
             false,
         ))));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
-        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
-        assert!(resp.is_some());
+        let err = server.process_phase(&req, &mut rc).unwrap_err();
+        assert!(err.to_string().contains("processor exploded"));
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+
+        // The phase error was counted by the server metrics.
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
     }
 
     #[test]
