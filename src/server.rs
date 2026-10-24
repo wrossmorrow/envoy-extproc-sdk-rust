@@ -971,7 +971,125 @@ mod tests {
     }
 
     #[test]
-    fn test_process_phase_processor_error_propagates() {
+    fn test_process_phase_response_headers_mutation_without_explicit_reset() {
+        // A fresh RequestContext must already carry a phase response mutation:
+        // the server appends `x-extproc-names` during the response-headers phase
+        // without any explicit reset, so a fresh context must accept mutations.
+        // (Go resets via rc.ResetPhase() per phase message; the Rust port must do
+        // the same internally.)
+        let options = ProcessingOptions {
+            update_ext_proc_header: true,
+            update_duration_header: false,
+            abort_on_processor_failure: false,
+        };
+        let proc = Arc::new(TestProcessor::new("myproc", Some(options.clone())));
+        let server = GenericExtProcServer::new(
+            "myproc".to_string(),
+            proc.clone(),
+            Some(options),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseHeaders(http_headers(
+            Some(&envoy_header_map(&[("x-foo", "bar")])),
+            false,
+        ))));
+        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        let mutation = rc.response.header_mutation.as_ref().unwrap();
+        assert_eq!(mutation.set_headers.len(), 1);
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-extproc-names"
+        );
+    }
+
+    #[test]
+    fn test_process_phase_resets_mutation_between_phases() {
+        // Mutations must not accumulate across phases within one stream: the
+        // response-headers phase appends `x-extproc-names`, and the following
+        // response-body phase must start from a clean mutation.
+        let options = ProcessingOptions {
+            update_ext_proc_header: true,
+            update_duration_header: false,
+            abort_on_processor_failure: false,
+        };
+        let proc = Arc::new(TestProcessor::new("myproc", Some(options.clone())));
+        let server = GenericExtProcServer::new(
+            "myproc".to_string(),
+            proc.clone(),
+            Some(options),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseHeaders(http_headers(
+            Some(&envoy_header_map(&[("x-foo", "bar")])),
+            false,
+        ))));
+        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        assert_eq!(
+            rc.response
+                .header_mutation
+                .as_ref()
+                .unwrap()
+                .set_headers
+                .len(),
+            1
+        );
+
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseBody(HttpBody {
+            body: b"hello".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert_eq!(
+            rc.response
+                .header_mutation
+                .as_ref()
+                .unwrap()
+                .set_headers
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_process_phase_processor_error_with_abort_propagates() {
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            Arc::new(ErroringProcessor {
+                opts: ProcessingOptions {
+                    abort_on_processor_failure: true,
+                    ..ProcessingOptions::new()
+                },
+            }),
+            Some(ProcessingOptions {
+                abort_on_processor_failure: true,
+                ..ProcessingOptions::new()
+            }),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let err = server.process_phase(&req, &mut rc).unwrap_err();
+        assert!(err.to_string().contains("processor exploded"));
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+    }
+
+    #[test]
+    fn test_process_phase_processor_error_without_abort_sends_empty_continue() {
+        // Without AbortOnProcessorFailure, a phase error must send an empty
+        // continue response and keep the stream alive (Go semantics).
         let server = GenericExtProcServer::new(
             "test".to_string(),
             Arc::new(ErroringProcessor {
@@ -986,9 +1104,9 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "GET")])),
             false,
         ))));
-        let err = server.process_phase(&req, &mut rc).unwrap_err();
-        assert!(err.to_string().contains("processor exploded"));
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert!(resp.is_some());
     }
 
     #[test]
