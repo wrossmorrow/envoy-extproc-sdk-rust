@@ -192,14 +192,23 @@ Port progress on this branch (checked off as each example lands):
 
 - [x] Port plan + status summary added here; starting-point dispatcher binary and `noop`
       processor committed.
-- [ ] `trivial`
-- [ ] `timer`
-- [ ] `data`
-- [ ] `digest`
-- [ ] `dedup`
-- [ ] `masker`
-- [ ] `echo`
-- [ ] `router`
+- [x] `trivial`
+- [x] `timer`
+- [x] `data`
+- [x] `digest`
+- [x] `dedup`
+- [x] `masker`
+- [x] `echo`
+- [x] `router`
+- [ ] Wire the example server into the Go-examples-style compose/envoy setup
+      (`examples/envoy.yaml`, `examples/compose.yaml`, `examples/Dockerfile`,
+      `examples/justfile`) and update the dispatcher flags (`-port`,
+      `-update-extproc-header`, `-update-duration-header`) to full parity with
+      the Go `examples/main.go`.
+- [ ] Update the Rust `README.md` Examples section now that the Go examples are
+      ported.
+- [ ] Consider promoting the example processors into the lib (public) if they
+      should be reusable outside the example binary.
 
 ## Go test inventory (ported so far)
 
