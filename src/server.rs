@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessor;
 use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
@@ -24,6 +24,8 @@ use crate::REQUEST_PHASE_RESPONSE_HEADERS;
 use crate::REQUEST_PHASE_RESPONSE_TRAILERS;
 use crate::REQUEST_PHASE_UNDETERMINED;
 use prometheus::Encoder;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::sleep;
 use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -132,6 +134,17 @@ impl GenericExtProcServer {
         let mut phase = REQUEST_PHASE_UNDETERMINED;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
         rc.duration += phase_start.elapsed();
+        if outcome.is_err()
+            && self
+                .options
+                .as_ref()
+                .is_some_and(|o| o.abort_on_processor_failure)
+        {
+            // Abort requested: propagate the phase error, which the
+            // ProcessStream turns into a stream error, closing the stream.
+            return Err(outcome.expect_err("phase error checked above"));
+        }
+
         outcome
     }
 
@@ -278,31 +291,75 @@ impl GenericExtProcServer {
     /// Set up and serve the ext_proc gRPC server, metrics endpoint, and
     /// health service.
     pub async fn serve(&self, server_options: crate::options::ServerOptions) -> Result<(), Error> {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
         // metrics
         let registry = prometheus::Registry::new();
-        let metrics = Metrics::new();
-        metrics.register(&registry)?;
-
-        let _metrics_router =
-            axum::Router::new().route("/metrics", axum::routing::get(metrics_handler));
+        self.metrics.register(&registry)?;
+        let metrics_state = MetricsState { registry };
+        let metrics_router = axum::Router::new()
+            .route("/metrics", axum::routing::get(metrics_handler))
+            .with_state(metrics_state);
+        let metrics_listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            [0, 0, 0, 0],
+            server_options.metrics_http_port,
+        )))
+        .await
+        .map_err(|e| format!("failed to bind metrics HTTP server: {}", e))?;
+        let metrics_server =
+            axum::serve(metrics_listener, metrics_router).with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            });
+        let metrics_task = tokio::spawn(async move {
+            if let Err(e) = metrics_server.await {
+                tracing::error!("metrics HTTP server task failed: {:?}", e);
+            }
+        });
 
         // grpc server
         let health = crate::health::HealthServer::new_ready();
+        let health_for_shutdown = health.clone();
         let grpc_server = Server::builder()
             .max_concurrent_streams(server_options.max_concurrent_streams)
             .add_service(ExternalProcessorServer::new(self.clone()))
             .add_service(health.health_service());
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], server_options.ext_proc_port));
-        let signal = async {
-            let _ = tokio::signal::ctrl_c().await;
+
+        // Shutdown signal: on SIGINT/SIGTERM mark the health service unready and
+        // wait out the unready propagation delay; the graceful shutdown then runs.
+        let sigint = signal(SignalKind::interrupt())
+            .map_err(|e| format!("failed to listen for SIGINT: {}", e))?;
+        let sigterm = signal(SignalKind::terminate())
+            .map_err(|e| format!("failed to listen for SIGTERM: {}", e))?;
+        let unready_delay_seconds = server_options.unready_propagation_delay_seconds;
+
+        let signal = async move {
+            let mut sigint = sigint;
+            let mut sigterm = sigterm;
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+            let mut health = health_for_shutdown;
+            health.mark_not_ready().await;
+            sleep(Duration::from_secs(unready_delay_seconds as u64)).await;
+            let _ = shutdown_tx.send(());
         };
         let grpc_fut = grpc_server.serve_with_shutdown(addr, signal);
-        grpc_fut
+        let grpc_result = grpc_fut
             .await
-            .map_err(|e| format!("failed to serve extproc gRPC server: {}", e))?;
+            .map_err(|e| format!("failed to serve extproc gRPC server: {}", e));
+
+        if let Err(e) = grpc_result {
+            metrics_task.abort();
+            return Err(e.into());
+        }
+
+        // graceful shutdown of the metrics HTTP server
+        let _ = metrics_task.await;
 
         // notify processor
-        let _ = self.close(server_options.termination_grace_period_seconds);
+        self.close(server_options.termination_grace_period_seconds)?;
 
         Ok(())
     }
@@ -351,9 +408,16 @@ async fn metrics_handler(state: axum::extract::State<MetricsState>) -> axum::res
             .body(axum::body::Body::from(e.to_string()))
             .unwrap();
     }
+    // Match the Go SDK's `EnableOpenMetrics` output: the OpenMetrics text
+    // format requires a final `# EOF` line and is served with the OpenMetrics
+    // content type.
+    buffer.extend_from_slice(b"# EOF\n");
     axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
-        .header("content-type", "text/plain; version=0.0.4; encoding=utf-8")
+        .header(
+            "content-type",
+            "application/openmetrics-text; version=0.0.4; charset=utf-8",
+        )
         .body(axum::body::Body::from(buffer))
         .unwrap()
 }
@@ -411,6 +475,21 @@ pub struct ProcessStream {
         Box<dyn tokio_stream::Stream<Item = Result<ProcessingRequest, tonic::Status>> + Send>,
     >,
     pending: Option<Result<ProcessingResponse, tonic::Status>>,
+    /// Whether the stream was ended by a processing error, for metrics.
+    errored: bool,
+}
+
+impl Drop for ProcessStream {
+    fn drop(&mut self) {
+        self.server
+            .metrics
+            .stream_duration_seconds
+            .observe((Instant::now() - self.rc.started).as_secs_f64());
+        self.server.metrics.active_streams.dec();
+        if self.errored {
+            self.server.metrics.errored_streams.inc();
+        }
+    }
 }
 
 impl Stream for ProcessStream {
@@ -428,6 +507,7 @@ impl Stream for ProcessStream {
                 match outcome {
                     Ok((resp, _phase)) => this.pending = resp.map(Ok),
                     Err(e) => {
+                        this.errored = true;
                         this.pending = Some(Err(Status::internal(format!(
                             "failed to process phase: {}",
                             e
@@ -436,7 +516,19 @@ impl Stream for ProcessStream {
                 }
                 Poll::Ready(Some(this.pending.take().unwrap()))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Err(e))) => {
+                if e.code() == tonic::Code::Cancelled {
+                    // Clean stream end, matching the Go SDK.
+                    return Poll::Ready(None);
+                }
+                this.errored = true;
+                this.server.processor.error_handler(
+                    &mut this.rc,
+                    REQUEST_PHASE_UNDETERMINED,
+                    Box::new(e.clone()),
+                );
+                Poll::Ready(Some(Err(e)))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -451,12 +543,15 @@ impl ExternalProcessor for GenericExtProcServer {
         &self,
         request: Request<Streaming<ProcessingRequest>>,
     ) -> Result<Response<Self::ProcessStream>, Status> {
+        self.metrics.total_streams.inc();
+        self.metrics.active_streams.inc();
         let incoming = Box::pin(request.into_inner());
         Ok(Response::new(ProcessStream {
             server: Arc::new(self.clone()),
             rc: RequestContext::new(),
             incoming,
             pending: None,
+            errored: false,
         }))
     }
 }

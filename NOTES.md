@@ -83,25 +83,122 @@ The port now compiles and the full test suite passes:
   - init errors / gen-headers errors invoke the processor `error_handler` and propagate.
   - processor errors propagate out of `process_phase`.
 
-### Remaining known gaps (draft)
+### Remaining known gaps (verified against the Go sources — 2026-10-24)
 
-- Metrics HTTP endpoint wiring in `GenericExtProcServer::serve` (metrics registry +
-  axum router are set up but the router is currently dropped/unused).
-- Graceful shutdown wiring in `serve` (signal handling, `serve_with_shutdown`, close
-  notification) — partially scaffolded, not finalized.
-- Envoy `FullDuplexStreamed` body flow-control handling is marked not-implemented in
-  envoy-types (`HttpBody.drain_complete`, flow-control fields).
-- Local response streaming (`StreamedImmediateResponse`) not yet implemented.
-- `Serve`/`MustServe` wrappers and `close` wiring finalized at the time of the green gate,
-  but the end-to-end server lifecycle still needs a final review pass.
+The items below are the open work. During this review each was re-checked against the
+Go implementation (mirrored into `/tmp/go_*.go` from `wrossmorrow/envoy-extproc-sdk-go@main`)
+and several additional gaps were found that were not yet listed.
 
-### Next steps
+1. **Metrics HTTP endpoint wiring in `GenericExtProcServer::serve`** — NOT done.
+   `serve` builds a throwaway `prometheus::Registry` + `Metrics::new()`, creates an axum
+   `Router` with the `/metrics` handler, binds it to `let _metrics_router` (immediately
+   dropped), and never serves it. The server-held `self.metrics` is not used for the
+   registry. Completion: register `self.metrics.clone()` into the served registry, run the
+   axum server on the `metrics_http_port` listener (with graceful shutdown), and shut it
+   down during the graceful shutdown sequence.
 
-1. Finalize metrics HTTP endpoint wiring and graceful shutdown in `server.rs`.
-2. Implement full-duplex streaming response handling if needed.
-3. Re-run full gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-   `cargo test`.
-4. Add the `Justfile` targets (`fmt`, `build`, `test`, …) — done.
+2. **Graceful shutdown wiring in `serve`** — NOT finalized. Current state: uses
+   `serve_with_shutdown(addr, ctrl_c-only signal)`, then `let _ = self.close(...)`.
+   Compared to Go `Serve`, missing: SIGTERM handling, health `MarkUnready`, unready
+   propagation wait, graceful stop, bounded force-stop, metrics server shutdown, close error
+   propagation. Completion: SIGINT+SIGTERM signal future; mark unready; wait
+   `unready_propagation_delay_seconds`; graceful stop; force stop after
+   `termination_grace_period_seconds`; shutdown metrics server; propagate `close` error.
+
+3. **Local response streaming (`StreamedImmediateResponse`)** — NOT implemented. The
+   envoy-types `ProcessingResponse` oneof includes `StreamedImmediateResponse` (oneof tag
+   `11`) for streaming local responses (`FULL_DUPLEX_STREAMED` / streaming body modes).
+   The Rust port only produces `ImmediateResponse` and plain phase responses via
+   `PhaseResponse::get_response`. Completion: map `PhaseResponse` onto the streamed arms
+   and handle end-of-stream signaling (`end_of_stream` on streamed headers/body responses,
+   `TrailersResponse`).
+
+4. **Full-duplex body flow control** — NOT implemented; envoy-types marks
+   `FlowControlInit`, `ClientWindowUpdate`, `ServerWindowUpdate` and
+   `HttpBody.drain_complete` as not-implemented. Decision needed on scope (accept-and-
+   document vs. implement where envoy-types permits).
+
+### Additional gaps found during the post-green-gate review
+
+- Metrics stream-level collectors are never incremented by the server:
+  `total_streams`, `errored_streams`, `active_streams`, `stream_duration_seconds`,
+  `total_empty_responses`, `response_send_errors`. Only phase counters and body-byte
+  counters are currently used. Go wires these in the stream handler via deferred stream
+  accounting and send-error handling.
+- `ProcessingOptions::abort_on_processor_failure` is never consulted by the server.
+- `serve` creates a fresh `Metrics` + registry instead of using the server-held
+  `self.metrics`.
+- `ProcessStream` receive-error handling does not mirror Go: `codes.Canceled` should end
+  the stream cleanly; other receive errors should route through the processor
+  `error_handler` with phase `UNDETERMINED`.
+- `GenericExtProcServer::close` error is discarded in `serve`.
+
+### Completion plan for the remaining gaps
+
+Ordered plan derived from the gaps above, sequenced against the existing green gate
+(`cargo check --all-targets`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test` — all passing, 33 tests):
+
+1. **Phase 1 — Metrics HTTP endpoint wiring** (completes gap 1) — **DONE (2026-10-24)**.
+   - ✅ Done: `server.rs` registers the server-held `self.metrics` into a `prometheus::Registry`;
+     passes it into the axum handler via `MetricsState`; binds a `TcpListener` on
+     `metrics_http_port`; runs `axum::serve(...).with_graceful_shutdown(...)`; spawns the task;
+     aborts it on gRPC serve error and gracefully awaits it during the shutdown sequence.
+   - ✅ Resolved (2026-10-24): OpenMetrics adopted to match Go. Implemented as the Rust
+     `prometheus::TextEncoder` output plus the mandatory OpenMetrics `# EOF` terminator and
+     the OpenMetrics content type
+     (`application/openmetrics-text; version=0.0.4; charset=utf-8`); Go's `EnableOpenMetrics`
+     behaviour for the collected metric set (counters/gauge/histogram, no created lines or
+     exemplars) is matched. (A dedicated OpenMetrics encoder would be more faithful long-term,
+     but the TextEncoder output is the required sample syntax.)
+   - Tests: handler/registry wiring unit tests; keep full gate green.
+
+2. **Phase 2 — Graceful shutdown wiring** (completes gap 2) — **IN PROGRESS (2026-10-24)**.
+   - ✅ Done: replaced the ctrl_c-only signal future with an SIGINT+SIGTERM future via
+     `tokio::signal::unix::{signal, SignalKind}`; signal future marks the health service
+     unready and waits out `unready_propagation_delay_seconds`; tonic `serve_with_shutdown`
+     performs the graceful stop; processor `close` error is now propagated.
+   - ⬜ Remaining: force stop after `termination_grace_period_seconds`. Design decision
+     (recorded): tonic 0.14 `serve_with_shutdown` performs graceful shutdown without an
+     externally-bounded force-stop. Either accept tonic's semantics or restructure around an
+     incoming stream to implement the bounded force-stop. Metrics server shutdown deferred to
+     Phase 1.
+   - 📝 Note (2026-10-24): maintainer decision — in Kubernetes the force stop after the grace
+     period happens automatically when the process is killed (kubelet sends SIGTERM, then
+     SIGKILL per `terminationGracePeriodSeconds`). The SDK may not need its own bounded
+     force-stop; graceful stop + close may be sufficient. Revisit if running outside k8s.
+
+3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (completes the
+   additional findings above) — **DONE (2026-10-24)**.
+   - ✅ Done: stream-level metrics wired via `ExternalProcessor::process` (total_streams,
+     active_streams) and `ProcessStream` Drop (active_streams decrement, stream_duration_seconds
+     observe, errored_streams increment when errored).
+   - ✅ Done: `abort_on_processor_failure` consulted in `process_phase`; phase error
+     propagates and closes the stream.
+   - ✅ Done: `ProcessStream` receive-error handling now treats `Code::Cancelled` as a clean
+     end and routes other receive errors through `error_handler(phase = UNDETERMINED)`.
+   - ⬜ Not wired here: `response_send_errors` (send errors are not observable at the
+     stream level in the current design) and `total_empty_responses` (no empty-response path
+     in the Rust PhaseResponse API).
+   - ✅ Done: propagate `close` error instead of discarding it (done in Phase 2).
+
+4. **Phase 4 — Streaming responses** (completes gaps 3–4).
+   - Implement `StreamedImmediateResponse` emission and end-of-stream signaling.
+   - Resolve full-duplex flow-control scope decision.
+
+5. **Phase 5 — Final gate and notes.**
+   - Re-run full gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+     `cargo test`.
+   - Update the Go test inventory to cover the newly ported tests.
+
+Suggested order, updated per maintainer prioritization:
+
+1. **Phase 2 — Graceful shutdown wiring** (most important; graceful shutdown is essential).
+2. **Phase 1 — Metrics HTTP endpoint wiring** (important but not critical).
+3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (third).
+4. **Phase 5 — Final gate and notes** (last).
+5. **Phase 4 — Streaming responses** — **DEFERRED/ignored for now** (maintainer decision;
+   deemed not handled in the Go SDK and likely adds would be needed in both SDKs).
 
 ## Go test inventory (ported so far)
 
