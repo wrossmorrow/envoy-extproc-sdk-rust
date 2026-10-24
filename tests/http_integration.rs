@@ -60,7 +60,7 @@ async fn wait_for_gateway() -> String {
     let deadline = GATEWAY_READY_TIMEOUT;
     let start = std::time::Instant::now();
     loop {
-        let uri: hyper::http::Uri = format!("{}/{}", base.trim_end_matches('/'), BYPASS_PATH)
+        let uri: hyper::http::Uri = format!("{}{}", base.trim_end_matches('/'), BYPASS_PATH)
             .parse()
             .expect("gateway bypass uri should be valid");
         let ready = match client.get(uri).await {
@@ -113,7 +113,7 @@ async fn send_tester_request(
     extra_headers: &HashMap<String, String>,
     actions: &TesterRequestBody,
 ) -> TesterResponse {
-    let uri: hyper::http::Uri = format!("{}/{}", base_url.trim_end_matches('/'), TEST_PATH)
+    let uri: hyper::http::Uri = format!("{}{}", base_url.trim_end_matches('/'), TEST_PATH)
         .parse()
         .expect("tester request uri should be valid");
     let json = serde_json::to_vec(actions).expect("tester actions should serialize");
