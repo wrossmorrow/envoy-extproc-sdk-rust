@@ -20,6 +20,9 @@ fn build_processor(
         })),
         "timer" => Ok(Arc::new(processors::timer::TimerRequestProcessor { opts })),
         "data" => Ok(Arc::new(processors::data::DataRequestProcessor { opts })),
+        "digest" => Ok(Arc::new(processors::digest::DigestRequestProcessor {
+            opts,
+        })),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
