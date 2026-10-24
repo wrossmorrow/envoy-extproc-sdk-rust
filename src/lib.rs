@@ -36,6 +36,7 @@ pub mod health;
 pub mod metrics;
 pub mod options;
 pub mod server;
+pub mod tester;
 
 pub use context::HeaderAppendAction;
 pub use context::{
@@ -49,3 +50,4 @@ pub use health::HealthServer;
 pub use metrics::Metrics;
 pub use options::{ProcessingOptions, ServerOptions};
 pub use server::{must_serve, serve, GenericExtProcServer, RequestProcessor};
+pub use tester::{TesterRequestBody, TesterRequestProcessor};
