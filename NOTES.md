@@ -161,7 +161,7 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      incoming stream to implement the bounded force-stop. Decide and document.
 
 3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (completes the
-   additional findings above, which unblock/overlap Phase 1).
+   additional findings above).
    - Wire stream-level metrics: `total_streams`, `active_streams`, `errored_streams`,
      `stream_duration_seconds`, `response_send_errors`, `total_empty_responses`.
    - Wire `ProcessingOptions::abort_on_processor_failure`.
@@ -178,9 +178,14 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      `cargo test`.
    - Update the Go test inventory to cover the newly ported tests.
 
-Suggested order: Phase 1 → Phase 2 (they share the shutdown sequence) → Phase 3 → Phase 4 →
-Phase 5. Phases 1–2 are prerequisites for an end-to-end server lifecycle; Phase 3 and Phase 4
-can proceed independently once Phase 1–2 land.
+Suggested order, updated per maintainer prioritization:
+
+1. **Phase 2 — Graceful shutdown wiring** (most important; graceful shutdown is essential).
+2. **Phase 1 — Metrics HTTP endpoint wiring** (important but not critical).
+3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (third).
+4. **Phase 5 — Final gate and notes** (last).
+5. **Phase 4 — Streaming responses** — **DEFERRED/ignored for now** (maintainer decision;
+   deemed not handled in the Go SDK and likely adds would be needed in both SDKs).
 
 ## Go test inventory (ported so far)
 
