@@ -27,6 +27,7 @@ fn build_processor(
         "masker" => Ok(Arc::new(processors::masker::MaskerRequestProcessor::new(
             opts,
         ))),
+        "echo" => Ok(Arc::new(processors::echo::EchoRequestProcessor { opts })),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
