@@ -294,6 +294,27 @@ Suggested order, updated per maintainer prioritization:
 - server_test.go: TestProcessPhaseMetricsErrorPath (processor error increments phase_errors
   and propagates).
 
+## Integration tests (proposed — Phase 6, new branch `test/integration-envoy-e2e`)
+
+Inspired by the Go SDK's `test/` directory (github.com/wrossmorrow/envoy-extproc-sdk-go
+`test/`), planned for the Rust port:
+
+- Go-side fixtures: `test/cases.yaml` (parametrized cases: noop, clear/append/
+  remove/overwrite request & response headers/body, cancel), `test/compose.yaml`
+  (envoy + upstream echo + extproc), `test/envoy.yaml`, `test/justfile`,
+  `test/Dockerfile` (golang:1.25-alpine builder → runtime, grpc-health-probe),
+  `test/main.go` (tester binary), `test/tester.go` (`TesterRequestProcessor`),
+  `test/tester_test.go`, `test/test.py`, `test/README.md`.
+- Rust side plan: new `test/` directory mirroring the layout; Rust Dockerfile for
+  the compose build (rust builder, likely minimal); compose file wiring envoy +
+  upstream echo + the Rust extproc server; Rust tester processor implementing the
+  same cases.yaml action schema (append/add/overwrite/remove headers, clear/replace
+  body, cancel) via the Rust PhaseResponse APIs (AppendHeader/AddHeader/Overwrite/
+  RemoveHeader/ClearBody/ReplaceBody/CancelRequest, GetValue typed access).
+- Notes: Go tester has `# TODO: requires work` for cancel; the Rust port may need
+  equivalent handling. Envoy config uses BUFFERED body modes, 2s message timeout,
+  `/no-extproc` bypass route, etc.
+
 ## Go source inventory
 
 - /tmp/go_sdk/*.go (re-fetched 2026-10-24) — context.go, extproc.go (RequestProcessor trait),
