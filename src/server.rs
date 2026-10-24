@@ -306,6 +306,10 @@ impl GenericExtProcServer {
     /// Set up and serve the ext_proc gRPC server, metrics endpoint, and
     /// health service.
     pub async fn serve(&self, server_options: crate::options::ServerOptions) -> Result<(), Error> {
+        // Install a default tracing subscriber so startup logs (e.g. the bound
+        // ports below) are emitted.
+        let _ = tracing_subscriber::fmt().try_init();
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // metrics
@@ -321,6 +325,10 @@ impl GenericExtProcServer {
         )))
         .await
         .map_err(|e| format!("failed to bind metrics HTTP server: {}", e))?;
+        tracing::info!(
+            port = server_options.metrics_http_port,
+            "extproc server bound metrics HTTP listener"
+        );
         let metrics_server =
             axum::serve(metrics_listener, metrics_router).with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
@@ -339,6 +347,10 @@ impl GenericExtProcServer {
             .add_service(ExternalProcessorServer::new(self.clone()))
             .add_service(health.health_service());
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], server_options.ext_proc_port));
+        tracing::info!(
+            port = server_options.ext_proc_port,
+            "extproc server bound gRPC listener"
+        );
 
         // Shutdown signal: on SIGINT/SIGTERM mark the health service unready and
         // wait out the unready propagation delay; the graceful shutdown then runs.
