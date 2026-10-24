@@ -280,13 +280,30 @@ impl GenericExtProcServer {
     /// Set up and serve the ext_proc gRPC server, metrics endpoint, and
     /// health service.
     pub async fn serve(&self, server_options: crate::options::ServerOptions) -> Result<(), Error> {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
         // metrics
         let registry = prometheus::Registry::new();
-        let metrics = Metrics::new();
-        metrics.register(&registry)?;
-
-        let _metrics_router =
-            axum::Router::new().route("/metrics", axum::routing::get(metrics_handler));
+        self.metrics.register(&registry)?;
+        let metrics_state = MetricsState { registry };
+        let metrics_router = axum::Router::new()
+            .route("/metrics", axum::routing::get(metrics_handler))
+            .with_state(metrics_state);
+        let metrics_listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            [0, 0, 0, 0],
+            server_options.metrics_http_port,
+        )))
+        .await
+        .map_err(|e| format!("failed to bind metrics HTTP server: {}", e))?;
+        let metrics_server =
+            axum::serve(metrics_listener, metrics_router).with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            });
+        let metrics_task = tokio::spawn(async move {
+            if let Err(e) = metrics_server.await {
+                tracing::error!("metrics HTTP server task failed: {:?}", e);
+            }
+        });
 
         // grpc server
         let health = crate::health::HealthServer::new_ready();
@@ -315,11 +332,20 @@ impl GenericExtProcServer {
             let mut health = health_for_shutdown;
             health.mark_not_ready().await;
             sleep(Duration::from_secs(unready_delay_seconds as u64)).await;
+            let _ = shutdown_tx.send(());
         };
         let grpc_fut = grpc_server.serve_with_shutdown(addr, signal);
-        grpc_fut
+        let grpc_result = grpc_fut
             .await
-            .map_err(|e| format!("failed to serve extproc gRPC server: {}", e))?;
+            .map_err(|e| format!("failed to serve extproc gRPC server: {}", e));
+
+        if let Err(e) = grpc_result {
+            metrics_task.abort();
+            return Err(e.into());
+        }
+
+        // graceful shutdown of the metrics HTTP server
+        let _ = metrics_task.await;
 
         // notify processor
         self.close(server_options.termination_grace_period_seconds)?;

@@ -139,12 +139,12 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
 (`cargo check --all-targets`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 `cargo test` — all passing, 33 tests):
 
-1. **Phase 1 — Metrics HTTP endpoint wiring** (completes gap 1).
-   - `server.rs`: register the server-held `Metrics` (clone) into a `prometheus::Registry`;
-     pass the registry into the axum handler (via the existing `MetricsState`);
-     bind a `TcpListener` on the metrics port and run `axum::serve(...).with_graceful_shutdown(...)`;
-     spawn the task; stop it on grpc serve error and during graceful shutdown.
-   - Fidelity decision: Go uses `promhttp.HandlerFor` with `EnableOpenMetrics: true` and
+1. **Phase 1 — Metrics HTTP endpoint wiring** (completes gap 1) — **DONE (2026-10-24)**.
+   - ✅ Done: `server.rs` registers the server-held `self.metrics` into a `prometheus::Registry`;
+     passes it into the axum handler via `MetricsState`; binds a `TcpListener` on
+     `metrics_http_port`; runs `axum::serve(...).with_graceful_shutdown(...)`; spawns the task;
+     aborts it on gRPC serve error and gracefully awaits it during the shutdown sequence.
+   - ⬜ Open decision: Go uses `promhttp.HandlerFor` with `EnableOpenMetrics: true` and
      promhttp's content type. Rust uses `prometheus::TextEncoder` + manual content-type
      header. Decide whether to switch to OpenMetrics output or keep TextEncoder.
    - Tests: handler/registry wiring unit tests; keep full gate green.
@@ -159,6 +159,10 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      externally-bounded force-stop. Either accept tonic's semantics or restructure around an
      incoming stream to implement the bounded force-stop. Metrics server shutdown deferred to
      Phase 1.
+   - 📝 Note (2026-10-24): maintainer decision — in Kubernetes the force stop after the grace
+     period happens automatically when the process is killed (kubelet sends SIGTERM, then
+     SIGKILL per `terminationGracePeriodSeconds`). The SDK may not need its own bounded
+     force-stop; graceful stop + close may be sufficient. Revisit if running outside k8s.
 
 3. **Phase 3 — Stream lifecycle metrics, error semantics and abort** (completes the
    additional findings above).
