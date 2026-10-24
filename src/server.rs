@@ -397,9 +397,16 @@ async fn metrics_handler(state: axum::extract::State<MetricsState>) -> axum::res
             .body(axum::body::Body::from(e.to_string()))
             .unwrap();
     }
+    // Match the Go SDK's `EnableOpenMetrics` output: the OpenMetrics text
+    // format requires a final `# EOF` line and is served with the OpenMetrics
+    // content type.
+    buffer.extend_from_slice(b"# EOF\n");
     axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
-        .header("content-type", "text/plain; version=0.0.4; encoding=utf-8")
+        .header(
+            "content-type",
+            "application/openmetrics-text; version=0.0.4; charset=utf-8",
+        )
         .body(axum::body::Body::from(buffer))
         .unwrap()
 }

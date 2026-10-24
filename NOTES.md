@@ -144,9 +144,13 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      passes it into the axum handler via `MetricsState`; binds a `TcpListener` on
      `metrics_http_port`; runs `axum::serve(...).with_graceful_shutdown(...)`; spawns the task;
      aborts it on gRPC serve error and gracefully awaits it during the shutdown sequence.
-   - ⬜ Open decision: Go uses `promhttp.HandlerFor` with `EnableOpenMetrics: true` and
-     promhttp's content type. Rust uses `prometheus::TextEncoder` + manual content-type
-     header. Decide whether to switch to OpenMetrics output or keep TextEncoder.
+   - ✅ Resolved (2026-10-24): OpenMetrics adopted to match Go. Implemented as the Rust
+     `prometheus::TextEncoder` output plus the mandatory OpenMetrics `# EOF` terminator and
+     the OpenMetrics content type
+     (`application/openmetrics-text; version=0.0.4; charset=utf-8`); Go's `EnableOpenMetrics`
+     behaviour for the collected metric set (counters/gauge/histogram, no created lines or
+     exemplars) is matched. (A dedicated OpenMetrics encoder would be more faithful long-term,
+     but the TextEncoder output is the required sample syntax.)
    - Tests: handler/registry wiring unit tests; keep full gate green.
 
 2. **Phase 2 — Graceful shutdown wiring** (completes gap 2) — **IN PROGRESS (2026-10-24)**.
