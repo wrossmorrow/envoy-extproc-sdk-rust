@@ -131,8 +131,8 @@ The port now compiles and the unit test suite passes:
   covers a processor that awaits inside a phase.
   - **Breaking change** for external implementors: phase methods are now async;
     implementors must add `#[async_trait]` and `async fn` to their `RequestProcessor`
-    impls. Follow-up candidates: make the error handler (`error_handler`) async as
-    well, and document `close` semantics for async processors.
+    impls. Follow-up candidates: document `close` semantics for async processors.
+    (The error handler (`error_handler`) has since been made async as well.)
 
 ## Remaining known gaps
 

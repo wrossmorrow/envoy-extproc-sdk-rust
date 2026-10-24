@@ -78,9 +78,10 @@ pub trait RequestProcessor: Send + Sync + 'static {
         trailers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Called when the SDK hits an error during request processing. An
-    /// implemented handler can implement any logic it likes.
-    fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
+    /// Called when the SDK hits an error during request processing. May
+    /// perform asynchronous work. An implemented handler can implement any
+    /// logic it likes.
+    async fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
 
     /// Called on shutdown, after in-flight streams have drained.
     fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;

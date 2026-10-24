@@ -84,9 +84,10 @@ pub trait RequestProcessor: Send + Sync + 'static {
         trailers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Called when the SDK hits an error during request processing. An
-    /// implemented handler can implement any logic it likes.
-    fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
+    /// Called when the SDK hits an error during request processing. May
+    /// perform asynchronous work. An implemented handler can implement any
+    /// logic it likes.
+    async fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
 
     /// Called on shutdown, after in-flight streams have drained.
     fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
@@ -192,7 +193,7 @@ impl GenericExtProcServer {
                     metrics.total_request_headers.inc();
                     let init = init_req_ctx(rc, h);
                     if let Err(e) = init {
-                        self.processor.error_handler(rc, *phase, e);
+                        self.processor.error_handler(rc, *phase, e).await;
                         return Err("request context initialization failed".into());
                     }
                     rc.end_of_stream = h.end_of_stream;
@@ -221,7 +222,7 @@ impl GenericExtProcServer {
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            self.processor.error_handler(rc, *phase, e);
+                            self.processor.error_handler(rc, *phase, e).await;
                             return Err("failed to generate request trailers".into());
                         }
                     };
@@ -241,7 +242,7 @@ impl GenericExtProcServer {
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            self.processor.error_handler(rc, *phase, e);
+                            self.processor.error_handler(rc, *phase, e).await;
                             return Err("failed to generate response headers".into());
                         }
                     };
@@ -302,7 +303,7 @@ impl GenericExtProcServer {
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            self.processor.error_handler(rc, *phase, e);
+                            self.processor.error_handler(rc, *phase, e).await;
                             return Err("failed to generate response trailers".into());
                         }
                     };
@@ -822,7 +823,7 @@ mod tests {
                 .push(RequestPhase::ResponseTrailers);
             ctx.continue_request()
         }
-        fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, _err: Error) {
+        async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, _err: Error) {
             self.errors.lock().unwrap().push(phase);
         }
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
@@ -884,7 +885,13 @@ mod tests {
         ) -> Result<(), Error> {
             ctx.continue_request()
         }
-        fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+        async fn error_handler(
+            &self,
+            _ctx: &mut RequestContext,
+            _phase: RequestPhase,
+            _err: Error,
+        ) {
+        }
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
             Ok(())
         }
@@ -1372,7 +1379,13 @@ mod tests {
             ) -> Result<(), Error> {
                 ctx.continue_request()
             }
-            fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+            async fn error_handler(
+                &self,
+                _ctx: &mut RequestContext,
+                _phase: RequestPhase,
+                _err: Error,
+            ) {
+            }
             fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
                 Ok(())
             }
@@ -1474,7 +1487,13 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 ctx.continue_request()
             }
-            fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+            async fn error_handler(
+                &self,
+                _ctx: &mut RequestContext,
+                _phase: RequestPhase,
+                _err: Error,
+            ) {
+            }
             fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
                 Ok(())
             }

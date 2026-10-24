@@ -80,7 +80,7 @@ impl RequestProcessor for TrivialRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+    async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
         tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 

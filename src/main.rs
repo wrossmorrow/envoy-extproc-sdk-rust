@@ -79,7 +79,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+    async fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
 
     fn close(
         &self,
