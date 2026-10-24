@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::any::Any;
 
 use extproc::{
@@ -9,6 +10,7 @@ pub struct DataRequestProcessor {
     pub opts: ProcessingOptions,
 }
 
+#[async_trait]
 impl RequestProcessor for DataRequestProcessor {
     fn name(&self) -> String {
         "data".to_string()
@@ -18,7 +20,7 @@ impl RequestProcessor for DataRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -30,7 +32,7 @@ impl RequestProcessor for DataRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -38,11 +40,15 @@ impl RequestProcessor for DataRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -63,11 +69,15 @@ impl RequestProcessor for DataRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,

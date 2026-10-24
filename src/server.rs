@@ -1,6 +1,7 @@
 //! The gRPC server implementation: [`RequestProcessor`] trait and
 //! [`GenericExtProcServer`].
 
+use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use crate::headers::{gen_headers, AllHeaders};
 use crate::metrics::Metrics;
 use crate::options::ProcessingOptions;
 use crate::Error;
+use async_trait::async_trait;
 use prometheus::Encoder;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
@@ -26,6 +28,13 @@ use tonic::{Request, Response, Status, Streaming};
 /// Errors that can occur while processing a phase. Implemented by processors
 /// to return from phase methods; errors flow to the processor's
 /// [`error_handler`](RequestProcessor::error_handler).
+///
+/// Phase processing methods are async so that processor implementations can
+/// perform asynchronous work (e.g. downstream HTTP calls, database lookups)
+/// without blocking the stream task. Phase messages within a single stream are
+/// still processed sequentially, matching the envoy ext_proc protocol's
+/// ordered message flow.
+#[async_trait]
 pub trait RequestProcessor: Send + Sync + 'static {
     /// The name of the processor, reported to `envoy` via the
     /// `x-extproc-names` response header.
@@ -34,35 +43,43 @@ pub trait RequestProcessor: Send + Sync + 'static {
     /// The processor's [`ProcessingOptions`](crate::options::ProcessingOptions).
     fn options(&self) -> &ProcessingOptions;
 
-    /// Process the request headers phase.
-    fn process_request_headers(
+    /// Process the request headers phase. May perform asynchronous work.
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         headers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Process the request trailers phase.
-    fn process_request_trailers(
+    /// Process the request trailers phase. May perform asynchronous work.
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         trailers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Process the request body phase.
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
+    /// Process the request body phase. May perform asynchronous work.
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error>;
 
-    /// Process the response headers phase.
-    fn process_response_headers(
+    /// Process the response headers phase. May perform asynchronous work.
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         headers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Process the response body phase.
-    fn process_response_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
+    /// Process the response body phase. May perform asynchronous work.
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error>;
 
-    /// Process the response trailers phase.
-    fn process_response_trailers(
+    /// Process the response trailers phase. May perform asynchronous work.
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         trailers: &AllHeaders,
@@ -123,7 +140,11 @@ impl GenericExtProcServer {
 
     /// Handle one phase of a request/response exchange, building the
     /// [`ProcessingResponse`] to send back to `envoy`.
-    pub fn process_phase(
+    ///
+    /// Phase processing is asynchronous: the processor's phase methods are
+    /// async, and this drives them. Called from the [`ProcessStream`] poll
+    /// loop, which polls the phase future instead of awaiting it.
+    pub async fn process_phase(
         &self,
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
@@ -133,7 +154,7 @@ impl GenericExtProcServer {
         // request-headers phase).
         rc.reset_phase()?;
         let mut phase = RequestPhase::Undetermined;
-        let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
+        let outcome = self.dispatch_phase(proc_req, rc, &mut phase).await;
         if let Err(e) = outcome {
             if self
                 .options
@@ -153,7 +174,7 @@ impl GenericExtProcServer {
         outcome
     }
 
-    fn dispatch_phase(
+    async fn dispatch_phase(
         &self,
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
@@ -163,7 +184,7 @@ impl GenericExtProcServer {
         let metrics = &self.metrics;
         let options = &self.options;
 
-        let outcome = (|| -> Result<(Option<ProcessingResponse>, RequestPhase), Error> {
+        let outcome = async {
             match &proc_req.request {
                 Some(ProcessingRequestOneof::RequestHeaders(h)) => {
                     *phase = RequestPhase::RequestHeaders;
@@ -178,7 +199,7 @@ impl GenericExtProcServer {
                     rc.set_phase(*phase);
                     let headers = rc.all_headers.clone();
                     rc.duration += phase_start.elapsed();
-                    self.processor.process_request_headers(rc, &headers)?;
+                    self.processor.process_request_headers(rc, &headers).await?;
                 }
                 Some(ProcessingRequestOneof::RequestBody(b)) => {
                     *phase = RequestPhase::RequestBody;
@@ -187,7 +208,7 @@ impl GenericExtProcServer {
                     metrics.request_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
                     rc.duration += phase_start.elapsed();
-                    self.processor.process_request_body(rc, &b.body)?;
+                    self.processor.process_request_body(rc, &b.body).await?;
                 }
                 Some(ProcessingRequestOneof::RequestTrailers(t)) => {
                     *phase = RequestPhase::RequestTrailers;
@@ -205,7 +226,9 @@ impl GenericExtProcServer {
                         }
                     };
                     rc.duration += phase_start.elapsed();
-                    self.processor.process_request_trailers(rc, &trailers)?;
+                    self.processor
+                        .process_request_trailers(rc, &trailers)
+                        .await?;
                 }
                 Some(ProcessingRequestOneof::ResponseHeaders(h)) => {
                     *phase = RequestPhase::ResponseHeaders;
@@ -223,7 +246,9 @@ impl GenericExtProcServer {
                         }
                     };
                     rc.end_of_stream = h.end_of_stream;
-                    self.processor.process_response_headers(rc, &headers)?;
+                    self.processor
+                        .process_response_headers(rc, &headers)
+                        .await?;
                     rc.duration += phase_start.elapsed();
                     if options.as_ref().is_some_and(|o| o.update_ext_proc_header) {
                         rc.append_header(
@@ -252,7 +277,7 @@ impl GenericExtProcServer {
                     metrics.total_response_body.inc();
                     metrics.response_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
-                    self.processor.process_response_body(rc, &b.body)?;
+                    self.processor.process_response_body(rc, &b.body).await?;
                     rc.duration += phase_start.elapsed();
                     if rc.end_of_stream
                         && options.as_ref().is_some_and(|o| o.update_duration_header)
@@ -282,7 +307,9 @@ impl GenericExtProcServer {
                         }
                     };
                     rc.duration += phase_start.elapsed();
-                    self.processor.process_response_trailers(rc, &trailers)?;
+                    self.processor
+                        .process_response_trailers(rc, &trailers)
+                        .await?;
                 }
                 None => {
                     rc.set_phase(*phase);
@@ -292,7 +319,8 @@ impl GenericExtProcServer {
 
             let response = rc.get_response(*phase)?;
             Ok((response, *phase))
-        })();
+        }
+        .await;
 
         if outcome.is_err() {
             metrics.phase_errors.inc_by(1.0);
@@ -528,16 +556,24 @@ impl Stream for ProcessStream {
         let poll = Stream::poll_next(std::pin::Pin::new(&mut this.incoming), cx);
         match poll {
             Poll::Ready(Some(Ok(req))) => {
-                let outcome = this.server.process_phase(&req, &mut this.rc);
+                // Phase processing is async (processor phase methods are async),
+                // but the `Stream` poll interface cannot await, so drive the
+                // phase future to completion via `poll`. Phase messages within
+                // a stream are still processed sequentially.
+                let mut phase_fut = Box::pin(this.server.process_phase(&req, &mut this.rc));
+                let outcome = std::pin::Pin::new(&mut phase_fut).poll(cx);
                 match outcome {
-                    Ok((resp, _phase)) => this.pending = resp.map(Ok),
-                    Err(e) => {
-                        this.errored = true;
-                        this.pending = Some(Err(Status::internal(format!(
-                            "failed to process phase: {}",
-                            e
-                        ))));
-                    }
+                    Poll::Ready(outcome) => match outcome {
+                        Ok((resp, _phase)) => this.pending = resp.map(Ok),
+                        Err(e) => {
+                            this.errored = true;
+                            this.pending = Some(Err(Status::internal(format!(
+                                "failed to process phase: {}",
+                                e
+                            ))));
+                        }
+                    },
+                    Poll::Pending => return Poll::Pending,
                 }
                 Poll::Ready(Some(this.pending.take().unwrap()))
             }
@@ -672,6 +708,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl RequestProcessor for TestProcessor {
         fn name(&self) -> String {
             self.name.clone()
@@ -679,7 +716,7 @@ mod tests {
         fn options(&self) -> &ProcessingOptions {
             self.opts.as_ref().unwrap()
         }
-        fn process_request_headers(
+        async fn process_request_headers(
             &self,
             ctx: &mut RequestContext,
             _headers: &AllHeaders,
@@ -690,7 +727,7 @@ mod tests {
                 .push(RequestPhase::RequestHeaders);
             ctx.continue_request()
         }
-        fn process_request_trailers(
+        async fn process_request_trailers(
             &self,
             ctx: &mut RequestContext,
             _trailers: &AllHeaders,
@@ -701,7 +738,11 @@ mod tests {
                 .push(RequestPhase::RequestTrailers);
             ctx.continue_request()
         }
-        fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+        async fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            body: &[u8],
+        ) -> Result<(), Error> {
             self.phases.lock().unwrap().push(RequestPhase::RequestBody);
             self.bodies
                 .lock()
@@ -709,7 +750,7 @@ mod tests {
                 .insert("request".to_string(), body.to_vec());
             ctx.continue_request()
         }
-        fn process_response_headers(
+        async fn process_response_headers(
             &self,
             ctx: &mut RequestContext,
             _headers: &AllHeaders,
@@ -720,7 +761,7 @@ mod tests {
                 .push(RequestPhase::ResponseHeaders);
             ctx.continue_request()
         }
-        fn process_response_body(
+        async fn process_response_body(
             &self,
             ctx: &mut RequestContext,
             body: &[u8],
@@ -732,7 +773,7 @@ mod tests {
                 .insert("response".to_string(), body.to_vec());
             ctx.continue_request()
         }
-        fn process_response_trailers(
+        async fn process_response_trailers(
             &self,
             ctx: &mut RequestContext,
             _trailers: &AllHeaders,
@@ -755,6 +796,7 @@ mod tests {
         opts: ProcessingOptions,
     }
 
+    #[async_trait]
     impl RequestProcessor for ErroringProcessor {
         fn name(&self) -> String {
             "test".to_string()
@@ -762,42 +804,42 @@ mod tests {
         fn options(&self) -> &ProcessingOptions {
             &self.opts
         }
-        fn process_request_headers(
+        async fn process_request_headers(
             &self,
             _ctx: &mut RequestContext,
             _headers: &AllHeaders,
         ) -> Result<(), Error> {
             Err("processor exploded".into())
         }
-        fn process_request_trailers(
+        async fn process_request_trailers(
             &self,
             ctx: &mut RequestContext,
             _trailers: &AllHeaders,
         ) -> Result<(), Error> {
             ctx.continue_request()
         }
-        fn process_request_body(
+        async fn process_request_body(
             &self,
             ctx: &mut RequestContext,
             _body: &[u8],
         ) -> Result<(), Error> {
             ctx.continue_request()
         }
-        fn process_response_headers(
+        async fn process_response_headers(
             &self,
             ctx: &mut RequestContext,
             _headers: &AllHeaders,
         ) -> Result<(), Error> {
             ctx.continue_request()
         }
-        fn process_response_body(
+        async fn process_response_body(
             &self,
             _ctx: &mut RequestContext,
             _body: &[u8],
         ) -> Result<(), Error> {
             Err("processor exploded".into())
         }
-        fn process_response_trailers(
+        async fn process_response_trailers(
             &self,
             ctx: &mut RequestContext,
             _trailers: &AllHeaders,
@@ -816,8 +858,8 @@ mod tests {
         assert_eq!(err.to_string(), "processor is nil");
     }
 
-    #[test]
-    fn test_process_phase_request_headers() {
+    #[tokio::test]
+    async fn test_process_phase_request_headers() {
         let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
         let server = GenericExtProcServer::new(
             "test".to_string(),
@@ -832,7 +874,7 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "POST")])),
             false,
         ))));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
         assert!(matches!(
@@ -845,8 +887,8 @@ mod tests {
         assert_eq!(proc.recorded_phases(), vec![RequestPhase::RequestHeaders]);
     }
 
-    #[test]
-    fn test_process_phase_request_body() {
+    #[tokio::test]
+    async fn test_process_phase_request_body() {
         let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
         let server = GenericExtProcServer::new(
             "test".to_string(),
@@ -863,7 +905,7 @@ mod tests {
             grpc_message_compressed: false,
             drain_complete: false,
         })));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::RequestBody);
         assert!(resp.is_some());
         assert!(matches!(
@@ -878,8 +920,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_process_phase_response_headers_updates_context() {
+    #[tokio::test]
+    async fn test_process_phase_response_headers_updates_context() {
         let options = ProcessingOptions {
             update_ext_proc_header: true,
             update_duration_header: true,
@@ -899,7 +941,7 @@ mod tests {
             Some(&envoy_header_map(&[("x-foo", "bar")])),
             true,
         ))));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseHeaders);
         assert!(resp.is_some());
         assert!(matches!(
@@ -929,8 +971,8 @@ mod tests {
         assert!(dur > 0);
     }
 
-    #[test]
-    fn test_process_phase_response_body_does_not_add_extproc_name() {
+    #[tokio::test]
+    async fn test_process_phase_response_body_does_not_add_extproc_name() {
         let options = ProcessingOptions {
             update_ext_proc_header: true,
             update_duration_header: true,
@@ -952,7 +994,7 @@ mod tests {
             grpc_message_compressed: false,
             drain_complete: false,
         })));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseBody);
         assert!(resp.is_some());
         assert!(matches!(
@@ -969,8 +1011,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_process_phase_response_trailers() {
+    #[tokio::test]
+    async fn test_process_phase_response_trailers() {
         let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
         let server = GenericExtProcServer::new(
             "test".to_string(),
@@ -985,7 +1027,7 @@ mod tests {
                 trailers: Some(envoy_header_map(&[("x-trailer", "yes")])),
             },
         )));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseTrailers);
         assert!(resp.is_some());
         assert!(matches!(
@@ -994,8 +1036,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_process_phase_response_headers_mutation_without_explicit_reset() {
+    #[tokio::test]
+    async fn test_process_phase_response_headers_mutation_without_explicit_reset() {
         // A fresh RequestContext must already carry a phase response mutation:
         // the server appends `x-extproc-names` during the response-headers phase
         // without any explicit reset, so a fresh context must accept mutations.
@@ -1018,7 +1060,7 @@ mod tests {
             Some(&envoy_header_map(&[("x-foo", "bar")])),
             false,
         ))));
-        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (_resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseHeaders);
         let mutation = rc.response.header_mutation.as_ref().unwrap();
         assert_eq!(mutation.set_headers.len(), 1);
@@ -1028,8 +1070,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_process_phase_resets_mutation_between_phases() {
+    #[tokio::test]
+    async fn test_process_phase_resets_mutation_between_phases() {
         // Mutations must not accumulate across phases within one stream: the
         // response-headers phase appends `x-extproc-names`, and the following
         // response-body phase must start from a clean mutation.
@@ -1051,7 +1093,7 @@ mod tests {
             Some(&envoy_header_map(&[("x-foo", "bar")])),
             false,
         ))));
-        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (_resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseHeaders);
         assert_eq!(
             rc.response
@@ -1070,7 +1112,7 @@ mod tests {
             grpc_message_compressed: false,
             drain_complete: false,
         })));
-        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (_resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseBody);
         assert_eq!(
             rc.response
@@ -1083,8 +1125,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_process_phase_processor_error_with_abort_propagates() {
+    #[tokio::test]
+    async fn test_process_phase_processor_error_with_abort_propagates() {
         let server = GenericExtProcServer::new(
             "test".to_string(),
             Arc::new(ErroringProcessor {
@@ -1105,13 +1147,13 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "GET")])),
             false,
         ))));
-        let err = server.process_phase(&req, &mut rc).unwrap_err();
+        let err = server.process_phase(&req, &mut rc).await.unwrap_err();
         assert!(err.to_string().contains("processor exploded"));
         assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
     }
 
-    #[test]
-    fn test_process_phase_processor_error_without_abort_sends_empty_continue() {
+    #[tokio::test]
+    async fn test_process_phase_processor_error_without_abort_sends_empty_continue() {
         // Without AbortOnProcessorFailure, a phase error must send an empty
         // continue response and keep the stream alive (Go semantics).
         let server = GenericExtProcServer::new(
@@ -1128,7 +1170,7 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "GET")])),
             false,
         ))));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
         assert!(matches!(
@@ -1147,8 +1189,8 @@ mod tests {
         assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
     }
 
-    #[test]
-    fn test_process_phase_init_req_ctx_error_invokes_error_handler() {
+    #[tokio::test]
+    async fn test_process_phase_init_req_ctx_error_invokes_error_handler() {
         let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
         let server = GenericExtProcServer::new(
             "test".to_string(),
@@ -1170,15 +1212,15 @@ mod tests {
         ))));
         // Without AbortOnProcessorFailure, an init error sends an empty
         // continue response (Go semantics) while the error handler still runs.
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
         assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
         assert_eq!(proc.recorded_errors(), vec![RequestPhase::RequestHeaders]);
     }
 
-    #[test]
-    fn test_process_phase_unknown_request_type() {
+    #[tokio::test]
+    async fn test_process_phase_unknown_request_type() {
         let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
         let server = GenericExtProcServer::new(
             "test".to_string(),
@@ -1190,13 +1232,14 @@ mod tests {
         rc.reset_phase().unwrap();
         let err = server
             .process_phase(&processing_request(None), &mut rc)
+            .await
             .unwrap_err();
         assert!(!err.to_string().is_empty());
         assert_eq!(rc.get_phase(), RequestPhase::Undetermined);
     }
 
-    #[test]
-    fn test_process_phase_metrics_increment() {
+    #[tokio::test]
+    async fn test_process_phase_metrics_increment() {
         let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
         let server = GenericExtProcServer::new(
             "test".to_string(),
@@ -1213,7 +1256,7 @@ mod tests {
             grpc_message_compressed: false,
             drain_complete: false,
         })));
-        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
         assert_eq!(phase, RequestPhase::ResponseBody);
         assert!(resp.is_some());
 
@@ -1225,6 +1268,98 @@ mod tests {
             .find(|f| f.name() == "extproc_response_body_bytes_total")
             .unwrap();
         assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 3.0);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_async_processor_awaits() {
+        // Phase methods are async: an implementation may await asynchronous
+        // work during a phase and still drive the phase to a response.
+        struct AsyncTestProcessor {
+            name: String,
+            opts: Option<ProcessingOptions>,
+        }
+
+        #[async_trait]
+        impl RequestProcessor for AsyncTestProcessor {
+            fn name(&self) -> String {
+                self.name.clone()
+            }
+            fn options(&self) -> &ProcessingOptions {
+                self.opts.as_ref().unwrap()
+            }
+            async fn process_request_headers(
+                &self,
+                ctx: &mut RequestContext,
+                _headers: &AllHeaders,
+            ) -> Result<(), Error> {
+                // Simulate an async phase by awaiting an already-completed
+                // oneshot signal, then continue the request.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(());
+                let _ = rx.await;
+                ctx.continue_request()
+            }
+            async fn process_request_trailers(
+                &self,
+                ctx: &mut RequestContext,
+                _trailers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_request_body(
+                &self,
+                ctx: &mut RequestContext,
+                _body: &[u8],
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_response_headers(
+                &self,
+                ctx: &mut RequestContext,
+                _headers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_response_body(
+                &self,
+                ctx: &mut RequestContext,
+                _body: &[u8],
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_response_trailers(
+                &self,
+                ctx: &mut RequestContext,
+                _trailers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+            fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let proc = Arc::new(AsyncTestProcessor {
+            name: "async".to_string(),
+            opts: Some(ProcessingOptions::new()),
+        });
+        let server = GenericExtProcServer::new(
+            "async".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_some());
+        assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
     }
 
     #[test]

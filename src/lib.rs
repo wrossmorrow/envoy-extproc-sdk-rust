@@ -19,7 +19,9 @@
 //! handed to [`serve`](server::serve) / [`must_serve`](server::must_serve), which
 //! handle the gRPC streaming and shared context, parsing the processing phase
 //! in the gRPC stream and calling the right
-//! [`RequestContext`](context::RequestContext) method.
+//! [`RequestContext`](context::RequestContext) method. Phase processing methods
+//! are async, so implementations may await asynchronous work (e.g. downstream
+//! HTTP calls) without blocking the stream task.
 //!
 //! [`envoy-types`](https://crates.io/crates/envoy-types) provides the compiled
 //! protobuf types for the `envoy.service.ext_proc.v3` service, and

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use extproc::{
     AllHeaders, Error, ProcessingOptions, RequestContext, RequestPhase, RequestProcessor,
 };
@@ -6,6 +7,7 @@ pub struct NoopRequestProcessor {
     pub opts: ProcessingOptions,
 }
 
+#[async_trait]
 impl RequestProcessor for NoopRequestProcessor {
     fn name(&self) -> String {
         "noop".to_string()
@@ -15,7 +17,7 @@ impl RequestProcessor for NoopRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -23,7 +25,7 @@ impl RequestProcessor for NoopRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -31,11 +33,15 @@ impl RequestProcessor for NoopRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -43,11 +49,15 @@ impl RequestProcessor for NoopRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,

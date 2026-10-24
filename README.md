@@ -44,35 +44,35 @@ pub trait RequestProcessor: Send + Sync + 'static {
     /// The processor's `ProcessingOptions`.
     fn options(&self) -> &ProcessingOptions;
 
-    /// Process the request headers phase.
-    fn process_request_headers(
+    /// Process the request headers phase. May perform asynchronous work.
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         headers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Process the request trailers phase.
-    fn process_request_trailers(
+    /// Process the request trailers phase. May perform asynchronous work.
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         trailers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Process the request body phase.
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
+    /// Process the request body phase. May perform asynchronous work.
+    async fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
 
-    /// Process the response headers phase.
-    fn process_response_headers(
+    /// Process the response headers phase. May perform asynchronous work.
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         headers: &AllHeaders,
     ) -> Result<(), Error>;
 
-    /// Process the response body phase.
-    fn process_response_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
+    /// Process the response body phase. May perform asynchronous work.
+    async fn process_response_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error>;
 
-    /// Process the response trailers phase.
-    fn process_response_trailers(
+    /// Process the response trailers phase. May perform asynchronous work.
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         trailers: &AllHeaders,
@@ -111,6 +111,9 @@ pub struct RequestContext {
 }
 ```
 that work together to allow processing of requests and responses.
+
+Phase processing methods are async (via the [`async_trait`](https://crates.io/crates/async-trait) crate): implementations may perform asynchronous work such as downstream HTTP calls or database lookups without blocking the stream task. Phase messages within a single request/response exchange are still processed sequentially, matching the ordered envoy ext_proc protocol flow; concurrency is available across concurrent streams.
+
 
 An ExtProc service can be run with the `must_serve` convenience function as in
 ```rust

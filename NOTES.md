@@ -114,6 +114,22 @@ The port now compiles and the unit test suite passes:
 
 - Stream lifecycle metrics, error semantics and abort (**done**, Phase 3).
 
+- Async phase processing (**done**, follow-up to Phase 3): the `RequestProcessor`
+  trait phase methods are now `async fn` (via the `async-trait` crate, `#[async_trait]`
+  on the trait), so processor implementations can await asynchronous work (e.g.
+  downstream HTTP calls, DB lookups) during a phase instead of blocking. The
+  server-side phase dispatch (`GenericExtProcServer::process_phase` /
+  `dispatch_phase`) is now async, and `ProcessStream::poll_next` drives the phase
+  future via `Future::poll` (the `Stream` poll interface cannot await). In-repo
+  implementors updated: `TesterRequestProcessor`, the local processor, and all
+  example processors, plus the server unit tests (now `#[tokio::test]`). A new
+  unit test (`test_process_phase_async_processor_awaits`) covers a processor that
+  awaits inside a phase.
+  - **Breaking change** for external implementors: phase methods are now async;
+    implementors must add `#[async_trait]` and `async fn` to their `RequestProcessor`
+    impls. Follow-up candidates: make the error handler (`error_handler`) async as
+    well, and document `close` semantics for async processors.
+
 ## Remaining known gaps
 
 - **Local response streaming** (`StreamedImmediateResponse`) — **NOT implemented**;

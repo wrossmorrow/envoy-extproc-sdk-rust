@@ -1,6 +1,7 @@
 //! Local binary entry point for the extproc server, for running the SDK
 //! locally (e.g. to smoke-test against a real Envoy).
 
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use extproc::{
@@ -20,6 +21,7 @@ impl LocalProcessor {
     }
 }
 
+#[async_trait]
 impl RequestProcessor for LocalProcessor {
     fn name(&self) -> String {
         "local".to_string()
@@ -29,7 +31,7 @@ impl RequestProcessor for LocalProcessor {
         &self.options
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -37,7 +39,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -45,7 +47,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(
+    async fn process_request_body(
         &self,
         ctx: &mut RequestContext,
         _body: &[u8],
@@ -53,7 +55,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -61,7 +63,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(
+    async fn process_response_body(
         &self,
         ctx: &mut RequestContext,
         _body: &[u8],
@@ -69,7 +71,7 @@ impl RequestProcessor for LocalProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,

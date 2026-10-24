@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 
 use regex::Regex;
@@ -30,6 +31,7 @@ pub struct EchoRequestProcessor {
     pub opts: ProcessingOptions,
 }
 
+#[async_trait]
 impl RequestProcessor for EchoRequestProcessor {
     fn name(&self) -> String {
         "echo".to_string()
@@ -39,7 +41,7 @@ impl RequestProcessor for EchoRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -51,7 +53,7 @@ impl RequestProcessor for EchoRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -59,7 +61,11 @@ impl RequestProcessor for EchoRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error> {
         if echo_path_rx().is_match(&ctx.path) {
             let headers = join_headers(&ctx.all_headers);
             return ctx.cancel_request(200, &headers, body);
@@ -67,7 +73,7 @@ impl RequestProcessor for EchoRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -75,11 +81,15 @@ impl RequestProcessor for EchoRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
