@@ -23,11 +23,16 @@ build:
 clippy:
     cargo clippy --all-targets -- -D warnings
 
-# Run the test suite.
+# Run the unit test suite. Integration tests under tests/ drive a running
+# server and are run separately via `just integration-test`.
 test:
-    cargo test
+    cargo test --lib
 
-# Run the full gate: format check, clippy, tests.
+# Run the integration test suite (requires a running server; see tests/).
+integration-test:
+    cargo test --tests
+
+# Run the full gate: format check, clippy, unit tests.
 all: fmt-check clippy test
 
 # Run the extproc server locally (gRPC on :50051, metrics on :9090).
