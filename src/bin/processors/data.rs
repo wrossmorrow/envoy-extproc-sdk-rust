@@ -1,0 +1,84 @@
+use std::any::Any;
+
+use extproc::{
+    AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestProcessor,
+};
+
+pub struct DataRequestProcessor {
+    pub opts: ProcessingOptions,
+}
+
+impl RequestProcessor for DataRequestProcessor {
+    fn get_name(&self) -> String {
+        "data".to_string()
+    }
+
+    fn get_options(&self) -> &ProcessingOptions {
+        &self.opts
+    }
+
+    fn process_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.set_value(
+            "customId",
+            Box::new(uuid::Uuid::new_v4()) as Box<dyn Any + Send + Sync>,
+        )?;
+        ctx.continue_request()
+    }
+
+    fn process_request_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        _trailers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.continue_request()
+    }
+
+    fn process_request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        ctx.continue_request()
+    }
+
+    fn process_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        if let Some(id) = ctx
+            .get_value("customId")
+            .ok()
+            .and_then(|v| v.downcast_ref::<uuid::Uuid>().map(|u| u.to_string()))
+        {
+            ctx.add_header(
+                "x-extproc-custom-data",
+                &HeaderValue {
+                    value: String::new(),
+                    raw_value: Some(id.as_bytes().to_vec()),
+                },
+            )?;
+        }
+        ctx.continue_request()
+    }
+
+    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        ctx.continue_request()
+    }
+
+    fn process_response_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        _trailers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.continue_request()
+    }
+
+    fn error_handler(&self, _ctx: &mut RequestContext, phase: u32, err: Error) {
+        tracing::error!("Error in phase {}: {:?}", phase, err);
+    }
+
+    fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+        Ok(())
+    }
+}

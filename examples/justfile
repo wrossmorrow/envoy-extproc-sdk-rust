@@ -1,0 +1,54 @@
+image_name := "envoy-extproc-sdk-rust-examples"
+image_tag := `git rev-parse HEAD`
+
+# list these commands and exit
+default:
+    just --list
+
+# update modules
+update:
+    cargo update
+
+# tidy up modules
+tidy:
+    cargo tidy
+
+# format code
+format:
+    cargo fmt
+
+# run unit tests code
+unit-test: 
+    echo "TBD"
+
+# run integration tests on code
+integration-test: 
+    echo "TBD"
+
+# run a specific example
+run example="noop" *flags="":
+    cd .. && cargo run --bin extproc-example -- {{example}} {{flags}}
+
+# build the example binary
+build *flags="":
+    cargo build --bin extproc-example
+
+# containerize the examples
+containerize tag=image_tag *flags="":
+    cd .. && docker build -f examples/Dockerfile -t {{image_name}}:{{tag}} . {{flags}}
+
+# run the examples in a container setup with envoy and an echo server
+up:
+    cd .. && docker compose -f examples/compose.yaml up --build
+
+# stop the examples in a container setup with envoy and an echo server
+down:
+    cd .. && docker compose -f examples/compose.yaml down
+
+# run a curl command against the example envoy setup; use flags for extra data
+call method="GET" path="/" *flags="": 
+    curl -X {{method}} localhost:8080{{path}} {{flags}} -vvv -s | jq .
+
+# run a curl command against the example envoy setup; use flags for extra data
+metrics: 
+    curl -X GET localhost:9090/metrics

@@ -43,3 +43,12 @@ all: fmt-check clippy test
 # Run the extproc server locally (gRPC on :50051, metrics on :9090).
 run:
     cargo run
+
+# Run a specific example processor (e.g. `just run example="noop"`, flags like
+# `-port 50051 -update-extproc-header -update-duration-header`).
+run-example example="noop" *flags="":
+    cargo run --bin extproc-example -- {{example}} {{flags}}
+
+# Build the example server binary.
+build-example:
+    cargo build --bin extproc-example

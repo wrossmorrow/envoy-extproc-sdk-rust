@@ -158,6 +158,58 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
 5. **Phase 5** — Final gate and notes.
 6. **Phase 6** — Integration tests (proposed next step).
 
+## Examples Port (Go SDK → Rust SDK)
+
+**Status:** in progress. Starting-point branch `feat/examples-port` (PR open).
+
+Port of the Go SDK
+[`examples/`](https://github.com/wrossmorrow/envoy-extproc-sdk-go/tree/main/examples)
+(`noop`, `trivial`, `timer`, `data`, `digest`, `dedup`, `masker`, `echo`, `router`) to the
+Rust SDK, as runnable example binaries built on the public `extproc` lib API.
+
+Summary of the agreed port plan:
+
+- Dispatcher binary: `src/bin/extproc-example.rs` with processor modules under
+  `src/bin/processors/`. Takes the processor name as the first argument and mirrors the Go
+  `examples/main.go` flags (`-port`, `-update-extproc-header`, `-update-duration-header`).
+- The Rust `RequestProcessor` trait has no `Init`; options live in each processor struct and
+  flow via `get_options`.
+- Errors are `Box<dyn Error + Send + Sync>` (`extproc::Error`).
+- Phase helpers: `continue_request`, `cancel_request(status, &HashMap<String, HeaderValue>, body: &[u8])`,
+  `add/append/overwrite/remove_header`, `replace_body/clear_body/replace_body_chunk/clear_body_chunk`,
+  `clear_route_cache`, `set_value/get_value` (values are `Box<dyn Any + Send + Sync>`, downcast via
+  `DynAny = dyn Any + Send + Sync`), `end_of_stream`, `started: Instant`, `duration: Duration`, phase
+  consts, `get_response`.
+- Immediate responses are valid for request-headers/request-body/response-headers/response-body
+  phases; trailers phases ignore them.
+- Digest example needs interior mutability for the shared hasher across phases
+  (`Mutex<Sha256>` via ctx data).
+- Masker needs JSON flatten/unflatten (via `serde_json`) — decision: hand-rolled minimal helpers.
+- Dedup cache: static `Mutex<HashMap<String, bool>>` (Go used a package var).
+- Example-processor logging: `tracing` (server installs a subscriber).
+
+Port progress on this branch (checked off as each example lands):
+
+- [x] Port plan + status summary added here; starting-point dispatcher binary and `noop`
+      processor committed.
+- [x] `trivial`
+- [x] `timer`
+- [x] `data`
+- [x] `digest`
+- [x] `dedup`
+- [x] `masker`
+- [x] `echo`
+- [x] `router`
+- [ ] Wire the example server into the Go-examples-style compose/envoy setup
+      (`examples/envoy.yaml`, `examples/compose.yaml`, `examples/Dockerfile`,
+      `examples/justfile`) and update the dispatcher flags (`-port`,
+      `-update-extproc-header`, `-update-duration-header`) to full parity with
+      the Go `examples/main.go`.
+- [ ] Update the Rust `README.md` Examples section now that the Go examples are
+      ported.
+- [ ] Consider promoting the example processors into the lib (public) if they
+      should be reusable outside the example binary.
+
 ## Go test inventory (ported so far)
 
 - context_test.go: phase constants values/names, `default_phase_if_invalid`,
