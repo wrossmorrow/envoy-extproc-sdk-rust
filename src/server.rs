@@ -1,7 +1,6 @@
 //! The gRPC server implementation: [`RequestProcessor`] trait and
 //! [`GenericExtProcServer`].
 
-use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -21,7 +20,7 @@ use async_trait::async_trait;
 use prometheus::Encoder;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -142,8 +141,9 @@ impl GenericExtProcServer {
     /// [`ProcessingResponse`] to send back to `envoy`.
     ///
     /// Phase processing is asynchronous: the processor's phase methods are
-    /// async, and this drives them. Called from the [`ProcessStream`] poll
-    /// loop, which polls the phase future instead of awaiting it.
+    /// async, and this drives them. Called from the spawned phase task that
+    /// backs the [`ProcessStream`], which owns the inbound stream and context
+    /// and sends responses over a channel.
     pub async fn process_phase(
         &self,
         proc_req: &ProcessingRequest,
@@ -521,23 +521,23 @@ fn init_req_ctx(
 }
 
 /// The response stream driving one bidirectional ext_proc stream.
+///
+/// Phase processing runs on a spawned task that owns the inbound stream and the
+/// [`RequestContext`](crate::context::RequestContext); responses (and terminal
+/// errors) are sent through an unbounded channel and relayed by
+/// [`Stream::poll_next`](tokio_stream::Stream::poll_next). The task sends each
+/// phase's response before pulling the next phase, so the relay preserves
+/// envoy's ordered phase flow; a closed channel means the task has finished and
+/// the stream is done.
 pub struct ProcessStream {
     server: Arc<GenericExtProcServer>,
-    rc: RequestContext,
-    incoming: std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<ProcessingRequest, tonic::Status>> + Send>,
-    >,
-    pending: Option<Result<ProcessingResponse, tonic::Status>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<ProcessingResponse, tonic::Status>>,
     /// Whether the stream was ended by a processing error, for metrics.
     errored: bool,
 }
 
 impl Drop for ProcessStream {
     fn drop(&mut self) {
-        self.server
-            .metrics
-            .stream_duration_seconds
-            .observe((Instant::now() - self.rc.started).as_secs_f64());
         self.server.metrics.active_streams.dec();
         if self.errored {
             self.server.metrics.errored_streams.inc();
@@ -550,50 +550,78 @@ impl Stream for ProcessStream {
 
     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(resp) = this.pending.take() {
-            return Poll::Ready(Some(resp));
+        // Relay phase responses produced by the spawned task over the channel.
+        // The task sends each phase's response (or a terminal error) in order,
+        // so relaying preserves envoy's ordered phase flow. A closed channel
+        // means the task has finished and the stream is done.
+        if let Poll::Ready(Some(resp)) = this.rx.poll_recv(cx) {
+            return match resp {
+                Ok(resp) => Poll::Ready(Some(Ok(resp))),
+                Err(e) => {
+                    this.errored = true;
+                    Poll::Ready(Some(Err(e)))
+                }
+            };
         }
-        let poll = Stream::poll_next(std::pin::Pin::new(&mut this.incoming), cx);
-        match poll {
-            Poll::Ready(Some(Ok(req))) => {
-                // Phase processing is async (processor phase methods are async),
-                // but the `Stream` poll interface cannot await, so drive the
-                // phase future to completion via `poll`. Phase messages within
-                // a stream are still processed sequentially.
-                let mut phase_fut = Box::pin(this.server.process_phase(&req, &mut this.rc));
-                let outcome = std::pin::Pin::new(&mut phase_fut).poll(cx);
-                match outcome {
-                    Poll::Ready(outcome) => match outcome {
-                        Ok((resp, _phase)) => this.pending = resp.map(Ok),
-                        Err(e) => {
-                            this.errored = true;
-                            this.pending = Some(Err(Status::internal(format!(
-                                "failed to process phase: {}",
-                                e
-                            ))));
-                        }
-                    },
-                    Poll::Pending => return Poll::Pending,
+        Poll::Pending
+    }
+}
+
+/// Spawn the task that drives one bidirectional ext_proc stream: pull inbound
+/// phase messages, run phase processing, and send responses/errors through the
+/// channel. The task owns the inbound stream and the
+/// [`RequestContext`](crate::context::RequestContext), so phase processing is
+/// fully async. Observes the stream duration before exiting.
+async fn run_phase_task(
+    server: Arc<GenericExtProcServer>,
+    incoming: std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<ProcessingRequest, tonic::Status>> + Send>,
+    >,
+    tx: tokio::sync::mpsc::UnboundedSender<Result<ProcessingResponse, tonic::Status>>,
+) {
+    let mut incoming = incoming;
+    let mut rc = RequestContext::new();
+    loop {
+        let Some(req) = incoming.next().await else {
+            break;
+        };
+        let req = match req {
+            Ok(req) => req,
+            Err(e) => {
+                // Inbound stream error: forward it to the client and end the
+                // exchange (a cancelled stream is a clean end).
+                if e.code() != tonic::Code::Cancelled && tx.send(Err(e)).is_err() {
+                    break;
                 }
-                Poll::Ready(Some(this.pending.take().unwrap()))
+                break;
             }
-            Poll::Ready(Some(Err(e))) => {
-                if e.code() == tonic::Code::Cancelled {
-                    // Clean stream end, matching the Go SDK.
-                    return Poll::Ready(None);
+        };
+        let outcome = server.process_phase(&req, &mut rc).await;
+        match outcome {
+            Ok((resp, _phase)) => {
+                if let Some(resp) = resp {
+                    if tx.send(Ok(resp)).is_err() {
+                        break;
+                    }
                 }
-                this.errored = true;
-                this.server.processor.error_handler(
-                    &mut this.rc,
-                    RequestPhase::Undetermined,
-                    Box::new(e.clone()),
-                );
-                Poll::Ready(Some(Err(e)))
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Err(e) => {
+                if tx
+                    .send(Err(Status::internal(format!(
+                        "failed to process phase: {}",
+                        e
+                    ))))
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
+    server
+        .metrics
+        .stream_duration_seconds
+        .observe((Instant::now() - rc.started).as_secs_f64());
 }
 
 #[tonic::async_trait]
@@ -607,11 +635,15 @@ impl ExternalProcessor for GenericExtProcServer {
         self.metrics.total_streams.inc();
         self.metrics.active_streams.inc();
         let incoming = Box::pin(request.into_inner());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = Arc::new(self.clone());
+        let task_server = server.clone();
+        tokio::spawn(async move {
+            run_phase_task(task_server, incoming, tx).await;
+        });
         Ok(Response::new(ProcessStream {
-            server: Arc::new(self.clone()),
-            rc: RequestContext::new(),
-            incoming,
-            pending: None,
+            server,
+            rx,
             errored: false,
         }))
     }
@@ -1360,6 +1392,124 @@ mod tests {
         assert_eq!(phase, RequestPhase::RequestHeaders);
         assert!(resp.is_some());
         assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
+    }
+
+    #[tokio::test]
+    async fn test_stream_phase_processing_with_sleeping_processor() {
+        // Drive a full ext_proc stream in-process: spawn the phase task over an
+        // inbound channel, relay responses through an outbound channel, and poll
+        // the stream — with a processor that awaits a real timer in each phase.
+        // The whole exchange must complete within a timeout.
+        struct SleepingProcessor {
+            opts: ProcessingOptions,
+        }
+
+        impl SleepingProcessor {
+            fn new() -> Self {
+                Self {
+                    opts: ProcessingOptions::new(),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl RequestProcessor for SleepingProcessor {
+            fn name(&self) -> String {
+                "sleepy".to_string()
+            }
+            fn options(&self) -> &ProcessingOptions {
+                &self.opts
+            }
+            async fn process_request_headers(
+                &self,
+                ctx: &mut RequestContext,
+                _headers: &AllHeaders,
+            ) -> Result<(), Error> {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ctx.continue_request()
+            }
+            async fn process_request_trailers(
+                &self,
+                ctx: &mut RequestContext,
+                _trailers: &AllHeaders,
+            ) -> Result<(), Error> {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ctx.continue_request()
+            }
+            async fn process_request_body(
+                &self,
+                ctx: &mut RequestContext,
+                _body: &[u8],
+            ) -> Result<(), Error> {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ctx.continue_request()
+            }
+            async fn process_response_headers(
+                &self,
+                ctx: &mut RequestContext,
+                _headers: &AllHeaders,
+            ) -> Result<(), Error> {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ctx.continue_request()
+            }
+            async fn process_response_body(
+                &self,
+                ctx: &mut RequestContext,
+                _body: &[u8],
+            ) -> Result<(), Error> {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ctx.continue_request()
+            }
+            async fn process_response_trailers(
+                &self,
+                ctx: &mut RequestContext,
+                _trailers: &AllHeaders,
+            ) -> Result<(), Error> {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ctx.continue_request()
+            }
+            fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+            fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let server = Arc::new(GenericExtProcServer::new(
+            "sleepy".to_string(),
+            Arc::new(SleepingProcessor::new()),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        ));
+
+        let (in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<ProcessingRequest, tonic::Status>>(1);
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task_server = server.clone();
+        tokio::spawn(async move {
+            run_phase_task(
+                task_server,
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(in_rx)),
+                out_tx,
+            )
+            .await;
+        });
+
+        let mut stream = ProcessStream {
+            server,
+            rx: out_rx,
+            errored: false,
+        };
+
+        let phase_req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(
+            http_headers(Some(&envoy_header_map(&[(":method", "GET")])), false),
+        )));
+        in_tx.send(Ok(phase_req)).await.unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out waiting for phase response")
+            .expect("stream ended before a phase response was produced");
+        assert!(response.is_ok());
     }
 
     #[test]

@@ -119,12 +119,16 @@ The port now compiles and the unit test suite passes:
   on the trait), so processor implementations can await asynchronous work (e.g.
   downstream HTTP calls, DB lookups) during a phase instead of blocking. The
   server-side phase dispatch (`GenericExtProcServer::process_phase` /
-  `dispatch_phase`) is now async, and `ProcessStream::poll_next` drives the phase
-  future via `Future::poll` (the `Stream` poll interface cannot await). In-repo
-  implementors updated: `TesterRequestProcessor`, the local processor, and all
-  example processors, plus the server unit tests (now `#[tokio::test]`). A new
-  unit test (`test_process_phase_async_processor_awaits`) covers a processor that
-  awaits inside a phase.
+  `dispatch_phase`) is now async, and phase execution lives in a spawned task
+  (`run_phase_task`) that owns the inbound stream and the request context and
+  sends responses/errors over a channel; `ProcessStream` relays via
+  `tokio::sync::mpsc` (`poll_recv`). A new full-stream unit test
+  (`test_stream_phase_processing_with_sleeping_processor`) drives a complete
+  exchange with a processor that awaits a real timer, wrapped in
+  `tokio::time::timeout`. In-repo implementors updated: `TesterRequestProcessor`,
+  the local processor, and all example processors, plus the server unit tests
+  (now `#[tokio::test]`). A new unit test (`test_process_phase_async_processor_awaits`)
+  covers a processor that awaits inside a phase.
   - **Breaking change** for external implementors: phase methods are now async;
     implementors must add `#[async_trait]` and `async fn` to their `RequestProcessor`
     impls. Follow-up candidates: make the error handler (`error_handler`) async as
