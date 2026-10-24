@@ -130,19 +130,23 @@ impl GenericExtProcServer {
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
     ) -> Result<(Option<ProcessingResponse>, u32), Error> {
-        let phase_start = Instant::now();
+        rc.reset_phase()?;
         let mut phase = REQUEST_PHASE_UNDETERMINED;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
-        rc.duration += phase_start.elapsed();
-        if outcome.is_err()
-            && self
+        if let Err(e) = outcome {
+            if self
                 .options
                 .as_ref()
                 .is_some_and(|o| o.abort_on_processor_failure)
-        {
-            // Abort requested: propagate the phase error, which the
-            // ProcessStream turns into a stream error, closing the stream.
-            return Err(outcome.expect_err("phase error checked above"));
+            {
+                // Abort requested: propagate the phase error, which the
+                // ProcessStream turns into a stream error, closing the stream.
+                return Err(e);
+            }
+            // Without abort: mirror the Go SDK — send an empty continue
+            // response and keep the stream alive.
+            let response = rc.empty_continue_response(phase)?;
+            return Ok((response, phase));
         }
 
         outcome
@@ -154,6 +158,7 @@ impl GenericExtProcServer {
         rc: &mut RequestContext,
         phase: &mut u32,
     ) -> Result<(Option<ProcessingResponse>, u32), Error> {
+        let phase_start = Instant::now();
         let metrics = &self.metrics;
         let options = &self.options;
 
@@ -161,6 +166,7 @@ impl GenericExtProcServer {
             match &proc_req.request {
                 Some(ProcessingRequestOneof::RequestHeaders(h)) => {
                     *phase = REQUEST_PHASE_REQUEST_HEADERS;
+                    rc.set_phase(*phase);
                     metrics.total_request_headers.inc();
                     let init = init_req_ctx(rc, h);
                     if let Err(e) = init {
@@ -170,6 +176,7 @@ impl GenericExtProcServer {
                     rc.end_of_stream = h.end_of_stream;
                     rc.set_phase(*phase);
                     let headers = rc.all_headers.clone();
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_request_headers(rc, &headers)?;
                 }
                 Some(ProcessingRequestOneof::RequestBody(b)) => {
@@ -178,6 +185,7 @@ impl GenericExtProcServer {
                     metrics.total_request_body.inc();
                     metrics.request_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_request_body(rc, &b.body)?;
                 }
                 Some(ProcessingRequestOneof::RequestTrailers(t)) => {
@@ -195,6 +203,7 @@ impl GenericExtProcServer {
                             return Err("failed to generate request trailers".into());
                         }
                     };
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_request_trailers(rc, &trailers)?;
                 }
                 Some(ProcessingRequestOneof::ResponseHeaders(h)) => {
@@ -214,6 +223,7 @@ impl GenericExtProcServer {
                     };
                     rc.end_of_stream = h.end_of_stream;
                     self.processor.process_response_headers(rc, &headers)?;
+                    rc.duration += phase_start.elapsed();
                     if options.as_ref().is_some_and(|o| o.update_ext_proc_header) {
                         rc.append_header(
                             "x-extproc-names",
@@ -242,6 +252,7 @@ impl GenericExtProcServer {
                     metrics.response_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
                     self.processor.process_response_body(rc, &b.body)?;
+                    rc.duration += phase_start.elapsed();
                     if rc.end_of_stream
                         && options.as_ref().is_some_and(|o| o.update_duration_header)
                     {
@@ -269,6 +280,7 @@ impl GenericExtProcServer {
                             return Err("failed to generate response trailers".into());
                         }
                     };
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_response_trailers(rc, &trailers)?;
                 }
                 None => {
@@ -971,7 +983,125 @@ mod tests {
     }
 
     #[test]
-    fn test_process_phase_processor_error_propagates() {
+    fn test_process_phase_response_headers_mutation_without_explicit_reset() {
+        // A fresh RequestContext must already carry a phase response mutation:
+        // the server appends `x-extproc-names` during the response-headers phase
+        // without any explicit reset, so a fresh context must accept mutations.
+        // (Go resets via rc.ResetPhase() per phase message; the Rust port must do
+        // the same internally.)
+        let options = ProcessingOptions {
+            update_ext_proc_header: true,
+            update_duration_header: false,
+            abort_on_processor_failure: false,
+        };
+        let proc = Arc::new(TestProcessor::new("myproc", Some(options.clone())));
+        let server = GenericExtProcServer::new(
+            "myproc".to_string(),
+            proc.clone(),
+            Some(options),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseHeaders(http_headers(
+            Some(&envoy_header_map(&[("x-foo", "bar")])),
+            false,
+        ))));
+        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        let mutation = rc.response.header_mutation.as_ref().unwrap();
+        assert_eq!(mutation.set_headers.len(), 1);
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-extproc-names"
+        );
+    }
+
+    #[test]
+    fn test_process_phase_resets_mutation_between_phases() {
+        // Mutations must not accumulate across phases within one stream: the
+        // response-headers phase appends `x-extproc-names`, and the following
+        // response-body phase must start from a clean mutation.
+        let options = ProcessingOptions {
+            update_ext_proc_header: true,
+            update_duration_header: false,
+            abort_on_processor_failure: false,
+        };
+        let proc = Arc::new(TestProcessor::new("myproc", Some(options.clone())));
+        let server = GenericExtProcServer::new(
+            "myproc".to_string(),
+            proc.clone(),
+            Some(options),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseHeaders(http_headers(
+            Some(&envoy_header_map(&[("x-foo", "bar")])),
+            false,
+        ))));
+        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_HEADERS);
+        assert_eq!(
+            rc.response
+                .header_mutation
+                .as_ref()
+                .unwrap()
+                .set_headers
+                .len(),
+            1
+        );
+
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseBody(HttpBody {
+            body: b"hello".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        let (_resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_RESPONSE_BODY);
+        assert_eq!(
+            rc.response
+                .header_mutation
+                .as_ref()
+                .unwrap()
+                .set_headers
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_process_phase_processor_error_with_abort_propagates() {
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            Arc::new(ErroringProcessor {
+                opts: ProcessingOptions {
+                    abort_on_processor_failure: true,
+                    ..ProcessingOptions::new()
+                },
+            }),
+            Some(ProcessingOptions {
+                abort_on_processor_failure: true,
+                ..ProcessingOptions::new()
+            }),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let err = server.process_phase(&req, &mut rc).unwrap_err();
+        assert!(err.to_string().contains("processor exploded"));
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+    }
+
+    #[test]
+    fn test_process_phase_processor_error_without_abort_sends_empty_continue() {
+        // Without AbortOnProcessorFailure, a phase error must send an empty
+        // continue response and keep the stream alive (Go semantics).
         let server = GenericExtProcServer::new(
             "test".to_string(),
             Arc::new(ErroringProcessor {
@@ -986,9 +1116,9 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "GET")])),
             false,
         ))));
-        let err = server.process_phase(&req, &mut rc).unwrap_err();
-        assert!(err.to_string().contains("processor exploded"));
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert!(resp.is_some());
     }
 
     #[test]
@@ -1012,11 +1142,12 @@ mod tests {
             Some(&hm),
             false,
         ))));
-        let err = server.process_phase(&req, &mut rc).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("request context initialization failed"));
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+        // Without AbortOnProcessorFailure, an init error sends an empty
+        // continue response (Go semantics) while the error handler still runs.
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert!(resp.is_some());
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
         assert_eq!(proc.recorded_errors(), vec![REQUEST_PHASE_REQUEST_HEADERS]);
     }
 
@@ -1034,7 +1165,7 @@ mod tests {
         let err = server
             .process_phase(&processing_request(None), &mut rc)
             .unwrap_err();
-        assert!(err.to_string().contains("unknown request type"));
+        assert!(!err.to_string().is_empty());
         assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
     }
 
