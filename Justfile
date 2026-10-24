@@ -28,9 +28,14 @@ clippy:
 test:
     cargo test --lib
 
-# Run the integration test suite (requires a running server; see tests/).
+# Run the integration test suite. Brings up the docker compose harness
+# (envoy + upstream echo + extproc) and runs the tests against it; the harness
+# must be up for the tests to pass. Single-threaded: the integration tests
+# assert on cumulative metrics deltas against a shared server, which is not
+# safe under parallel test execution.
 integration-test:
-    cargo test --tests
+    just -f tests/justfile up
+    cargo test --tests -- --test-threads=1
 
 # Run the full gate: format check, clippy, unit tests.
 all: fmt-check clippy test

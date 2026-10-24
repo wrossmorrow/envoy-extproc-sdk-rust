@@ -513,15 +513,10 @@ async fn integration_metrics_endpoint() {
     let grpc_addr = grpc_addr();
     let mut client = connect_grpc(grpc_addr).await;
     let (tx, rx) = mpsc::channel::<ProcessingRequest>(8);
-    let mut stream = client
-        .process(ReceiverStream::new(rx))
-        .await
-        .expect("failed to open process stream")
-        .into_inner();
-    let mut tx = tx;
 
     // Metrics are cumulative over the lifetime of the server, so assert on
-    // deltas across this test's own stream.
+    // deltas across this test's own stream. The snapshot must be taken before
+    // the stream is opened: opening a stream increments `extproc_total_streams`.
     let text_before = fetch_metrics_text(metrics_addr()).await;
     let bytes_before = metrics_counter_value(&text_before, "extproc_request_body_bytes_total")
         .expect("before: body bytes");
@@ -529,6 +524,13 @@ async fn integration_metrics_endpoint() {
         metrics_counter_value(&text_before, "extproc_total_streams").expect("before: streams");
     let msgs_before = metrics_counter_value(&text_before, "extproc_request_body_messages_total")
         .expect("before: body messages");
+
+    let mut stream = client
+        .process(ReceiverStream::new(rx))
+        .await
+        .expect("failed to open process stream")
+        .into_inner();
+    let mut tx = tx;
 
     let resp = send_recv(
         &mut tx,
