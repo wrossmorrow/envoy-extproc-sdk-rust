@@ -381,4 +381,31 @@ Inspired by the Go SDK's `test/` directory (github.com/wrossmorrow/envoy-extproc
    default to `0`) — followup, since the fix was switching to `ServerOptions::new()`.
 4. Re-run the full gate and update the Go test inventory to cover the newly ported tests.
 
-## Go source inventory (2026-10-24)
+## Session log (2026-10-24 — plain-http envoy integration tests migrated, gateway 301 root cause fixed)
+
+### Changes made this session (2026-10-24, on `test/integration-envoy-e2e`, PR #7)
+
+- Added `tests/http_integration.rs`: clean plain-HTTP end-to-end integration tests
+  against a running envoy (docker compose harness), ported from the Go SDK's
+  `test/tester_test.go` and `test/cases.yaml`. 11 tests: noop, clear request/response
+  body, add/remove/overwrite request & response headers, cancel, header parsing.
+  Gateway base URL via `EXTO_PROC_ECHO_URL` (default `http://localhost:8080`).
+- `src/tester.rs`: `TesterRequestBody` now derives `Serialize` and skips `None`
+  fields on serialization (action JSON without nulls, matching the Go SDK's
+  omission of unset fields).
+
+### Root cause of the mass `301` failures (fixed)
+
+- Tester gateway URIs were built with `format!("{}/{}", base, path)` where the paths
+  (`/test`, `/no-extproc`) already begin with `/`, producing `//test` and `//no-extproc`.
+  Envoy canonicalized and answered `301 → Location: /test`.
+- Fixed to single-slash URIs; re-ran the plain-HTTP suite.
+
+### Test results (live harness, after fix)
+
+- `cargo test --test http_integration -- --test-threads=1` → 10/11 pass.
+- `http_remove_response_header` still red; the add-then-remove rewrite also failed
+  (final encoded response still carried the added header), so the original remove-`date`
+  variant was restored in `b03adbe`.
+
+## Go source inventory (2026/10/24)
