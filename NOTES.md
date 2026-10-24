@@ -67,7 +67,7 @@ Suggested stage breakdown (adjust as reality hits):
   `HeaderAppendAction`; action variants and constructor names may differ from
   the Go ones — check generated source before implementing.
 
-### Current state (post green gate — 2026-10-23)
+### Current state (post green gate — 2026-10-24, refreshed after the quick overall review)
 
 The port now compiles and the full test suite passes:
 
@@ -83,27 +83,83 @@ The port now compiles and the full test suite passes:
   - init errors / gen-headers errors invoke the processor `error_handler` and propagate.
   - processor errors propagate out of `process_phase`.
 
+### Quick overall review findings (2026-10-24)
+
+A quick side-by-side review of the merged Rust port against the Go sources
+(re-fetched from `wrossmorrow/envoy-extproc-sdk-go@main` into `/tmp/go_sdk`) was
+performed on top of the green gate. Findings, in priority order:
+
+**P0 — correctness bugs (fix before relying on phase behavior):**
+
+1. Phase response state is never reset between phases. Go resets via
+   `rc.ResetPhase()` at the top of every stream message loop iteration (and
+   again inside `initReqCtx` for the request-headers phase). The Rust port has
+   `RequestContext::reset_phase` (with tests) but the server never calls it, so
+   a fresh `RequestContext` starts with `PhaseResponse.header_mutation == None`
+   and the first `append_header` / `replace_body` (which overwrite
+   Content-Length via header mutation) fails with "no header mutation in
+   progress"; mutations also accumulate across phases within one stream. The
+   unit tests masked this by calling `rc.reset_phase()` manually. **Fix:** call
+   `rc.reset_phase()` at the start of phase processing.
+
+2. Error semantics diverge. Go: on a phase error, set `errored`, increment
+   `PhaseErrors`, and if `AbortOnProcessorFailure` return an error (stream
+   errors); **otherwise** send an empty continue response and keep the stream
+   alive. Rust: always converts a phase error into a stream error. Rust also
+   never increments `total_empty_responses` on this path. **Fix:** mirror Go's
+   empty-continue flow in the stream loop.
+
+3. `x-extproc-duration-ns` is computed before the current phase's duration is
+   accumulated. Rust appends the duration header inside `dispatch_phase` using
+   `rc.duration`, but `rc.duration += phase_start.elapsed()` runs in
+   `process_phase` afterwards. Go adds the phase duration before appending. **Fix
+   ordering.**
+
+**P1 — fidelity bugs:**
+
+4. `UpdateHeaders` (and `AddHeaders`/`OverwriteHeaders`) are not all-or-nothing
+   in Rust; Go validates all header values before applying. Rust appends while
+   iterating and leaves a partial mutation behind on error. **Fix:** validate
+   first, then apply.
+
+5. Metrics: `response_send_errors` is still unwired (send errors are not
+   observable at the stream level in the current design — accepted gap).
+   `total_empty_responses` becomes reachable once the P0-2 fix lands.
+
+**P2 — accepted deviations / minor divergences:**
+
+6. Bounded force-stop after `termination_grace_period_seconds` is still not
+   implemented (tonic `serve_with_shutdown` graceful semantics; maintainer decision
+   recorded to rely on k8s SIGKILL). Revisit if running outside k8s.
+
+7. Metrics histogram lacks Go's `NativeHistogramBucketFactor(1.1)`.
+
+8. `Cargo.toml` `repository` still points at the Go repo — copy/paste leftover.
+
+**Test coverage gaps (for the upcoming integration tests):**
+
+- Rust: 33 unit tests. Go: ~50 across context/headers/health/options/phase/server/metrics.
+- Not yet ported: ContinueRequest clears immediate / honors clear-route-cache, GetResponse
+  typed responses incl. trailers, GetResponse unknown phase, EmptyContinueResponse per phase,
+  GetResponse ignores immediate for trailers, ReplaceBody/SetContentLength/ClearBody content-
+  length behavior, UpdateHeader actions, UpdateHeaders all-or-nothing, metrics counter/gauge/
+  register-exposes-every-collector tests, context value helpers, cancel-request validation,
+  phase lifecycle via GetResponse.
+- NOTES.md "Go test inventory" is stale: it overstates what has been ported.
+
 ### Remaining known gaps (verified against the Go sources — 2026-10-24)
 
 The items below are the open work. During this review each was re-checked against the
 Go implementation (mirrored into `/tmp/go_*.go` from `wrossmorrow/envoy-extproc-sdk-go@main`)
 and several additional gaps were found that were not yet listed.
 
-1. **Metrics HTTP endpoint wiring in `GenericExtProcServer::serve`** — NOT done.
-   `serve` builds a throwaway `prometheus::Registry` + `Metrics::new()`, creates an axum
-   `Router` with the `/metrics` handler, binds it to `let _metrics_router` (immediately
-   dropped), and never serves it. The server-held `self.metrics` is not used for the
-   registry. Completion: register `self.metrics.clone()` into the served registry, run the
-   axum server on the `metrics_http_port` listener (with graceful shutdown), and shut it
-   down during the graceful shutdown sequence.
+1. **Metrics HTTP endpoint wiring in `GenericExtProcServer::serve`** — **DONE (2026-10-24)**.
+   Completed via PR #3 (Phase 1 of the completion plan below).
 
-2. **Graceful shutdown wiring in `serve`** — NOT finalized. Current state: uses
-   `serve_with_shutdown(addr, ctrl_c-only signal)`, then `let _ = self.close(...)`.
-   Compared to Go `Serve`, missing: SIGTERM handling, health `MarkUnready`, unready
-   propagation wait, graceful stop, bounded force-stop, metrics server shutdown, close error
-   propagation. Completion: SIGINT+SIGTERM signal future; mark unready; wait
-   `unready_propagation_delay_seconds`; graceful stop; force stop after
-   `termination_grace_period_seconds`; shutdown metrics server; propagate `close` error.
+2. **Graceful shutdown wiring in `serve`** — **IN PROGRESS (2026-10-24)** (Phase 2 below).
+   Done: SIGINT+SIGTERM signal future, health `MarkUnready`, unready propagation wait,
+   graceful stop via tonic `serve_with_shutdown`, and `close` error propagation. Still
+   open: bounded force-stop after `termination_grace_period_seconds`.
 
 3. **Local response streaming (`StreamedImmediateResponse`)** — NOT implemented. The
    envoy-types `ProcessingResponse` oneof includes `StreamedImmediateResponse` (oneof tag
@@ -162,7 +218,8 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      (recorded): tonic 0.14 `serve_with_shutdown` performs graceful shutdown without an
      externally-bounded force-stop. Either accept tonic's semantics or restructure around an
      incoming stream to implement the bounded force-stop. Metrics server shutdown deferred to
-     Phase 1.
+     Phase 1 — **resolved**: Phase 1 completed 2026-10-24, so the metrics server is served and
+     gracefully awaited during the shutdown sequence.
    - 📝 Note (2026-10-24): maintainer decision — in Kubernetes the force stop after the grace
      period happens automatically when the process is killed (kubelet sends SIGTERM, then
      SIGKILL per `terminationGracePeriodSeconds`). The SDK may not need its own bounded
@@ -174,12 +231,15 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      active_streams) and `ProcessStream` Drop (active_streams decrement, stream_duration_seconds
      observe, errored_streams increment when errored).
    - ✅ Done: `abort_on_processor_failure` consulted in `process_phase`; phase error
-     propagates and closes the stream.
+     propagates and closes the stream (pre-review reading — see the P0-2 finding above: the
+     Go SDK sends an empty continue and keeps the stream alive unless abort is set, so the
+     error flow below is known to be incomplete until fixed).
    - ✅ Done: `ProcessStream` receive-error handling now treats `Code::Cancelled` as a clean
      end and routes other receive errors through `error_handler(phase = UNDETERMINED)`.
    - ⬜ Not wired here: `response_send_errors` (send errors are not observable at the
-     stream level in the current design) and `total_empty_responses` (no empty-response path
-     in the Rust PhaseResponse API).
+     stream level in the current design). `total_empty_responses` is expected to be wired
+     together with the P0-2 error/empty-continue fix (the Rust `PhaseResponse` API already
+     provides `empty_continue_response`).
    - ✅ Done: propagate `close` error instead of discarding it (done in Phase 2).
 
 4. **Phase 4 — Streaming responses** (completes gaps 3–4).
@@ -191,6 +251,13 @@ Ordered plan derived from the gaps above, sequenced against the existing green g
      `cargo test`.
    - Update the Go test inventory to cover the newly ported tests.
 
+6. **Phase 6 — Integration tests (proposed next step).**
+   - Spin up the real server (`GenericExtProcServer` + tonic listener) and drive it with a
+     tonic client over a real gRPC stream: multi-phase streams (headers → body → trailers),
+     header/body mutations and responses, error paths, metrics endpoint, health, shutdown.
+   - Port/adapt the Go test-suite behaviors not covered by the unit tests listed in the
+     Go test inventory above.
+
 Suggested order, updated per maintainer prioritization:
 
 1. **Phase 2 — Graceful shutdown wiring** (most important; graceful shutdown is essential).
@@ -200,7 +267,7 @@ Suggested order, updated per maintainer prioritization:
 5. **Phase 4 — Streaming responses** — **DEFERRED/ignored for now** (maintainer decision;
    deemed not handled in the Go SDK and likely adds would be needed in both SDKs).
 
-## Go test inventory (ported so far)
+## Go test inventory (ported so far, refreshed 2026-10-24)
 
 - context_test.go: phase constants values/names, `default_phase_if_invalid`,
   `request_phase_to_string`, HeaderValue isValid/to_envoy conversions, PhaseResponse,
@@ -215,7 +282,19 @@ Suggested order, updated per maintainer prioritization:
 - phase_test.go: phase name strings for all 7 phases, errors like "processor is nil".
 - server_test.go: Serve error when processor nil, processPhase dispatch, error handler.
 
+**Not yet ported (candidates for the upcoming integration tests):**
+
+- phase_test.go: ContinueRequest clears immediate / honors clear-route-cache, GetResponse
+  typed responses per phase (incl. trailers), GetResponse unknown phase, EmptyContinueResponse
+  per phase, GetResponse ignores immediate for trailers, ReplaceBody/SetContentLength/
+  ClearBody content-length behavior, UpdateHeader actions, UpdateHeaders all-or-nothing.
+- context_test.go: context value helpers (Set/Get/overwrite), CancelRequest invalid header
+  value, ReplaceBodyChunk/ReplaceBody/ClearBody content-length cases, MetricsCollectors
+  counter/gauge/register-exposes-every-collector cases.
+- server_test.go: TestProcessPhaseMetricsErrorPath (processor error increments phase_errors
+  and propagates).
+
 ## Go source inventory
 
-- /tmp/envoy-extproc-sdk-go/*.go — context.go, extproc.go (RequestProcessor trait),
+- /tmp/go_sdk/*.go (re-fetched 2026-10-24) — context.go, extproc.go (RequestProcessor trait),
   headers.go, health.go, options.go, server.go, metrics.go, tests.
