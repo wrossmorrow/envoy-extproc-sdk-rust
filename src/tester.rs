@@ -12,7 +12,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::context::{HeaderValue, RequestContext};
 use crate::headers::AllHeaders;
@@ -26,44 +26,44 @@ const ACTIONS_KEY: &str = "actions";
 
 /// The action schema of the parametrized integration test cases, mirroring the
 /// Go SDK's `test/tester.go` `TesterRequestBody`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TesterRequestBody {
     // request processing options
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_request_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub add_request_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overwrite_request_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_request_headers: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_request_body: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_request_body: Option<String>,
 
     // response processing options
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_response_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub add_response_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overwrite_response_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_response_headers: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_response_body: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_response_body: Option<String>,
 
     // cancellation
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request_status: Option<i32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request_body: Option<String>,
 }
 
