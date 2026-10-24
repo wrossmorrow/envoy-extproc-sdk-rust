@@ -259,7 +259,7 @@ async fn integration_noop_stream() {
     let bin = std::env::var("CARGO_BIN_EXE_extproc-tester").expect("CARGO_BIN_EXE_extproc-tester");
     let ext_proc_port = free_port().await;
     let metrics_http_port = free_port().await;
-    let mut child = std::process::Command::new(bin)
+    let child = std::process::Command::new(bin)
         .args([
             "--extproc-port",
             &ext_proc_port.to_string(),
@@ -268,6 +268,8 @@ async fn integration_noop_stream() {
         ])
         .spawn()
         .expect("failed to spawn server binary");
+    // Ensure the spawned server is cleaned up even if the test fails.
+    let _child_guard = ChildGuard { child };
 
     let grpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], ext_proc_port));
     let deadline = Duration::from_secs(15);
@@ -315,7 +317,19 @@ async fn integration_noop_stream() {
     // Clean end of stream.
     drop(tx);
     assert!(stream.next().await.is_none());
-    let _ = child.wait();
+}
+
+/// Kills and reaps a spawned server child when dropped, so a failed test
+/// cannot leak a running server process.
+struct ChildGuard {
+    child: std::process::Child,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[tokio::test]
