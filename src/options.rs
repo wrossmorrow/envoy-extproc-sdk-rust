@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Options controlling the ext_proc server itself (ports, timeouts, ...).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerOptions {
     /// Port the ext_proc gRPC server listens on.
     #[serde(rename = "extproc_port", default)]
@@ -23,6 +23,12 @@ pub struct ServerOptions {
     /// Seconds to wait for graceful shutdown before forcing stop.
     #[serde(rename = "termination_grace_period_seconds", default)]
     pub termination_grace_period_seconds: i32,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServerOptions {
