@@ -28,6 +28,9 @@ fn build_processor(
             opts,
         ))),
         "echo" => Ok(Arc::new(processors::echo::EchoRequestProcessor { opts })),
+        "router" => Ok(Arc::new(processors::router::RoutingRequestProcessor {
+            opts,
+        })),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
