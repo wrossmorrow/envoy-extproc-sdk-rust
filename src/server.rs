@@ -1131,9 +1131,13 @@ mod tests {
             Some(&envoy_header_map(&[(":method", "GET")])),
             false,
         ))));
-        let err = server.process_phase(&req, &mut rc).unwrap_err();
-        assert!(err.to_string().contains("processor exploded"));
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::RequestHeaders(_))
+        ));
 
         // The phase error was counted by the server metrics.
         let registry = Registry::new();
