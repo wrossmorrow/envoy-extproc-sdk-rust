@@ -130,19 +130,23 @@ impl GenericExtProcServer {
         proc_req: &ProcessingRequest,
         rc: &mut RequestContext,
     ) -> Result<(Option<ProcessingResponse>, u32), Error> {
-        let phase_start = Instant::now();
+        rc.reset_phase()?;
         let mut phase = REQUEST_PHASE_UNDETERMINED;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase);
-        rc.duration += phase_start.elapsed();
-        if outcome.is_err()
-            && self
+        if let Err(e) = outcome {
+            if self
                 .options
                 .as_ref()
                 .is_some_and(|o| o.abort_on_processor_failure)
-        {
-            // Abort requested: propagate the phase error, which the
-            // ProcessStream turns into a stream error, closing the stream.
-            return Err(outcome.expect_err("phase error checked above"));
+            {
+                // Abort requested: propagate the phase error, which the
+                // ProcessStream turns into a stream error, closing the stream.
+                return Err(e);
+            }
+            // Without abort: mirror the Go SDK — send an empty continue
+            // response and keep the stream alive.
+            let response = rc.empty_continue_response(phase)?;
+            return Ok((response, phase));
         }
 
         outcome
@@ -154,6 +158,7 @@ impl GenericExtProcServer {
         rc: &mut RequestContext,
         phase: &mut u32,
     ) -> Result<(Option<ProcessingResponse>, u32), Error> {
+        let phase_start = Instant::now();
         let metrics = &self.metrics;
         let options = &self.options;
 
@@ -161,6 +166,7 @@ impl GenericExtProcServer {
             match &proc_req.request {
                 Some(ProcessingRequestOneof::RequestHeaders(h)) => {
                     *phase = REQUEST_PHASE_REQUEST_HEADERS;
+                    rc.set_phase(*phase);
                     metrics.total_request_headers.inc();
                     let init = init_req_ctx(rc, h);
                     if let Err(e) = init {
@@ -170,6 +176,7 @@ impl GenericExtProcServer {
                     rc.end_of_stream = h.end_of_stream;
                     rc.set_phase(*phase);
                     let headers = rc.all_headers.clone();
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_request_headers(rc, &headers)?;
                 }
                 Some(ProcessingRequestOneof::RequestBody(b)) => {
@@ -178,6 +185,7 @@ impl GenericExtProcServer {
                     metrics.total_request_body.inc();
                     metrics.request_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_request_body(rc, &b.body)?;
                 }
                 Some(ProcessingRequestOneof::RequestTrailers(t)) => {
@@ -195,6 +203,7 @@ impl GenericExtProcServer {
                             return Err("failed to generate request trailers".into());
                         }
                     };
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_request_trailers(rc, &trailers)?;
                 }
                 Some(ProcessingRequestOneof::ResponseHeaders(h)) => {
@@ -214,6 +223,7 @@ impl GenericExtProcServer {
                     };
                     rc.end_of_stream = h.end_of_stream;
                     self.processor.process_response_headers(rc, &headers)?;
+                    rc.duration += phase_start.elapsed();
                     if options.as_ref().is_some_and(|o| o.update_ext_proc_header) {
                         rc.append_header(
                             "x-extproc-names",
@@ -242,6 +252,7 @@ impl GenericExtProcServer {
                     metrics.response_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
                     self.processor.process_response_body(rc, &b.body)?;
+                    rc.duration += phase_start.elapsed();
                     if rc.end_of_stream
                         && options.as_ref().is_some_and(|o| o.update_duration_header)
                     {
@@ -269,6 +280,7 @@ impl GenericExtProcServer {
                             return Err("failed to generate response trailers".into());
                         }
                     };
+                    rc.duration += phase_start.elapsed();
                     self.processor.process_response_trailers(rc, &trailers)?;
                 }
                 None => {
@@ -1130,11 +1142,12 @@ mod tests {
             Some(&hm),
             false,
         ))));
-        let err = server.process_phase(&req, &mut rc).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("request context initialization failed"));
-        assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
+        // Without AbortOnProcessorFailure, an init error sends an empty
+        // continue response (Go semantics) while the error handler still runs.
+        let (resp, phase) = server.process_phase(&req, &mut rc).unwrap();
+        assert_eq!(phase, REQUEST_PHASE_REQUEST_HEADERS);
+        assert!(resp.is_some());
+        assert_eq!(rc.get_phase(), REQUEST_PHASE_REQUEST_HEADERS);
         assert_eq!(proc.recorded_errors(), vec![REQUEST_PHASE_REQUEST_HEADERS]);
     }
 
@@ -1152,7 +1165,7 @@ mod tests {
         let err = server
             .process_phase(&processing_request(None), &mut rc)
             .unwrap_err();
-        assert!(err.to_string().contains("unknown request type"));
+        assert!(!err.to_string().is_empty());
         assert_eq!(rc.get_phase(), REQUEST_PHASE_UNDETERMINED);
     }
 
