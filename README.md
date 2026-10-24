@@ -213,4 +213,6 @@ The Rust port also provides whole-body variants, [`replace_body`](https://docs.r
 
 ## Examples
 
-The examples from the Go SDK (`examples/noop.go`, `examples/trivial.go`, `examples/timer.go`, `examples/data.go`, `examples/digest.go`, `examples/dedup.go`, `examples/masker.go`, and `examples/echo.go`) have not yet been ported to Rust. Until then, the [`tester`](https://docs.rs/extproc/latest/extproc/) module and the integration harness in [`tests/`](tests/) exercise the SDK end to end.
+The examples from the Go SDK (`examples/noop.go`, `examples/trivial.go`, `examples/timer.go`, `examples/data.go`, `examples/digest.go`, `examples/dedup.go`, `examples/masker.go`, `examples/echo.go`, and `examples/router.go`) have been ported to Rust as example binaries. The example server binary is [`src/bin/extproc-example.rs`](src/bin/extproc-example.rs); run a specific example with `just run-example example="<name>"` or `cargo run --bin extproc-example -- <name>`.
+
+The compose setup under [`examples/`](examples/) runs `envoy` (see [`examples/envoy.yaml`](examples/envoy.yaml)), a mock echo server, and the example processors, mirroring the Go SDK's `examples/` setup.
