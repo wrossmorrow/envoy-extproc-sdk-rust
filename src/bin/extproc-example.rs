@@ -23,6 +23,7 @@ fn build_processor(
         "digest" => Ok(Arc::new(processors::digest::DigestRequestProcessor {
             opts,
         })),
+        "dedup" => Ok(Arc::new(processors::dedup::DedupRequestProcessor { opts })),
         _ => Err(format!("processor {} not defined", name).into()),
     }
 }
