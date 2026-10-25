@@ -53,6 +53,34 @@ just -f tests/justfile down
 | `burst.js` | `ramping-vus` | ramp concurrency to `VUS` (default 100) over 10s, ramp down. Thresholds: error rate < 1%, p95 < 2s. |
 | `delayed.js` | `constant-arrival-rate` | upstream latency injection via `X-Echo-Delay` and/or error injection via `X-Echo-Status`, through the full chain. |
 
+## Pass/fail signal
+
+The single generic signal for each k6 script is the **k6 exit code** (and the
+final run status line):
+
+- **Exit 0** = pass. All configured thresholds met.
+- **Exit 1** = fail. One or more thresholds were violated (k6 logs
+  `level=error msg="thresholds on metrics ... have been crossed"`).
+
+The human-readable equivalent is the final status line: `✓ [ 100% ] ...` means
+pass; `✗ [...] ...` means a threshold failed.
+
+Each script encodes its pass criteria via thresholds:
+
+- `http_req_failed: ['rate<0.01']` — error rate < 1% (unexpected statuses; the
+  `http.setResponseCallback(http.expectedStatuses(...))` marks 4xx/5xx as failed
+  requests).
+- `http_req_duration: ['p(95)<2000']` — p95 latency under the script's budget (per
+  script: smoke <1s, steady/burst <2s, delayed <5s).
+
+So a green run = exit 0 = no threshold violations = the full chain responded
+within the latency/error budget. A red run (exit 1) = a threshold was crossed
+(e.g. error rate too high, or p95 latency over budget).
+
+Without the containerized stack running, the scripts will fail on connection
+refused and trip the `http_req_failed` threshold — that's expected; a passing
+run implies the full envoy -> extproc -> upstream chain actually responded.
+
 ## Configuration
 
 k6 scripts read their inputs from environment variables:
