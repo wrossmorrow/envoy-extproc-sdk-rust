@@ -1,4 +1,5 @@
 import http from 'k6/http';
+import { Trend } from 'k6/metrics';
 
 // Delayed/upstream-latency load test: send requests through the full
 // containerized chain with an artificial upstream delay (via the echo
@@ -19,6 +20,19 @@ const RPS = parseInt(__ENV.RPS || '10', 10);
 const DURATION = __ENV.DURATION || '30s';
 const ECHO_DELAY = __ENV.ECHO_DELAY || '2';
 const ECHO_STATUS = __ENV.ECHO_STATUS || '';
+
+const extprocDuration = new Trend('extproc_duration', 'ExtProc processing time in milliseconds');
+
+function getHeaderValue(res, name) {
+  const wanted = name.toLowerCase();
+  for (const k of Object.keys(res.headers)) {
+    if (k.toLowerCase() === wanted) {
+      const v = res.headers[k];
+      if (v !== undefined && v !== null) return v;
+    }
+  }
+  return undefined;
+}
 
 function expectedStatus() {
   if (ECHO_STATUS) {
@@ -58,5 +72,9 @@ export default function () {
   if (ECHO_STATUS) {
     headers['X-Echo-Status'] = ECHO_STATUS;
   }
-  http.post(`${baseUrl}/`, JSON.stringify({}), { headers });
+  const res = http.post(`${baseUrl}/`, JSON.stringify({}), { headers });
+  const durNs = getHeaderValue(res, 'x-extproc-duration-ns');
+  if (durNs) {
+    extprocDuration.add(parseInt(durNs, 10) / 1e6);
+  }
 }

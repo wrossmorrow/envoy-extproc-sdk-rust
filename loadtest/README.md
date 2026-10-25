@@ -91,9 +91,9 @@ header when the processor options enable the duration header
 
 The load-test stack (the `extproc-tester` server) is started with
 `--update-duration-header` (wired via `tests/compose.yaml`), so responses now
-carry the header. The k6 load scripts (`steady.js`, `burst.js`) read the header
-from the response and accumulate it into a custom `extproc_duration` Trend
-metric (milliseconds).
+carry the header. The k6 load scripts (`smoke.js`, `steady.js`, `burst.js`, `delayed.js`) read the
+header from the response and accumulate it into a custom `extproc_duration`
+Trend metric (milliseconds).
 
 Together with the end-to-end `http_req_duration` metric, this lets the load
 tests separate extproc processing time from total request latency.
