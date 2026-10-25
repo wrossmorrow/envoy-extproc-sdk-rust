@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use extproc::{
+use envoy_extproc_sdk::{
     GenericExtProcServer, Metrics, ProcessingOptions, ServerOptions, TesterRequestProcessor,
 };
 
