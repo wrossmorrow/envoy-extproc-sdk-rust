@@ -2,7 +2,7 @@
 name = "envoy_extproc_sdk"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.99.1"
+rust-version = "1.90.0"
 description = "Envoy External Processor SDK for Rust (gRPC, tokio/tonic)"
 license = "Apache-2.0"
 repository = "https://github.com/wrossmorrow/envoy-extproc-sdk-rust"
