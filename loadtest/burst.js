@@ -15,6 +15,17 @@ const TARGET_VUS = parseInt(__ENV.VUS || '100', 10);
 
 const extprocDuration = new Trend('extproc_duration', 'ExtProc processing time in milliseconds');
 
+function getHeaderValue(res, name) {
+  const wanted = name.toLowerCase();
+  for (const k of Object.keys(res.headers)) {
+    if (k.toLowerCase() === wanted) {
+      const v = res.headers[k];
+      if (v !== undefined && v !== null) return v;
+    }
+  }
+  return undefined;
+}
+
 export const options = {
   scenarios: {
     burst: {
@@ -39,8 +50,8 @@ export default function () {
       'Content-Type': 'application/json',
     },
   });
-  const durNs = res.headers['x-extproc-duration-ns'];
+  const durNs = getHeaderValue(res, 'x-extproc-duration-ns');
   if (durNs) {
-    extprocDuration.record(parseInt(durNs, 10) / 1e6);
+    extprocDuration.add(parseInt(durNs, 10) / 1e6);
   }
 }
