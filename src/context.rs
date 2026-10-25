@@ -908,6 +908,70 @@ mod tests {
         ));
     }
 
+    fn response_common(resp: &ProcessingResponse) -> Option<&CommonResponse> {
+        match &resp.response {
+            Some(ProcessingResponseResponse::RequestHeaders(h)) => h.response.as_ref(),
+            Some(ProcessingResponseResponse::ResponseHeaders(h)) => h.response.as_ref(),
+            Some(ProcessingResponseResponse::RequestBody(h)) => h.response.as_ref(),
+            Some(ProcessingResponseResponse::ResponseBody(h)) => h.response.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_get_response_propagates_clear_route_cache() {
+        // An external processor that clears the route cache (i.e. is changing the
+        // upstream, typically by rewriting a routed header such as `:authority`)
+        // must surface that decision in the envoy-facing response, or envoy will
+        // keep serving from its cached route.
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        rc.clear_route_cache();
+        let resp = rc
+            .get_response(RequestPhase::RequestHeaders)
+            .unwrap()
+            .unwrap();
+        let common = response_common(&resp)
+            .expect("expected a CommonResponse in the request headers response");
+        assert!(common.clear_route_cache);
+
+        rc.un_clear_route_cache();
+        let resp = rc
+            .get_response(RequestPhase::RequestHeaders)
+            .unwrap()
+            .unwrap();
+        let common = response_common(&resp)
+            .expect("expected a CommonResponse in the request headers response");
+        assert!(!common.clear_route_cache);
+    }
+
+    #[test]
+    fn test_get_response_propagates_clear_route_cache_request_body() {
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        rc.clear_route_cache();
+        let resp = rc.get_response(RequestPhase::RequestBody).unwrap().unwrap();
+        let common =
+            response_common(&resp).expect("expected a CommonResponse in the request body response");
+        assert!(common.clear_route_cache);
+    }
+
+    #[test]
+    fn test_get_response_clear_route_cache_defaults_to_false() {
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        let resp = rc
+            .get_response(RequestPhase::RequestHeaders)
+            .unwrap()
+            .unwrap();
+        let common = response_common(&resp)
+            .expect("expected a CommonResponse in the request headers response");
+        assert!(!common.clear_route_cache);
+    }
+
     #[test]
     fn test_update_headers() {
         let mut rc = RequestContext::new();

@@ -665,6 +665,7 @@ mod tests {
     use crate::options::{ProcessingOptions, ServerOptions};
     use envoy_types::pb::envoy::service::ext_proc::v3::processing_request::Request as ProcessingRequestOneof;
     use envoy_types::pb::envoy::service::ext_proc::v3::processing_response::Response as ResponseOneof;
+    use envoy_types::pb::envoy::service::ext_proc::v3::CommonResponse;
     use envoy_types::pb::envoy::service::ext_proc::v3::HttpBody;
     use envoy_types::pb::envoy::service::ext_proc::v3::HttpHeaders;
     use envoy_types::pb::envoy::service::ext_proc::v3::HttpTrailers;
@@ -894,6 +895,152 @@ mod tests {
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    fn response_common(resp: &ProcessingResponse) -> Option<&CommonResponse> {
+        match &resp.response {
+            Some(ResponseOneof::RequestHeaders(h)) => h.response.as_ref(),
+            Some(ResponseOneof::ResponseHeaders(h)) => h.response.as_ref(),
+            Some(ResponseOneof::RequestBody(h)) => h.response.as_ref(),
+            Some(ResponseOneof::ResponseBody(h)) => h.response.as_ref(),
+            _ => None,
+        }
+    }
+
+    // clearRouteProcessor is a minimal external processor that clears the route
+    // cache, as an upstream-changing processor does when it rewrites a routed
+    // header such as `:authority`.
+    struct ClearRouteCacheProcessor {
+        name: String,
+        opts: Option<ProcessingOptions>,
+        clear: bool,
+    }
+
+    impl ClearRouteCacheProcessor {
+        fn new(name: &str, clear: bool) -> Self {
+            Self {
+                name: name.to_string(),
+                opts: Some(ProcessingOptions::new()),
+                clear,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RequestProcessor for ClearRouteCacheProcessor {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn options(&self) -> &ProcessingOptions {
+            self.opts.as_ref().unwrap()
+        }
+        async fn process_request_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            if self.clear {
+                ctx.clear_route_cache();
+            }
+            ctx.continue_request()
+        }
+        async fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn error_handler(
+            &self,
+            _ctx: &mut RequestContext,
+            _phase: RequestPhase,
+            _err: Error,
+        ) {
+        }
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_clear_route_cache_clears_envoy_response() {
+        // An external processor that clears the route cache (i.e. is changing the
+        // upstream, typically by rewriting a routed header such as `:authority`)
+        // must surface that decision in the envoy-facing response, or envoy will
+        // keep serving from its cached route.
+        let proc = Arc::new(ClearRouteCacheProcessor::new("router", true));
+        let server = GenericExtProcServer::new(
+            "router".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_some());
+        let common = response_common(resp.as_ref().unwrap())
+            .expect("expected a CommonResponse in the request headers response");
+        assert!(common.clear_route_cache);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_clear_route_cache_defaults_to_false() {
+        // Without a processor clearing the route cache, the envoy-facing response
+        // must not clear it (the default).
+        let proc = Arc::new(ClearRouteCacheProcessor::new("router", false));
+        let server = GenericExtProcServer::new(
+            "router".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_some());
+        let common = response_common(resp.as_ref().unwrap())
+            .expect("expected a CommonResponse in the request headers response");
+        assert!(!common.clear_route_cache);
     }
 
     #[tokio::test]

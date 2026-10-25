@@ -227,6 +227,21 @@ impl RequestProcessor for TesterRequestProcessor {
         headers: &AllHeaders,
     ) -> Result<(), Error> {
         report_header_parsing(ctx, headers);
+
+        // optional upstream override, exercising clear-route-cache driven upstream
+        // changes: rewrite the authority and clear the route cache so envoy
+        // recomputes the route
+        if let Some(upstream) = headers.get("x-route-to-upstream") {
+            ctx.overwrite_header(
+                ":authority",
+                &HeaderValue {
+                    value: upstream.clone(),
+                    raw_value: Some(upstream.as_bytes().to_vec()),
+                },
+            )?;
+            ctx.clear_route_cache();
+        }
+
         ctx.continue_request()
     }
 
@@ -356,5 +371,67 @@ fn report_header_parsing(ctx: &mut RequestContext, headers: &AllHeaders) {
             &str(headers.split_list("x-probe-list").join("|")),
             HeaderAppendAction::AddIfAbsent,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::RequestContext;
+    use crate::headers::AllHeaders;
+
+    fn all_headers(pairs: &[(&str, &str)]) -> AllHeaders {
+        let mut headers = AllHeaders::default();
+        for (k, v) in pairs {
+            headers
+                .headers
+                .insert(k.to_lowercase(), vec![v.to_string()]);
+            headers
+                .raw_headers
+                .insert(k.to_lowercase(), vec![v.as_bytes().to_vec()]);
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn test_process_request_headers_clears_route_cache_for_upstream_override() {
+        // An upstream override (`x-route-to-upstream`) rewrites the `:authority`
+        // and clears the route cache, so envoy recomputes the route. The clear
+        // decision must surface in the envoy-facing response.
+        let proc = TesterRequestProcessor::new(ProcessingOptions::new());
+        let mut ctx = RequestContext::new();
+        ctx.reset_phase().unwrap();
+        let headers = all_headers(&[("x-route-to-upstream", "upstream-copy")]);
+        proc.process_request_headers(&mut ctx, &headers)
+            .await
+            .unwrap();
+        assert!(ctx.response.clear_route_cache);
+        let mutation = ctx.response.header_mutation.as_ref().unwrap();
+        let authority = mutation
+            .set_headers
+            .iter()
+            .find(|o| {
+                o.header
+                    .as_ref()
+                    .map(|h| h.key == ":authority")
+                    .unwrap_or(false)
+            })
+            .expect("expected an :authority overwrite in the header mutation");
+        assert_eq!(
+            authority.header.as_ref().unwrap().raw_value,
+            b"upstream-copy".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_request_headers_does_not_clear_route_cache_without_upstream_override() {
+        let proc = TesterRequestProcessor::new(ProcessingOptions::new());
+        let mut ctx = RequestContext::new();
+        ctx.reset_phase().unwrap();
+        let headers = all_headers(&[]);
+        proc.process_request_headers(&mut ctx, &headers)
+            .await
+            .unwrap();
+        assert!(!ctx.response.clear_route_cache);
     }
 }
