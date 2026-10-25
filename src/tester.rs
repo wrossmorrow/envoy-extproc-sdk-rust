@@ -9,7 +9,6 @@
 //! request body during the request-body phase, and applied across the
 //! response phases.
 
-use std::any::Any;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -20,10 +19,6 @@ use crate::options::ProcessingOptions;
 use crate::Error;
 use crate::RequestProcessor;
 use async_trait::async_trait;
-
-/// The context key under which the parsed [`TesterRequestBody`] actions are
-/// stored between phases of a single request/response exchange.
-const ACTIONS_KEY: &str = "actions";
 
 /// The action schema of the parametrized integration test cases, mirroring the
 /// Go SDK's `test/tester.go` `TesterRequestBody`.
@@ -91,10 +86,7 @@ impl TesterRequestProcessor {
     /// Fetch the actions stored in the request context during the
     /// request-body phase, if any.
     fn tester_actions(ctx: &mut RequestContext) -> Option<TesterRequestBody> {
-        ctx.get_value(ACTIONS_KEY)
-            .ok()?
-            .downcast_ref::<TesterRequestBody>()
-            .cloned()
+        ctx.get_value::<TesterRequestBody>().ok().cloned()
     }
 
     /// Store the actions in the request context for the later phases.
@@ -103,7 +95,7 @@ impl TesterRequestProcessor {
         ctx: &mut RequestContext,
         actions: TesterRequestBody,
     ) -> Result<(), Error> {
-        ctx.set_value(ACTIONS_KEY, Box::new(actions) as Box<dyn Any + Send + Sync>)
+        ctx.set_value(actions)
     }
 
     /// Build the cancel headers exactly like the Go SDK's

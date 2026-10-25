@@ -1,7 +1,6 @@
 use async_trait::async_trait;
-use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use extproc::{
     AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
@@ -17,10 +16,7 @@ pub struct DedupRequestProcessor {
 }
 
 fn lock_hasher(ctx: &RequestContext) -> Result<MutexGuard<'_, Sha256>, Error> {
-    let value = ctx.get_value("hasher")?;
-    let hasher = value
-        .downcast_ref::<Mutex<Sha256>>()
-        .ok_or_else(|| "invalid hasher".to_string())?;
+    let hasher = ctx.get_value::<Arc<Mutex<Sha256>>>()?;
     Ok(hasher
         .lock()
         .map_err(|_| "hasher lock failed".to_string())?)
@@ -31,10 +27,7 @@ fn compute_digest(hasher: &mut Sha256) -> String {
 }
 
 fn set_digest(ctx: &mut RequestContext, digest: &str) -> Result<(), Error> {
-    ctx.set_value(
-        "digest",
-        Box::new(digest.to_string()) as Box<dyn Any + Send + Sync>,
-    )?;
+    ctx.set_value(digest.to_string())?;
     ctx.add_header(
         "x-extproc-request-digest",
         &HeaderValue {
@@ -47,11 +40,7 @@ fn set_digest(ctx: &mut RequestContext, digest: &str) -> Result<(), Error> {
 
 fn report_digest(ctx: &mut RequestContext) -> Result<(), Error> {
     if ctx.end_of_stream {
-        if let Some(digest) = ctx
-            .get_value("digest")
-            .ok()
-            .and_then(|v| v.downcast_ref::<String>().cloned())
-        {
+        if let Ok(digest) = ctx.get_value::<String>() {
             ctx.add_header(
                 "x-extproc-request-digest",
                 &HeaderValue {
@@ -95,10 +84,7 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        ctx.set_value(
-            "hasher",
-            Box::new(Mutex::new(Sha256::new())) as Box<dyn Any + Send + Sync>,
-        )?;
+        ctx.set_value(Arc::new(Mutex::new(Sha256::new())))?;
         let digest = {
             let mut hasher = lock_hasher(ctx)?;
             hasher.update(format!("{}:{}", ctx.method, ctx.path).as_bytes());
@@ -159,11 +145,7 @@ impl RequestProcessor for DedupRequestProcessor {
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
         report_digest(ctx)?;
-        let digest = ctx
-            .get_value("digest")
-            .ok()
-            .and_then(|v| v.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
+        let digest = ctx.get_value::<String>().ok().cloned().unwrap_or_default();
         uncache_request(&digest);
         ctx.continue_request()
     }
@@ -174,11 +156,7 @@ impl RequestProcessor for DedupRequestProcessor {
         _body: &[u8],
     ) -> Result<(), Error> {
         report_digest(ctx)?;
-        let digest = ctx
-            .get_value("digest")
-            .ok()
-            .and_then(|v| v.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
+        let digest = ctx.get_value::<String>().ok().cloned().unwrap_or_default();
         uncache_request(&digest);
         ctx.continue_request()
     }

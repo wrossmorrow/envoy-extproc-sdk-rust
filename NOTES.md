@@ -197,8 +197,7 @@ Summary of the agreed port plan:
 - Errors are `Box<dyn Error + Send + Sync>` (`extproc::Error`).
 - Phase helpers: `continue_request`, `cancel_request(status, &HashMap<String, HeaderValue>, body: &[u8])`,
   `add/append/overwrite/remove_header`, `replace_body/clear_body/replace_body_chunk/clear_body_chunk`,
-  `clear_route_cache`, `set_value/get_value` (values are `Box<dyn Any + Send + Sync>`, downcast via
-  `DynAny = dyn Any + Send + Sync`), `end_of_stream`, `started: Instant`, `duration: Duration`, phase
+  `clear_route_cache`, `set_value/get_value` (typed values via the type-keyed `http::Extensions` map), `end_of_stream`, `started: Instant`, `duration: Duration`, phase
   enum, `get_response`.
 - Immediate responses are valid for request-headers/request-body/response-headers/response-body
   phases; trailers phases ignore them.

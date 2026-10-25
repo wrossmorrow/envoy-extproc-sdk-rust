@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::any::Any;
 use std::collections::HashMap;
 
 use extproc::{
@@ -109,10 +108,7 @@ impl RequestProcessor for MaskerRequestProcessor {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        ctx.set_value(
-            "responseHeaders",
-            Box::new(ctx.all_headers.clone()) as Box<dyn Any + Send + Sync>,
-        )?;
+        ctx.set_value(ctx.all_headers.clone())?;
         ctx.continue_request()
     }
 
@@ -122,12 +118,8 @@ impl RequestProcessor for MaskerRequestProcessor {
         body: &[u8],
     ) -> Result<(), Error> {
         if !self.masked["response"].is_empty() {
-            if let Some(headers) = ctx
-                .get_value("responseHeaders")
-                .ok()
-                .and_then(|v| v.downcast_ref::<AllHeaders>().cloned())
-            {
-                if is_maybe_json(&headers) {
+            if let Ok(headers) = ctx.get_value::<AllHeaders>() {
+                if is_maybe_json(headers) {
                     if let Ok(masked) = self.mask_body(&self.masked["response"], body) {
                         ctx.replace_body(&masked)?;
                     }

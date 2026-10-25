@@ -3,8 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// A `'static` trait object shared across phases of a request.
-pub type DynAny = dyn std::any::Any + Send + Sync;
+use http::Extensions;
 
 pub use envoy_types::pb::envoy::config::core::v3::header_value_option::HeaderAppendAction;
 use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
@@ -215,8 +214,10 @@ pub struct RequestContext {
     /// Whether the current phase message was the last of its kind.
     pub end_of_stream: bool,
 
-    /// Arbitrary custom values shared across phases of a request.
-    pub data: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
+    /// Arbitrary custom values shared across phases of a request, stored in a
+    /// type-keyed map ([`http::Extensions`]) so values are strongly typed
+    /// rather than string-keyed trait objects.
+    pub data: Extensions,
 
     /// Current processing phase.
     pub phase: RequestPhase,
@@ -238,7 +239,7 @@ impl RequestContext {
             started: Instant::now(),
             duration: Duration::ZERO,
             end_of_stream: false,
-            data: HashMap::new(),
+            data: Extensions::new(),
             phase: RequestPhase::Undetermined,
             response: PhaseResponse::default(),
         }
@@ -268,23 +269,17 @@ impl RequestContext {
         request_phase_to_string(self.phase)
     }
 
-    /// Store a custom value for later phases of this request.
-    pub fn set_value(
-        &mut self,
-        name: &str,
-        val: Box<dyn std::any::Any + Send + Sync>,
-    ) -> Result<(), Error> {
-        self.data.insert(name.to_string(), val);
+    /// Store a typed custom value for later phases of this request.
+    pub fn set_value<T: Clone + Send + Sync + 'static>(&mut self, val: T) -> Result<(), Error> {
+        self.data.insert(val);
         Ok(())
     }
 
-    /// Retrieve a custom value stored for this request, if present.
-    pub fn get_value(&self, name: &str) -> Result<&DynAny, Error> {
-        let value = match self.data.get(name) {
-            Some(v) => &**v,
-            None => return Err(format!("{} does not exist", name).into()),
-        };
-        Ok(value)
+    /// Retrieve a typed custom value stored for this request, if present.
+    pub fn get_value<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
+        self.data
+            .get::<T>()
+            .ok_or_else(|| format!("{} does not exist", std::any::type_name::<T>()).into())
     }
 
     /// Whether to clear the route cache after the current phase.
@@ -840,14 +835,10 @@ mod tests {
         rc.set_phase(default_phase_if_invalid(42));
         assert_eq!(rc.get_phase(), RequestPhase::Undetermined);
 
-        rc.set_value(
-            "foo",
-            Box::new(42u32) as Box<dyn std::any::Any + Send + Sync>,
-        )
-        .unwrap();
-        let v = rc.get_value("foo").unwrap();
-        assert_eq!(*v.downcast_ref::<u32>().unwrap(), 42);
-        assert!(rc.get_value("nope").is_err());
+        rc.set_value(42u32).unwrap();
+        let v = rc.get_value::<u32>().unwrap();
+        assert_eq!(*v, 42);
+        assert!(rc.get_value::<u64>().is_err());
     }
 
     #[test]

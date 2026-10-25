@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::any::Any;
 
 use extproc::{
     AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
@@ -25,10 +24,7 @@ impl RequestProcessor for DataRequestProcessor {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        ctx.set_value(
-            "customId",
-            Box::new(uuid::Uuid::new_v4()) as Box<dyn Any + Send + Sync>,
-        )?;
+        ctx.set_value(uuid::Uuid::new_v4())?;
         ctx.continue_request()
     }
 
@@ -53,16 +49,12 @@ impl RequestProcessor for DataRequestProcessor {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        if let Some(id) = ctx
-            .get_value("customId")
-            .ok()
-            .and_then(|v| v.downcast_ref::<uuid::Uuid>().map(|u| u.to_string()))
-        {
+        if let Ok(id) = ctx.get_value::<uuid::Uuid>() {
             ctx.add_header(
                 "x-extproc-custom-data",
                 &HeaderValue {
                     value: String::new(),
-                    raw_value: Some(id.as_bytes().to_vec()),
+                    raw_value: Some(id.to_string().as_bytes().to_vec()),
                 },
             )?;
         }
