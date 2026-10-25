@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::any::Any;
 use std::sync::{Mutex, MutexGuard};
 
@@ -59,6 +60,7 @@ fn report_digest(ctx: &mut RequestContext) -> Result<(), Error> {
     Ok(())
 }
 
+#[async_trait]
 impl RequestProcessor for DigestRequestProcessor {
     fn name(&self) -> String {
         "digest".to_string()
@@ -68,7 +70,7 @@ impl RequestProcessor for DigestRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -92,7 +94,7 @@ impl RequestProcessor for DigestRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -100,7 +102,11 @@ impl RequestProcessor for DigestRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error> {
         let digest = {
             let mut hasher = lock_hasher(ctx)?;
             hasher.update(b":");
@@ -117,7 +123,7 @@ impl RequestProcessor for DigestRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -126,12 +132,16 @@ impl RequestProcessor for DigestRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         report_digest(ctx)?;
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -139,7 +149,7 @@ impl RequestProcessor for DigestRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+    async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
         tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 

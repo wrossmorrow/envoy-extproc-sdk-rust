@@ -19,6 +19,7 @@ use crate::headers::AllHeaders;
 use crate::options::ProcessingOptions;
 use crate::Error;
 use crate::RequestProcessor;
+use async_trait::async_trait;
 
 /// The context key under which the parsed [`TesterRequestBody`] actions are
 /// stored between phases of a single request/response exchange.
@@ -208,6 +209,7 @@ impl TesterRequestProcessor {
     }
 }
 
+#[async_trait]
 impl RequestProcessor for TesterRequestProcessor {
     fn name(&self) -> String {
         "testing".to_string()
@@ -217,7 +219,7 @@ impl RequestProcessor for TesterRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         headers: &AllHeaders,
@@ -226,7 +228,7 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -234,7 +236,11 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error> {
         let actions = Self::load_actions(body);
 
         if let Some(actions) = &actions {
@@ -272,7 +278,7 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -283,7 +289,11 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         if let Some(actions) = TesterRequestProcessor::tester_actions(ctx) {
             if actions.clear_response_body.unwrap_or(false) {
                 ctx.clear_body()?;
@@ -296,7 +306,7 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -304,7 +314,7 @@ impl RequestProcessor for TesterRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
+    async fn error_handler(&self, _ctx: &mut RequestContext, _phase: RequestPhase, _err: Error) {}
 
     fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
         Ok(())

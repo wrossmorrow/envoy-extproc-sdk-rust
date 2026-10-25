@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -79,6 +80,7 @@ fn dedupable(ctx: &RequestContext) -> bool {
     matches!(ctx.method.as_str(), "PUT" | "POST" | "PATCH")
 }
 
+#[async_trait]
 impl RequestProcessor for DedupRequestProcessor {
     fn name(&self) -> String {
         "dedup".to_string()
@@ -88,7 +90,7 @@ impl RequestProcessor for DedupRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -117,7 +119,7 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -125,7 +127,11 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error> {
         let digest = {
             let mut hasher = lock_hasher(ctx)?;
             hasher.update(b":");
@@ -147,7 +153,7 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -162,7 +168,11 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         report_digest(ctx)?;
         let digest = ctx
             .get_value("digest")
@@ -173,7 +183,7 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -181,7 +191,7 @@ impl RequestProcessor for DedupRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+    async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
         tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 

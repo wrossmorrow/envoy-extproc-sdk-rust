@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::any::Any;
 
 use extproc::{
@@ -15,6 +16,7 @@ pub struct RoutingRequestProcessor {
     pub opts: ProcessingOptions,
 }
 
+#[async_trait]
 impl RequestProcessor for RoutingRequestProcessor {
     fn name(&self) -> String {
         "router".to_string()
@@ -24,7 +26,7 @@ impl RequestProcessor for RoutingRequestProcessor {
         &self.opts
     }
 
-    fn process_request_headers(
+    async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -49,7 +51,7 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_trailers(
+    async fn process_request_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -57,7 +59,11 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+    async fn process_request_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> Result<(), Error> {
         if ctx
             .get_value("routed")
             .ok()
@@ -82,7 +88,7 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_headers(
+    async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
@@ -90,11 +96,15 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx.continue_request()
     }
 
-    fn process_response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+    async fn process_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _body: &[u8],
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn process_response_trailers(
+    async fn process_response_trailers(
         &self,
         ctx: &mut RequestContext,
         _trailers: &AllHeaders,
@@ -102,7 +112,7 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx.continue_request()
     }
 
-    fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+    async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
         tracing::error!("Error in phase {:?}: {:?}", phase, err);
     }
 
