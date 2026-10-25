@@ -1,0 +1,66 @@
+name: Pull Request Checks
+on:
+  push:
+    branches:
+      - main
+  pull_request: {}
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Check build(s)
+        run: |
+          cargo check --all-targets
+      # tests/Dockerfile is covered by the integration job, but o/w examples/Dockerfile not covered
+      - name: Check example image build
+        run: docker build -f examples/Dockerfile -t extproc-examples:ci .
+  vet-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Vet the Rust code
+        run: cargo clippy --all-targets -- -D warnings
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Unit tests
+        run: cargo test --lib
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Start compose setup
+        run: docker compose -f tests/compose.yaml up --build -d --wait --wait-timeout 90
+      - name: Run tests
+        run: cargo test --tests -- --test-threads=1
+      - name: Dump compose state on failure
+        if: failure()
+        run: |
+          docker compose -f tests/compose.yaml ps
+          docker inspect --format '{{.Name }} {{if .State.Health}}{{.State.Health.Status}}{{range .State.Health.Log}} exit={{.ExitCode}} out={{println .Output}}{{end}}{{else}}(no healthcheck){{end}}' "$(docker compose -f tests/compose.yaml ps -aq)"
+          docker compose -f tests/compose.yaml logs --no-color --timestamps
+      - name: Stop compose setup
+        if: always()
+        run: docker compose -f tests/compose.yaml down --volumes
