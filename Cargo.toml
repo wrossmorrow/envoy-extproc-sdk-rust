@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["envoy", "grpc", "proxy", "ext_proc", "external-processor"]
 categories = ["network-programming", "web-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "envoy_extproc_sdk"
 path = "src/lib.rs"
