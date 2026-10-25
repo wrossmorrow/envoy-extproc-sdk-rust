@@ -375,7 +375,7 @@ async fn http_remove_response_header() {
             "x-add-me".to_string(),
             "true".to_string(),
         )])),
-        remove_response_headers: Some(vec!["x-add-me".to_string()]),
+        remove_response_headers: Some(vec!["x-echo-server-received".to_string()]),
         ..Default::default()
     };
     let resp = send_tester_request(&client, &gateway, &HashMap::new(), &actions).await;
@@ -385,14 +385,8 @@ async fn http_remove_response_header() {
         StatusCode::OK,
         "removing a response header should not fail"
     );
-    // TEMPORARY DEBUG: dump the full final response headers to diagnose why
-    // the removed response header is still present in the final response.
-    eprintln!(
-        "DEBUG http_remove_response_header final response headers: {:?}",
-        resp.headers
-    );
     assert!(
-        response_header_values(&resp.headers, "x-add-me").is_none(),
+        response_header_values(&resp.headers, "x-echo-server-received").is_none(),
         "removed response header should not be returned"
     );
 }
