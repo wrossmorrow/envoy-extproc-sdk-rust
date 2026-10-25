@@ -74,3 +74,10 @@ loadtest-burst:
 # Run the k6 delayed/upstream-latency load test (ECHO_DELAY/ECHO_STATUS).
 loadtest-delayed:
     just loadtest delayed.js
+
+# Run all k6 load tests in loadtest/ (smoke, steady, burst, delayed).
+loadtest-all:
+    just loadtest smoke.js
+    just loadtest steady.js
+    just loadtest burst.js
+    just loadtest delayed.js
