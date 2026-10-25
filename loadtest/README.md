@@ -44,6 +44,48 @@ Stop the stack:
 just -f tests/justfile down
 ```
 
+## Plain gRPC load testing
+
+The k6 scenarios above drive the **full** chain (k6 -> envoy -> extproc -> echo
+upstream). To isolate the processor from envoy (and the upstream), there is a
+second, separate load testing layer: the **plain gRPC load test**.
+
+The plain gRPC load test is implemented by the [`extproc-loadgen`](../../src/bin/extproc-loadgen.rs)
+binary (`src/bin/extproc-loadgen.rs`): a Rust load generator that opens full
+bidirectional ext_proc exchanges (`envoy.service.ext_proc.v3.ExternalProcessor/Process`)
+against a running extproc server, sends the phase sequence envoy would
+(request headers -> request body -> response headers -> response body), then
+closes the stream. Because envoy is not in the path, the reported latency is the
+processor-side cost of the SDK's gRPC server path, and the run is a layer above
+the end-to-end integrated tests in [`tests/`](../tests) rather than an extension
+of them.
+
+It runs the same `TesterRequestProcessor` as the containerized stack, so no
+dedicated load-test processor is needed and the full phase flow the tester
+implements is exercised.
+
+Run the server (extproc gRPC on `:50051`, metrics on `:9090`) and then the load
+gen:
+
+```sh
+cargo run --bin extproc-tester -- --extproc-port 50051 --metrics-http-port 9090 --update-duration-header
+just loadtest-grpc-smoke
+just loadtest-grpc-burst
+just loadtest-grpc 100 10   # 100 exchanges, concurrency 10
+```
+
+The loadgen reports, per run:
+
+- `finished: N exchanges, E errors` — completion and failure counts.
+- `latency avg=...ms p50=...ms p95=...ms max=...ms` — exchange latency (first phase
+  send to final response), in milliseconds.
+- `extproc duration avg=...ms (N samples)` — the server-reported extproc
+  processing time from the `x-extproc-duration-ns` response header (requires the
+  server to run with `--update-duration-header`).
+
+Exit status is non-zero if any exchange errored, so the just recipes surface
+failures.
+
 ## Scenarios
 
 | script | scenario | purpose |
@@ -134,4 +176,6 @@ The same scripts run against any reachable envoy deployment:
 - k6 Cloud: run the same scripts in k6 Cloud against the staging deployment.
 
 Follow-up work: gRPC-level load tests to isolate the processor from envoy
-overhead (see the original load-testing plan).
+overhead (see the original load-testing plan) — done via
+[Plain gRPC load testing](#plain-grpc-load-testing), which drives the raw gRPC
+server directly via the `extproc-loadgen` binary.

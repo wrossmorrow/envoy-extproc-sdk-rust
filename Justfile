@@ -81,3 +81,19 @@ loadtest-all:
     just loadtest steady.js
     just loadtest burst.js
     just loadtest delayed.js
+
+# Run the plain gRPC load test against a running extproc server (no envoy in
+# the path, no upstream). Drives full ext_proc exchanges over the raw gRPC
+# server. Usage: just loadtest-grpc [iterations] [concurrency]
+loadtest-grpc iterations concurrency:
+    cargo run --bin extproc-loadgen -- --iterations {{iterations}} --concurrency {{concurrency}}
+
+# Run a single-exchange plain gRPC load test (smoke) against a running extproc
+# server. Usage: just loadtest-grpc-smoke
+loadtest-grpc-smoke:
+    just loadtest-grpc 1 1
+
+# Run a plain gRPC burst load test: N concurrent exchanges against a running
+# extproc server. Usage: just loadtest-grpc-burst [concurrency]
+loadtest-grpc-burst concurrency:
+    cargo run --bin extproc-loadgen -- --iterations {{concurrency}} --concurrency {{concurrency}}
