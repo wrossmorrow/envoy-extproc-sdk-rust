@@ -7,19 +7,24 @@ on:
 jobs:
   build-check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["${{ vars.RUST_MSRV }}", "${{ vars.RUST_STABLE }}"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: ${{ matrix.toolchain }}
       - name: Check build(s)
         run: |
           cargo check --all-targets
       # tests/Dockerfile is covered by the integration job, but o/w examples/Dockerfile not covered
       - name: Check example image build
-        run: docker build -f examples/Dockerfile -t extproc-examples:ci .
+        run: |
+          docker build --build-arg RUST_VERSION=${{ matrix.toolchain }} \
+            -f examples/Dockerfile -t extproc-examples:ci .
   vet-check:
     runs-on: ubuntu-latest
     steps:
@@ -28,19 +33,22 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: "${{ vars.RUST_STABLE }}"
           components: clippy
       - name: Vet the Rust code
         run: cargo clippy --all-targets -- -D warnings
   unit-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["${{ vars.RUST_MSRV }}", "${{ vars.RUST_STABLE }}"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: ${{ matrix.toolchain }}
       - name: Unit tests
         run: cargo test --lib
   integration-test:
@@ -51,8 +59,10 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: "${{ vars.RUST_STABLE }}"
       - name: Start compose setup
+        env:
+          RUST_VERSION: "${{ vars.RUST_STABLE }}"
         run: docker compose -f tests/compose.yaml up --build -d --wait --wait-timeout 90
       - name: Run tests
         run: cargo test --tests -- --test-threads=1

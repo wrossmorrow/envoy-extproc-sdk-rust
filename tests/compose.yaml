@@ -39,6 +39,8 @@ services:
     build:
       context: ..
       dockerfile: tests/Dockerfile
+      args:
+        RUST_VERSION: ${RUST_VERSION}
     command: ["--update-duration-header"]
     ports:
       - '50051:50051'
