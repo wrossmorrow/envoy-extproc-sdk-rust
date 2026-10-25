@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        toolchain: ["1.90", "1.99.1"]
+        toolchain: ["${{ vars.RUST_MSRV }}", "${{ vars.RUST_STABLE }}"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: "${{ vars.RUST_STABLE }}"
           components: clippy
       - name: Vet the Rust code
         run: cargo clippy --all-targets -- -D warnings
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        toolchain: ["1.90", "1.99.1"]
+        toolchain: ["${{ vars.RUST_MSRV }}", "${{ vars.RUST_STABLE }}"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,19 +53,16 @@ jobs:
         run: cargo test --lib
   integration-test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        toolchain: ["1.90", "1.99.1"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: "${{ vars.RUST_STABLE }}"
       - name: Start compose setup
         env:
-          RUST_VERSION: ${{ matrix.toolchain }}
+          RUST_VERSION: "${{ vars.RUST_STABLE }}"
         run: docker compose -f tests/compose.yaml up --build -d --wait --wait-timeout 90
       - name: Run tests
         run: cargo test --tests -- --test-threads=1
