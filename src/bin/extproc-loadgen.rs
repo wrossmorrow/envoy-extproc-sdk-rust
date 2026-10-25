@@ -385,6 +385,108 @@ async fn main() {
 mod tests {
     use super::*;
 
+    use envoy_types::pb::envoy::config::core::v3::HeaderValueOption;
+    use envoy_types::pb::envoy::service::ext_proc::v3::processing_response::Response as ResponseOneof;
+    use envoy_types::pb::envoy::service::ext_proc::v3::{
+        BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ProcessingResponse,
+    };
+
+    #[allow(deprecated)]
+    fn duration_header_option(ns: i64) -> HeaderValueOption {
+        HeaderValueOption {
+            header: Some(EnvoyHeaderValue {
+                key: DURATION_HEADER.to_string(),
+                value: String::new(),
+                raw_value: ns.to_string().into_bytes(),
+            }),
+            append: None,
+            append_action: 0,
+            keep_empty_value: false,
+        }
+    }
+
+    fn common_response_with_duration(ns: i64) -> CommonResponse {
+        CommonResponse {
+            status: 0,
+            header_mutation: Some(HeaderMutation {
+                set_headers: vec![duration_header_option(ns)],
+                remove_headers: Vec::new(),
+            }),
+            body_mutation: None,
+            trailers: None,
+            clear_route_cache: false,
+        }
+    }
+
+    fn processing_response_with(kind: &str, ns: i64) -> ProcessingResponse {
+        let response = match kind {
+            "response_headers" => ResponseOneof::ResponseHeaders(HeadersResponse {
+                response: Some(common_response_with_duration(ns)),
+            }),
+            _ => ResponseOneof::ResponseBody(BodyResponse {
+                response: Some(common_response_with_duration(ns)),
+            }),
+        };
+        ProcessingResponse {
+            response: Some(response),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_extract_duration_ns_from_response_headers() {
+        let resp = processing_response_with("response_headers", 12_345_678);
+        assert_eq!(extract_duration_ns(&resp), Some(12_345_678));
+    }
+
+    #[test]
+    fn test_extract_duration_ns_from_response_body() {
+        let resp = processing_response_with("response_body", 1_000_000_000);
+        assert_eq!(extract_duration_ns(&resp), Some(1_000_000_000));
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_extract_duration_ns_absent_without_duration_header() {
+        // A mutation that carries a different header, but no duration header.
+        let resp = ProcessingResponse {
+            response: Some(ResponseOneof::ResponseHeaders(HeadersResponse {
+                response: Some(CommonResponse {
+                    status: 0,
+                    header_mutation: Some(HeaderMutation {
+                        set_headers: vec![HeaderValueOption {
+                            header: Some(EnvoyHeaderValue {
+                                key: "x-extproc-names".to_string(),
+                                value: String::new(),
+                                raw_value: b"tester".to_vec(),
+                            }),
+                            append: None,
+                            append_action: 0,
+                            keep_empty_value: false,
+                        }],
+                        remove_headers: Vec::new(),
+                    }),
+                    body_mutation: None,
+                    trailers: None,
+                    clear_route_cache: false,
+                }),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(extract_duration_ns(&resp), None);
+    }
+
+    #[test]
+    fn test_extract_duration_ns_absent_without_mutation() {
+        let resp = ProcessingResponse {
+            response: Some(ResponseOneof::ResponseHeaders(HeadersResponse {
+                response: None,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(extract_duration_ns(&resp), None);
+    }
+
     #[test]
     fn test_percentile_empty() {
         assert_eq!(percentile(&[], 0.95), None);
