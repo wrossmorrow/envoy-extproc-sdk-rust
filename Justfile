@@ -52,3 +52,24 @@ run-example example="noop" *flags="":
 # Build the example server binary.
 build-example:
     cargo build --bin extproc-example
+
+# Run a k6 load test script from loadtest/ against the containerized stack
+# (envoy -> extproc -> echo upstream). Usage: just loadtest <script> [k6 args...]
+loadtest *args="smoke.js":
+    docker run --rm --network host -v "$(pwd)/loadtest:/scripts" ghcr.io/grafana/k6/k6 run /scripts/{{args}}
+
+# Run the k6 smoke load test against the full containerized envoy chain.
+loadtest-smoke:
+    just loadtest smoke.js
+
+# Run the k6 steady-state load test (RPS via $RPS, duration via $DURATION).
+loadtest-steady:
+    just loadtest steady.js
+
+# Run the k6 burst load test (VUs via $VUS).
+loadtest-burst:
+    just loadtest burst.js
+
+# Run the k6 delayed/upstream-latency load test (ECHO_DELAY/ECHO_STATUS).
+loadtest-delayed:
+    just loadtest delayed.js
