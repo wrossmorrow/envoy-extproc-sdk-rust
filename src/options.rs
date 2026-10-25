@@ -20,7 +20,10 @@ pub struct ServerOptions {
     /// Seconds to wait for unready propagation after shutdown begins.
     #[serde(rename = "unready_propagation_delay_seconds", default)]
     pub unready_propagation_delay_seconds: u32,
-    /// Seconds to wait for graceful shutdown before forcing stop.
+    /// Seconds to wait for graceful shutdown before forcing stop. Reserved
+    /// for now: the server performs graceful shutdown (via the tonic
+    /// `serve_with_shutdown` machinery) and relies on process termination for
+    /// an external force stop.
     #[serde(rename = "termination_grace_period_seconds", default)]
     pub termination_grace_period_seconds: i32,
 }
