@@ -22,7 +22,9 @@ jobs:
           cargo check --all-targets
       # tests/Dockerfile is covered by the integration job, but o/w examples/Dockerfile not covered
       - name: Check example image build
-        run: docker build -f examples/Dockerfile -t extproc-examples:ci .
+        run: |
+          docker build --build-arg RUST_VERSION=${{ matrix.toolchain }} \
+            -f examples/Dockerfile -t extproc-examples:ci .
   vet-check:
     runs-on: ubuntu-latest
     steps:
