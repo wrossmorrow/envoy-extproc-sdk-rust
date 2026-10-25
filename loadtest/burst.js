@@ -1,4 +1,5 @@
 import http from 'k6/http';
+import { Trend } from 'k6/metrics';
 
 // Burst load test: ramp VUs up through the full containerized chain
 // (k6 -> envoy -> extproc (gRPC) -> echo upstream).
@@ -11,6 +12,8 @@ import http from 'k6/http';
 
 const baseUrl = __ENV.TEST_TARGET || 'http://localhost:8080';
 const TARGET_VUS = parseInt(__ENV.VUS || '100', 10);
+
+const extprocDuration = new Trend('extproc_duration', 'ExtProc processing time in milliseconds');
 
 export const options = {
   scenarios: {
@@ -31,9 +34,13 @@ export const options = {
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }));
 
 export default function () {
-  http.post(`${baseUrl}/`, JSON.stringify({}), {
+  const res = http.post(`${baseUrl}/`, JSON.stringify({}), {
     headers: {
       'Content-Type': 'application/json',
     },
   });
+  const durNs = res.headers['x-extproc-duration-ns'];
+  if (durNs) {
+    extprocDuration.record(parseInt(durNs, 10) / 1e6);
+  }
 }

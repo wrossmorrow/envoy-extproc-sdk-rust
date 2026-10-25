@@ -81,6 +81,23 @@ Without the containerized stack running, the scripts will fail on connection
 refused and trip the `http_req_failed` threshold — that's expected; a passing
 run implies the full envoy -> extproc -> upstream chain actually responded.
 
+## ExtProc processing time
+
+The SDK collects extproc processing time internally (the `RequestContext.duration`
+accumulator, exposed as the `extproc_stream_duration_seconds` Prometheus
+histogram via `/metrics`) and emits it as the `x-extproc-duration-ns` response
+header when the processor options enable the duration header
+(`ProcessingOptions.update_duration_header`, serde: `UpdateDurationHeader`).
+
+The load-test stack (the `extproc-tester` server) is started with
+`--update-duration-header` (wired via `tests/compose.yaml`), so responses now
+carry the header. The k6 load scripts (`steady.js`, `burst.js`) read the header
+from the response and accumulate it into a custom `extproc_duration` Trend
+metric (milliseconds).
+
+Together with the end-to-end `http_req_duration` metric, this lets the load
+tests separate extproc processing time from total request latency.
+
 ## Configuration
 
 k6 scripts read their inputs from environment variables:
