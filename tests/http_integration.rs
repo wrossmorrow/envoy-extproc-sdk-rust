@@ -381,6 +381,13 @@ async fn http_remove_response_header() {
         StatusCode::OK,
         "removing a response header should not fail"
     );
+    // TEMPORARY DEBUG: dump the full final response headers to diagnose why
+    // the removed response header (`date`) is still present in the final
+    // response.
+    eprintln!(
+        "DEBUG http_remove_response_header final response headers: {:?}",
+        resp.headers
+    );
     assert!(
         response_header_values(&resp.headers, "date").is_none(),
         "removed response header should not be returned"
