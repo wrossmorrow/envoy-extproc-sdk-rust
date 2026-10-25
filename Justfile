@@ -56,6 +56,7 @@ build-example:
 # Run a k6 load test script from loadtest/ against the containerized stack
 # (envoy -> extproc -> echo upstream). Usage: just loadtest <script> [k6 args...]
 loadtest *args="smoke.js":
+    docker pull ghcr.io/grafana/k6/k6
     docker run --rm --network host -v "$(pwd)/loadtest:/scripts" ghcr.io/grafana/k6/k6 run /scripts/{{args}}
 
 # Run the k6 smoke load test against the full containerized envoy chain.
