@@ -496,3 +496,32 @@ async fn http_header_parsing() {
         "list header should be split on commas"
     );
 }
+
+#[tokio::test]
+async fn http_change_upstream_via_clear_route_cache() {
+    // The clear-route-cache driven upstream change: the tester rewrites the
+    // `:authority` to the value of the `x-route-to-upstream` header and clears
+    // the route cache, so envoy recomputes the route and routes to the
+    // "upstream-copy" upstream.
+    let gateway = wait_for_gateway().await;
+    let client = http_client();
+    let extra_headers = HashMap::from([(
+        "x-route-to-upstream".to_string(),
+        "upstream-copy".to_string(),
+    )]);
+    let actions = TesterRequestBody::default();
+    let resp = send_tester_request(&client, &gateway, &extra_headers, &actions).await;
+
+    assert_eq!(
+        resp.status,
+        StatusCode::OK,
+        "clear-route-cache driven upstream change should not fail"
+    );
+    let echo = parse_echo_response(&resp.body).expect("echo should still respond");
+    assert_eq!(echo.status, Some(200));
+    assert_eq!(
+        echo.hostname.as_deref(),
+        Some("upstream-copy"),
+        "clear-route-cache driven upstream change should route to the copy upstream"
+    );
+}
