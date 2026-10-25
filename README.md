@@ -155,7 +155,7 @@ The `RequestContext` is initialized with request data when request headers are r
 * an accumulator `Duration` _for the time spent in external processing_
 * a flag `EndOfStream` from gRPC messages for header and body phases
 
-This context is carried through every request phase, meaning that data can be shared _across_ phases particularly in the generic slot `data` for arbitrary values. Define and access data with the `RequestContext::set_value` and `RequestContext::get_value` methods. Values are stored generically as `Box<dyn Any + Send + Sync>`, so to use them you must re-type the data upon retrieval. See the [data](#data) or [digest](#digest) examples.
+This context is carried through every request phase, meaning that data can be shared _across_ phases particularly in the generic slot `data` for arbitrary values. Data is stored in a type-keyed map ([`http::Extensions`](https://docs.rs/http/latest/http/struct.Extensions.html)) so values are strongly typed rather than string-keyed trait objects. Define and access data with the `RequestContext::set_value` and `RequestContext::get_value` methods, which take and return typed values. See the [data](#data) or [digest](#digest) examples.
 
 ### Forming Responses
 

@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::any::Any;
 
 use extproc::{
     AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
@@ -31,11 +30,11 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        ctx.set_value("routed", Box::new(false) as Box<dyn Any + Send + Sync>)?;
+        ctx.set_value(false)?;
         // parse and "redirect" if there is a routing header
         // NOTE: mutation_rules.allow_all_routing is critical in the envoy config to modify :authority
         if let Some(upstream) = ctx.all_headers.get("x-route-to-upstream") {
-            ctx.set_value("routed", Box::new(true) as Box<dyn Any + Send + Sync>)?;
+            ctx.set_value(true)?;
             ctx.overwrite_header(
                 ":authority",
                 &HeaderValue {
@@ -64,17 +63,12 @@ impl RequestProcessor for RoutingRequestProcessor {
         ctx: &mut RequestContext,
         body: &[u8],
     ) -> Result<(), Error> {
-        if ctx
-            .get_value("routed")
-            .ok()
-            .and_then(|v| v.downcast_ref::<bool>().cloned())
-            != Some(false)
-        {
+        if ctx.get_value::<bool>().ok() != Some(&false) {
             // parse request body, assuming buffered and JSON in a specific schema declaring the upstream
             // NOTE: mutation_rules.allow_all_routing is critical in the envoy config to modify :authority
             let parsed_body: UpstreamBodySchema = serde_json::from_slice(body)
                 .map_err(|e| format!("could not parse request schema: {}", e))?;
-            ctx.set_value("routed", Box::new(true) as Box<dyn Any + Send + Sync>)?;
+            ctx.set_value(true)?;
             let upstream = parsed_body.upstream;
             ctx.overwrite_header(
                 ":authority",

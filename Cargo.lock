@@ -196,6 +196,7 @@ dependencies = [
  "axum",
  "envoy-types",
  "hex",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
