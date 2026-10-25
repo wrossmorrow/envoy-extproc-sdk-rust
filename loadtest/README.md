@@ -23,7 +23,7 @@ Bring up the full containerized stack (envoy + upstream echo + extproc):
 just -f tests/justfile up
 ```
 
-Run a load test (k6 runs in a container via the `ghcr.io/grafana/k6/k6` image):
+Run a load test (k6 runs in a container via the `grafana/k6` image):
 
 ```sh
 just loadtest-smoke
@@ -35,7 +35,7 @@ just loadtest-delayed
 Or directly, e.g. for a custom k6 invocation:
 
 ```sh
-docker run --rm --network host -v "$(pwd)/loadtest:/scripts" ghcr.io/grafana/k6/k6 run /scripts/smoke.js
+docker run --rm --network host -v "$(pwd)/loadtest:/scripts" grafana/k6 run /scripts/smoke.js
 ```
 
 Stop the stack:
