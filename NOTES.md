@@ -174,7 +174,7 @@ gate (`cargo check --all-targets`, `cargo fmt --check`, `cargo clippy --all-targ
 Port of the Go SDK
 [`examples/`](https://github.com/wrossmorrow/envoy-extproc-sdk-go/tree/main/examples)
 (`noop`, `trivial`, `timer`, `data`, `digest`, `dedup`, `masker`, `echo`, `router`) to the
-Rust SDK, as runnable example binaries built on the public `extproc` lib API.
+Rust SDK, as runnable example binaries built on the public `envoy_extproc_sdk` lib API.
 
 Summary of the port:
 
@@ -183,7 +183,7 @@ Summary of the port:
   `examples/main.go` flags (`-port`, `-update-extproc-header`, `-update-duration-header`).
 - The Rust `RequestProcessor` trait has no `Init`; options live in each processor struct and
   flow via `options`.
-- Errors are `Box<dyn Error + Send + Sync>` (`extproc::Error`).
+- Errors are `Box<dyn Error + Send + Sync>` (`envoy_extproc_sdk::Error`).
 - Phase helpers: `continue_request`, `cancel_request(status, &HashMap<String, HeaderValue>, body: &[u8])`,
   `add/append/overwrite/remove_header`, `replace_body/clear_body/replace_body_chunk/clear_body_chunk`,
   `clear_route_cache`, `set_value/get_value` (typed values via the type-keyed `http::Extensions` map), `end_of_stream`, `started: Instant`, `duration: Duration`, phase

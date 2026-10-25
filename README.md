@@ -8,7 +8,7 @@
 
 We attempt to achieve this ease largely by masking some of the details behind the datastructures `envoy` uses, which are effective but verbose and idiosyncratic. Each request generates a bidirectional gRPC stream (with at most 6 messages) and sends, in turn, data concerning request headers, request body, request trailers, response headers, response body, and response trailers (if `envoy` is configured to send all phases). The idea here is to supply functions for each phase that operate on a context and more generically typed data suitable for each phase. (See details below.)
 
-The SDK is implemented as the `extproc` crate and uses the [`envoy-types`](https://crates.io/crates/envoy-types) crate for the compiled `envoy.service.ext_proc.v3` protobuf types and [`tonic`](https://crates.io/crates/tonic) for the gRPC transport and server scaffolding.
+The SDK is implemented as the `envoy_extproc_sdk` crate and uses the [`envoy-types`](https://crates.io/crates/envoy-types) crate for the compiled `envoy.service.ext_proc.v3` protobuf types and [`tonic`](https://crates.io/crates/tonic) for the gRPC transport and server scaffolding.
 
 Several examples are provided here in the [examples](#examples), which can be reviewed to examine usage patterns.
 
@@ -16,7 +16,7 @@ Several examples are provided here in the [examples](#examples), which can be re
 
 ### TL;DR
 
-Implement the `extproc::RequestProcessor` trait, and pass an instance to the `extproc::serve` function.
+Implement the `envoy_extproc_sdk::RequestProcessor` trait, and pass an instance to the `envoy_extproc_sdk::serve` function.
 
 ### Details
 
@@ -24,7 +24,7 @@ This SDK uses a `struct`
 ```rust
 use std::sync::Arc;
 
-use extproc::{Metrics, ProcessingOptions, RequestProcessor};
+use envoy_extproc_sdk::{Metrics, ProcessingOptions, RequestProcessor};
 
 pub struct GenericExtProcServer {
     /// The name of the processor, as reported to `envoy`.
@@ -97,7 +97,7 @@ and a context object
 use std::time::{Duration, Instant};
 
 use http::Extensions;
-use extproc::{AllHeaders, PhaseResponse, RequestContext, RequestPhase};
+use envoy_extproc_sdk::{AllHeaders, PhaseResponse, RequestContext, RequestPhase};
 
 pub struct RequestContext {
     // parsed from headers
@@ -125,7 +125,7 @@ An ExtProc service can be run as in
 ```rust
 use std::sync::Arc;
 
-use extproc::{GenericExtProcServer, Metrics, ProcessingOptions, ServerOptions};
+use envoy_extproc_sdk::{GenericExtProcServer, Metrics, ProcessingOptions, ServerOptions};
 
 // define serverOptions, setup your tracing subscriber...
 // (ProcessingOptions are supplied by your processor's options method)
@@ -201,7 +201,7 @@ Two methods help modify bodies:
 ```
 These are the two options currently available in `envoy` ExtProcs: replace a chunk and clear the entire chunk. Note that with buffered bodies the "chunks" should be the entire body. See the [masker](#masker) example discussed below.
 
-The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/extproc/latest/extproc/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/extproc/latest/extproc/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
+The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
 
 ## Examples
 
