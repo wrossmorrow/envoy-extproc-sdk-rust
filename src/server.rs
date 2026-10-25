@@ -112,6 +112,8 @@ pub struct GenericExtProcServer {
 }
 
 impl GenericExtProcServer {
+    /// Create a new generic ext_proc server holding the given processor, its
+    /// options and the metrics to collect.
     pub fn new(
         name: impl Into<String>,
         processor: Arc<dyn RequestProcessor>,

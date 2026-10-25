@@ -13,23 +13,23 @@ for gRPC and the `envoy-types` crate for compiled protobuf types.
 Suggested stage breakdown (adjust as reality hits):
 
 1. **Stage 1** — Proto/types layer: `ProcessingRequest/Response`, `AllHeaders`,
-   `HeaderValue`, `PhaseResponse`, `RequestContext`, phase enum, helpers.
+   `HeaderValue`, `PhaseResponse`, `RequestContext`, phase enum, helpers. **DONE**.
 2. **Stage 2** — Options/health/metrics: `ProcessingOptions`, `ServerOptions`,
-   `HealthServer`, `Metrics`.
+   `HealthServer`, `Metrics`. **DONE**.
 3. **Stage 3** — gRPC server: `RequestProcessor` trait, `GenericExtProcServer`,
-   `Serve`, graceful shutdown.
+   `Serve`, graceful shutdown. **DONE**.
 4. **Stage 4** — Tests replicating the Go test suite (context, headers, options,
-   phase, metrics, health, server).
+   phase, metrics, health, server). **DONE** (unit tests).
 
 Remaining plan items:
 
 5. **Stage 5** — Implement integration tests. **In progress**: the `tests/` harness
-   now has `extproc_integration.rs` (gRPC) and `http_integration.rs` (plain HTTP;
-   HTTP suite at 10/11 passing, one red), plus `Dockerfile`/`justfile`/`compose.yaml`/
+   now has `extproc_integration.rs` (gRPC, 8 tests) and `http_integration.rs` (plain
+   HTTP, 10/11 passing, one red), plus `Dockerfile`/`justfile`/`compose.yaml`/
    `envoy.yaml`. Not yet done: full green gate across all suites, remaining cases.
-6. **Stage 6** — Implement examples. **Not started**: port the Go `examples/`
-   processors (`noop`, `trivial`, `timer`, `data`, `digest`, `dedup`, `masker`,
-   `echo`) to Rust.
+6. **Stage 6** — Implement examples. **Done** (PR #10): the dispatcher binary and the
+   example processors now cover `noop`, `trivial`, `timer`, `data`, `digest`, `dedup`,
+   `masker`, `echo`, `router`; see [Examples Port](#examples-port).
 
 ## Environment
 
@@ -73,7 +73,7 @@ Remaining plan items:
   `RequestTrailers(TrailersResponse)`, etc. — the active arm is obtained via
   `.response` (field/method returning the oneof enum).
 - `CommonResponse { status, header_mutation, body_mutation, trailers, clear_route_cache, ... }`.
-- `BodyMutation { mutation: Option<body_mutation::Mutation> }`; `Mutation` has
+- `BodyMutation { mutation: Option(body_mutation::Mutation) }`; `Mutation` has
   variants like `Body(Vec<u8>)`, `ClearBody(bool)` (+ possibly `Streamed`).
 - `ImmediateResponse { status: Option<HttpStatus>, headers, body, grpc_status, details }`;
   `HttpStatus { code: i32 }` from `envoy_types::pb::envoy::r#type::v3::HttpStatus`.
@@ -84,12 +84,14 @@ Remaining plan items:
 
 ## Current status
 
-The port now compiles and the unit test suite passes:
+The port now compiles and the unit test suite passes (green gate: `cargo check
+--all-targets`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test` — all passing, 38 unit tests):
 
-- `cargo check --all-targets` ✓, `cargo fmt --check` ✓, `cargo clippy --all-targets -- -D warnings` ✓, `cargo test` ✓ (33 unit tests passing).
-
-- Implemented modules: `context`, `headers`, `options`, `metrics`, `health`, `server`, plus `lib.rs` re-exports and the `Error` alias. (`tester` module backs the integration harness.)
-
+- Implemented modules: `context`, `headers`, `options`, `metrics`, `health`,
+  `server`, plus `lib.rs` re-exports and the `Error` alias. (`tester` module backs
+  the integration harness; `src/bin/` holds the local server and the example
+  binaries.)
 - Server behavior ported from Go `processPhase`:
   - Phase dispatch via oneof arms (`RequestHeaders`, `ResponseHeaders`, `RequestBody`,
     `ResponseBody`, `RequestTrailers`, `ResponseTrailers`).
@@ -101,38 +103,29 @@ The port now compiles and the unit test suite passes:
   - Error semantics mirror Go: on a phase error, if the processor opted in via
     `abort_on_processor_failure`, the error propagates (stream errors); otherwise
     an empty continue response is sent and the stream stays alive.
-
-- Metrics HTTP endpoint wiring (**done**, Phase 1): the server registers the
-  server-held `self.metrics` into a `prometheus::Registry`, serves `/metrics` via
-  axum, and emits OpenMetrics output (with the mandatory `# EOF` terminator and
-  the OpenMetrics content type) matching Go's `EnableOpenMetrics` behavior.
-
-- Graceful shutdown wiring (**in progress**, Phase 2): SIGINT+SIGTERM signal
-  future, health `MarkUnready`, unready propagation wait, tonic
-  `serve_with_shutdown`, and `close` error propagation. Bounded force-stop after
-  `termination_grace_period_seconds` still open (see Remaining known gaps).
-
-- Stream lifecycle metrics, error semantics and abort (**done**, Phase 3).
-
-- Async phase processing (**done**, follow-up to Phase 3): the `RequestProcessor`
-  trait phase methods are now `async fn` (via the `async-trait` crate, `#[async_trait]`
+- Metrics HTTP endpoint wiring (**done**): the server registers the server-held
+  `self.metrics` into a `prometheus::Registry`, serves `/metrics` via axum, and emits
+  OpenMetrics output (with the mandatory `# EOF` terminator and the OpenMetrics
+  content type) matching Go's `EnableOpenMetrics` behavior.
+- Graceful shutdown wiring (**in progress**): SIGINT+SIGTERM signal future,
+  health `MarkUnready`, unready propagation wait, tonic `serve_with_shutdown`,
+  and `close` error propagation. Bounded force-stop after
+  `termination_grace_period_seconds` still open (see
+  [Remaining known gaps](#remaining-known-gaps)).
+- Stream lifecycle metrics, error semantics and abort (**done**).
+- Async phase processing (**done**, follow-up to the above): the `RequestProcessor`
+  trait phase methods are now `async fn` (via the `async_trait` crate, `#[async_trait]`
   on the trait), so processor implementations can await asynchronous work (e.g.
   downstream HTTP calls, DB lookups) during a phase instead of blocking. The
   server-side phase dispatch (`GenericExtProcServer::process_phase` /
   `dispatch_phase`) is now async, and phase execution lives in a spawned task
-  (`run_phase_task`) that owns the inbound stream and the request context and
-  sends responses/errors over a channel; `ProcessStream` relays via
-  `tokio::sync::mpsc` (`poll_recv`). A new full-stream unit test
-  (`test_stream_phase_processing_with_sleeping_processor`) drives a complete
-  exchange with a processor that awaits a real timer, wrapped in
-  `tokio::time::timeout`. In-repo implementors updated: `TesterRequestProcessor`,
-  the local processor, and all example processors, plus the server unit tests
-  (now `#[tokio::test]`). A new unit test (`test_process_phase_async_processor_awaits`)
-  covers a processor that awaits inside a phase.
-  - **Breaking change** for external implementors: phase methods are now async;
-    implementors must add `#[async_trait]` and `async fn` to their `RequestProcessor`
-    impls. Follow-up candidates: document `close` semantics for async processors.
-    (The error handler (`error_handler`) has since been made async as well.)
+  (`run_phase_task`) that owns the inbound stream and the request context and sends
+  responses/errors over a channel; `ProcessStream` relays via
+  `tokio::sync::mpsc` (`poll_recv`). The server unit tests are `#[tokio::test]`.
+  The error handler (`error_handler`) has since been made async as well.
+  **Breaking change** for external implementors: phase methods are now async;
+  implementors must add `#[async_trait]` and `async fn` to their `RequestProcessor`
+  impls.
 
 ## Remaining known gaps
 
@@ -159,35 +152,31 @@ The port now compiles and the unit test suite passes:
 
 - Metrics histogram lacks Go's `NativeHistogramBucketFactor(1.1)`.
 
-- `Cargo.toml` `repository` still points at the Go repo — copy/paste leftover.
-
 ## Completion plan
 
-Ordered plan derived from the gaps above, sequenced against the existing green gate
-(`cargo check --all-targets`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test` — all passing, 33 tests):
+Ordered plan derived from the remaining gaps, sequenced against the existing green
+gate (`cargo check --all-targets`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test` — all passing, 38 unit tests):
 
-1. **Phase 1** — Metrics HTTP endpoint wiring (completes gap 1) — **DONE**.
-   - Done via PR #3.
-2. **Phase 2** — Graceful shutdown wiring (completes gap 2) — **IN PROGRESS**.
-   - Done: SIGINT+SIGTERM signal future, health `MarkUnready`, unready propagation wait,
-     graceful stop via tonic `serve_with_shutdown`, and `close` error propagation.
-   - Still open: bounded force-stop after `termination_grace_period_seconds`.
+1. **Phase 1** — Metrics HTTP endpoint wiring — **DONE**.
+2. **Phase 2** — Graceful shutdown wiring — **IN PROGRESS**; bounded force-stop
+   still open.
 3. **Phase 3** — Stream lifecycle metrics, error semantics and abort — **DONE**.
 4. **Phase 4** — Streaming responses — **DEFERRED** (maintainer decision recorded).
-5. **Phase 5** — Final gate and notes.
-6. **Phase 6** — Integration tests (proposed next step).
+5. **Phase 5** — Final gate and notes — **DONE**.
+6. **Phase 6** — Integration tests — **IN PROGRESS** (Stage 5; full green gate
+   across all suites still pending).
 
-## Examples Port (Go SDK → Rust SDK)
+## Examples Port
 
-**Status:** in progress. Starting-point branch `feat/examples-port` (PR open).
+**Status:** done. Starting-point branch `feat/examples-port` (PR #10, merged).
 
 Port of the Go SDK
 [`examples/`](https://github.com/wrossmorrow/envoy-extproc-sdk-go/tree/main/examples)
 (`noop`, `trivial`, `timer`, `data`, `digest`, `dedup`, `masker`, `echo`, `router`) to the
 Rust SDK, as runnable example binaries built on the public `extproc` lib API.
 
-Summary of the agreed port plan:
+Summary of the port:
 
 - Dispatcher binary: `src/bin/extproc-example.rs` with processor modules under
   `src/bin/processors/`. Takes the processor name as the first argument and mirrors the Go
@@ -207,29 +196,16 @@ Summary of the agreed port plan:
 - Dedup cache: static `Mutex<HashMap<String, bool>>` (Go used a package var).
 - Example-processor logging: `tracing` (server installs a subscriber).
 
-Port progress on this branch (checked off as each example lands):
+Port progress: all example processors landed and the dispatcher, compose/envoy
+wiring and README Examples section were updated to full parity with the Go
+`examples/` setup.
 
-- [x] Port plan + status summary added here; starting-point dispatcher binary and `noop`
-      processor committed.
-- [x] `trivial`
-- [x] `timer`
-- [x] `data`
-- [x] `digest`
-- [x] `dedup`
-- [x] `masker`
-- [x] `echo`
-- [x] `router`
-- [ ] Wire the example server into the Go-examples-style compose/envoy setup
-      (`examples/envoy.yaml`, `examples/compose.yaml`, `examples/Dockerfile`,
-      `examples/justfile`) and update the dispatcher flags (`-port`,
-      `-update-extproc-header`, `-update-duration-header`) to full parity with
-      the Go `examples/main.go`.
-- [ ] Update the Rust `README.md` Examples section now that the Go examples are
-      ported.
+Open follow-ups:
+
 - [ ] Consider promoting the example processors into the lib (public) if they
       should be reusable outside the example binary.
 
-## Go test inventory (ported so far)
+## Go test inventory
 
 - context_test.go: phase constants values/names, `default_phase_if_invalid`,
   `request_phase_to_string`, HeaderValue isValid/to_envoy conversions, PhaseResponse,
@@ -243,7 +219,6 @@ Port progress on this branch (checked off as each example lands):
 - options_test.go: defaults of ServerOptions/ProcessingOptions, options file loading
   helpers (`from_json`/`from_yaml`).
 - phase_test.go: phase name strings for all 7 phases, errors like "processor is nil".
-- server_test.go: Serve error when processor nil, processPhase dispatch, error handler.
 
 **Not yet ported** (candidates for the upcoming integration tests):
 
@@ -267,10 +242,9 @@ Port progress on this branch (checked off as each example lands):
   `test/tester_test.go`, `test/test.py`, `test/README.md`.
 - Rust side: `tests/` holds `Dockerfile`, `justfile`, `compose.yaml`, `envoy.yaml`,
   `extproc_integration.rs` (gRPC harness: spawned server via `GenericExtProcServer`,
-  tonic client, wire-format helpers, metrics fetch, 8 tests), and
-  `http_integration.rs` (plain-HTTP end-to-end, 11 tests ported from the Go
-  `tester_test.go`/`cases.yaml`; 10/11 passing, `http_remove_response_header` still
-  red due to a body-mutation rewrite failure).
+  tonic client, wire-format helpers, metrics fetch, 8 tests), and `http_integration.rs`
+  (plain-HTTP end-to-end, 11 tests ported from the Go `tester_test.go`/`cases.yaml`; 10/11
+  passing, `http_remove_response_header` still red due to a body-mutation rewrite failure).
 - Rust side plan: new `test/` directory mirroring the Go layout; Rust tester
   processor implementing the same `cases.yaml` action schema via the Rust
   `PhaseResponse` APIs.

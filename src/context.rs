@@ -141,7 +141,8 @@ impl HeaderValue {
     }
 }
 
-/// Build a map of [`HeaderValue`] from a map of header names to string values.
+/// Build a map of [`HeaderValue`] from a map of header names to string values,
+/// storing each value as a raw value.
 pub fn build_header_values_from_map(
     headers: &HashMap<String, String>,
 ) -> HashMap<String, HeaderValue> {
@@ -296,6 +297,11 @@ impl RequestContext {
     /// Build the [`ProcessingResponse`] for the given phase, honoring an
     /// immediate response set by the processor when the phase allows it, and
     /// otherwise returning a "continue" response.
+    ///
+    /// Immediate responses are honored for the
+    /// [`RequestPhase::RequestHeaders`], [`RequestPhase::RequestBody`],
+    /// [`RequestPhase::ResponseHeaders`] and [`RequestPhase::ResponseBody`]
+    /// phases; the trailer phases ignore them and always continue.
     pub fn get_response(
         &mut self,
         phase: RequestPhase,

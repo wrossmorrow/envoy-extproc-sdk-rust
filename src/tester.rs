@@ -24,7 +24,8 @@ use async_trait::async_trait;
 /// Go SDK's `test/tester.go` `TesterRequestBody`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TesterRequestBody {
-    // request processing options
+    /// How to modify the request headers during the request phase:
+    /// header names to append to, add only if absent, overwrite, or remove.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_request_headers: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,8 +34,10 @@ pub struct TesterRequestBody {
     pub overwrite_request_headers: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_request_headers: Option<Vec<String>>,
+    /// Whether to clear the request body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_request_body: Option<bool>,
+    /// The full request body to replace the original with, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_request_body: Option<String>,
 
@@ -47,18 +50,25 @@ pub struct TesterRequestBody {
     pub overwrite_response_headers: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_response_headers: Option<Vec<String>>,
+    /// Whether to clear the response body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_response_body: Option<bool>,
+    /// The full response body to replace the original with, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_response_body: Option<String>,
 
     // cancellation
+    /// Whether to cancel (respond immediately to) the request instead of
+    /// forwarding it upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request: Option<bool>,
+    /// The HTTP status to cancel the request with, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request_status: Option<i32>,
+    /// Headers to set on the cancellation response, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request_headers: Option<HashMap<String, String>>,
+    /// The body of the cancellation response, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request_body: Option<String>,
 }
