@@ -89,7 +89,10 @@ pub trait RequestProcessor: Send + Sync + 'static {
     /// logic it likes.
     async fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
 
-    /// Called on shutdown, after in-flight streams have drained.
+    /// Called on shutdown, after in-flight streams have completed, including
+    /// in-flight phase processing. Implementations may perform blocking
+    /// cleanup during close; the server awaits in-flight streams (via graceful
+    /// shutdown) before invoking this.
     fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
 }
 
@@ -133,7 +136,9 @@ impl GenericExtProcServer {
         self.processor.options()
     }
 
-    /// Called on shutdown, after in-flight streams have drained.
+    /// Called on shutdown, after in-flight streams have completed, including
+    /// in-flight phase processing; the graceful shutdown awaits in-flight
+    /// streams before invoking the processor's close.
     pub fn close(&self, grace_period_seconds: i32) -> Result<(), Error> {
         self.processor.close(grace_period_seconds)
     }
@@ -406,6 +411,9 @@ impl GenericExtProcServer {
 
         if let Err(e) = grpc_result {
             metrics_task.abort();
+            // Still attempt processor shutdown before exiting, so close is
+            // invoked even when the graceful shutdown path errors.
+            self.close(server_options.termination_grace_period_seconds)?;
             return Err(e.into());
         }
 

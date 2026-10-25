@@ -83,7 +83,10 @@ pub trait RequestProcessor: Send + Sync + 'static {
     /// logic it likes.
     async fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
 
-    /// Called on shutdown, after in-flight streams have drained.
+    /// Called on shutdown, after in-flight streams have completed, including
+    /// in-flight phase processing. Implementations may perform blocking
+    /// cleanup during close; the server awaits in-flight streams (via graceful
+    /// shutdown) before invoking this.
     fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
 }
 ```
