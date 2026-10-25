@@ -201,7 +201,7 @@ Two methods help modify bodies:
 ```
 These are the two options currently available in `envoy` ExtProcs: replace a chunk and clear the entire chunk. Note that with buffered bodies the "chunks" should be the entire body. See the [masker](#masker) example discussed below.
 
-The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
+The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/context/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/context/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
 
 ## Examples
 
