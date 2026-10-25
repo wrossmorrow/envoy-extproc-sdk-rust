@@ -443,17 +443,6 @@ pub async fn serve(
     server.serve(server_options).await
 }
 
-/// Start the ext_proc server and exit on failure. Convenience wrapper around
-/// [`serve`](serve).
-pub async fn must_serve(
-    server_options: crate::options::ServerOptions,
-    processor: Option<Arc<dyn RequestProcessor>>,
-) {
-    if let Err(e) = serve(server_options, processor).await {
-        panic!("extproc server failed: {}", e);
-    }
-}
-
 /// Shared state for the metrics handler.
 #[derive(Clone)]
 struct MetricsState {

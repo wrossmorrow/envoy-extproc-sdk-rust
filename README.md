@@ -118,23 +118,8 @@ that work together to allow processing of requests and responses.
 
 Phase processing methods are async (via the [`async_trait`](https://crates.io/crates/async-trait) crate): implementations may perform asynchronous work such as downstream HTTP calls or database lookups without blocking the stream task. Phase messages within a single request/response exchange are still processed sequentially, matching the ordered envoy ext_proc protocol flow; concurrency is available across concurrent streams.
 
-An ExtProc service can be run with the `must_serve` convenience function as in
-```rust
-use std::sync::Arc;
+An ExtProc service can be run as in
 
-use extproc::{must_serve, ServerOptions};
-
-// define serverOptions, setup your tracing subscriber...
-// (ProcessingOptions are supplied by your processor's options method)
-
-#[tokio::main]
-async fn main() {
-    // ...
-    let processor = Arc::new(MyProcessor::default());
-    must_serve(ServerOptions::default(), Some(processor)).await;
-}
-```
-or, more explicitly,
 ```rust
 use std::sync::Arc;
 
@@ -156,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await
 }
 ```
-Internally the `GenericExtProcServer` constructed in `must_serve` handles the gRPC streaming and shared context, parsing the processing phase in the gRPC stream and calling the right `RequestProcessor` method. The header and body messages can be responded to with either a "common" or "immediate" response object (or error); the trailer methods can only mutate headers. But that should be opaque to the user of this SDK; the `RequestContext` and `RequestProcessor` are more important.
+Internally the `GenericExtProcServer` handles the gRPC streaming and shared context, parsing the processing phase in the gRPC stream and calling the right `RequestProcessor` method. The header and body messages can be responded to with either a "common" or "immediate" response object (or error); the trailer methods can only mutate headers. But that should be opaque to the user of this SDK; the `RequestContext` and `RequestProcessor` are more important.
 
 ### Context Data
 
