@@ -16,7 +16,7 @@
 //! generically typed data suitable for each phase.
 //!
 //! The [`RequestProcessor`] trait is implemented by processor authors and
-//! handed to [`serve`](server::serve) / [`must_serve`](server::must_serve), which
+//! handed to [`serve`](server::serve), which
 //! handle the gRPC streaming and shared context, parsing the processing phase
 //! in the gRPC stream and calling the right
 //! [`RequestContext`](context::RequestContext) method. Phase processing methods
@@ -49,5 +49,5 @@ pub use headers::AllHeaders;
 pub use health::HealthServer;
 pub use metrics::Metrics;
 pub use options::{ProcessingOptions, ServerOptions};
-pub use server::{must_serve, serve, GenericExtProcServer, RequestProcessor};
+pub use server::{serve, GenericExtProcServer, RequestProcessor};
 pub use tester::{TesterRequestBody, TesterRequestProcessor};
