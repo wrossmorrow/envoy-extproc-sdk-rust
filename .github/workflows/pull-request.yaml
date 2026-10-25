@@ -7,13 +7,16 @@ on:
 jobs:
   build-check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["1.90", "1.99.1"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: ${{ matrix.toolchain }}
       - name: Check build(s)
         run: |
           cargo check --all-targets
@@ -34,25 +37,33 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
   unit-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["1.90", "1.99.1"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: ${{ matrix.toolchain }}
       - name: Unit tests
         run: cargo test --lib
   integration-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["1.90", "1.99.1"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.99.1'
+          toolchain: ${{ matrix.toolchain }}
       - name: Start compose setup
+        env:
+          RUST_VERSION: ${{ matrix.toolchain }}
         run: docker compose -f tests/compose.yaml up --build -d --wait --wait-timeout 90
       - name: Run tests
         run: cargo test --tests -- --test-threads=1
