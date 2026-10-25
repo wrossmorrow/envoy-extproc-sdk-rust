@@ -371,7 +371,11 @@ async fn http_remove_response_header() {
     let gateway = wait_for_gateway().await;
     let client = http_client();
     let actions = TesterRequestBody {
-        remove_response_headers: Some(vec!["date".to_string()]),
+        add_response_headers: Some(HashMap::from([(
+            "x-add-me".to_string(),
+            "true".to_string(),
+        )])),
+        remove_response_headers: Some(vec!["x-add-me".to_string()]),
         ..Default::default()
     };
     let resp = send_tester_request(&client, &gateway, &HashMap::new(), &actions).await;
@@ -382,14 +386,13 @@ async fn http_remove_response_header() {
         "removing a response header should not fail"
     );
     // TEMPORARY DEBUG: dump the full final response headers to diagnose why
-    // the removed response header (`date`) is still present in the final
-    // response.
+    // the removed response header is still present in the final response.
     eprintln!(
         "DEBUG http_remove_response_header final response headers: {:?}",
         resp.headers
     );
     assert!(
-        response_header_values(&resp.headers, "date").is_none(),
+        response_header_values(&resp.headers, "x-add-me").is_none(),
         "removed response header should not be returned"
     );
 }
