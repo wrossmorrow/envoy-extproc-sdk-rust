@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use extproc::{
+use envoy_extproc_sdk::{
     AllHeaders, Error, GenericExtProcServer, Metrics, ProcessingOptions, RequestContext,
     RequestPhase, RequestProcessor, ServerOptions,
 };

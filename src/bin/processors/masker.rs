@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 
-use extproc::{
+use envoy_extproc_sdk::{
     AllHeaders, Error, ProcessingOptions, RequestContext, RequestPhase, RequestProcessor,
 };
 use serde_json::{Map, Value};

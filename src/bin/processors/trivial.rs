@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use extproc::{
+use envoy_extproc_sdk::{
     AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
     RequestProcessor,
 };

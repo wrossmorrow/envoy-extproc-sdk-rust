@@ -21,7 +21,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
-use extproc::TesterRequestBody;
+use envoy_extproc_sdk::TesterRequestBody;
 
 use serde::Deserialize;
 
