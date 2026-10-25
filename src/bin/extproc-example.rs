@@ -5,7 +5,7 @@ mod processors;
 
 use std::sync::Arc;
 
-use extproc::{
+use envoy_extproc_sdk::{
     Error, GenericExtProcServer, Metrics, ProcessingOptions, RequestProcessor, ServerOptions,
 };
 
