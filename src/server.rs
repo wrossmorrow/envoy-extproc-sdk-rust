@@ -429,6 +429,23 @@ impl GenericExtProcServer {
     }
 }
 
+/// Reports whether an error is a stream cancellation rather than a processing
+/// failure. Cancellations occur when the client goes away mid-stream or envoy
+/// aborts the stream; they are a normal end of stream, not a processing error,
+/// and must not be surfaced through the error handler or error metrics.
+///
+/// Mirrors the Go SDK's `isStreamCancelled`: a `tonic::Status` carrying the gRPC
+/// `Canceled` code is a cancellation, and a raw context cancellation error is
+/// too. Context cancellation is normalized into a `Canceled` status by the
+/// transport, so checking the status covers both cases.
+fn is_stream_cancelled(err: Option<&Error>) -> bool {
+    let Some(err) = err else {
+        return false;
+    };
+    err.downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::Cancelled)
+}
+
 /// Start the ext_proc server, rejecting a nil processor. Convenience wrapper
 /// around [`GenericExtProcServer::serve`](GenericExtProcServer::serve).
 pub async fn serve(
@@ -595,8 +612,19 @@ async fn run_phase_task(
             Ok(req) => req,
             Err(e) => {
                 // Inbound stream error: forward it to the client and end the
-                // exchange (a cancelled stream is a clean end).
-                if e.code() != tonic::Code::Cancelled && tx.send(Err(e)).is_err() {
+                // exchange, unless it is a stream cancellation, which is a clean
+                // end that still notifies the error handler so the processor can
+                // clean up.
+                let err: Error = e.clone().into();
+                if is_stream_cancelled(Some(&err)) {
+                    // the stream was cancelled; notify the handler so it can clean
+                    // up, but this is not a processing error
+                    let phase = rc.get_phase();
+                    server.processor.error_handler(&mut rc, phase, err).await;
+                    tracing::debug!("Processing stream cancelled: {}", e.message());
+                    break;
+                }
+                if tx.send(Err(e)).is_err() {
                     break;
                 }
                 break;
@@ -721,6 +749,8 @@ mod tests {
         phases: Arc<Mutex<Vec<RequestPhase>>>,
         bodies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         errors: Arc<Mutex<Vec<RequestPhase>>>,
+        error_handler_calls: Arc<Mutex<u32>>,
+        last_error: Arc<Mutex<Option<Error>>>,
     }
 
     impl TestProcessor {
@@ -731,6 +761,8 @@ mod tests {
                 phases: Arc::new(Mutex::new(Vec::new())),
                 bodies: Arc::new(Mutex::new(HashMap::new())),
                 errors: Arc::new(Mutex::new(Vec::new())),
+                error_handler_calls: Arc::new(Mutex::new(0)),
+                last_error: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -823,8 +855,10 @@ mod tests {
                 .push(RequestPhase::ResponseTrailers);
             ctx.continue_request()
         }
-        async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, _err: Error) {
+        async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
             self.errors.lock().unwrap().push(phase);
+            *self.error_handler_calls.lock().unwrap() += 1;
+            *self.last_error.lock().unwrap() = Some(err);
         }
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
             Ok(())
@@ -1693,5 +1727,83 @@ mod tests {
         assert_eq!(RequestPhase::ResponseBody.as_u32(), 5);
         assert_eq!(RequestPhase::ResponseTrailers.as_u32(), 6);
         assert_eq!(RequestPhase::ResponseHeaders.as_u32(), 4);
+    }
+
+    #[test]
+    fn test_is_stream_cancelled() {
+        assert!(!is_stream_cancelled(None));
+        let cancelled: Error = tonic::Status::cancelled("context canceled").into();
+        assert!(is_stream_cancelled(Some(&cancelled)));
+        let failed: Error = tonic::Status::internal("failed to send response to envoy").into();
+        assert!(!is_stream_cancelled(Some(&failed)));
+    }
+
+    #[tokio::test]
+    async fn test_stream_context_cancelled_while_idle_is_graceful() {
+        // the stream context transitioning to done between phases is handled
+        // like a stream cancellation: notify the error handler, end gracefully
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = Arc::new(GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        ));
+
+        let (in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<ProcessingRequest, tonic::Status>>(1);
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task_server = server.clone();
+        tokio::spawn(async move {
+            run_phase_task(
+                task_server,
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(in_rx)),
+                out_tx,
+            )
+            .await;
+        });
+
+        let mut stream = ProcessStream {
+            server: server.clone(),
+            rx: out_rx,
+            errored: false,
+        };
+
+        // The stream is cancelled before any phase message arrives: the task
+        // observes the cancellation error and must end the stream gracefully.
+        in_tx
+            .send(Err(tonic::Status::cancelled("context canceled")))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out waiting for the stream to end");
+        assert!(response.is_none());
+
+        assert_eq!(*proc.error_handler_calls.lock().unwrap(), 1);
+        let last_error = proc.last_error.lock().unwrap();
+        let last_error = last_error
+            .as_ref()
+            .expect("expected the error handler to record an error");
+        assert!(is_stream_cancelled(Some(last_error)));
+        assert_eq!(
+            proc.errors.lock().unwrap().last(),
+            Some(&RequestPhase::Undetermined)
+        );
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_errored_streams")
+            .expect("expected errored streams family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
     }
 }
