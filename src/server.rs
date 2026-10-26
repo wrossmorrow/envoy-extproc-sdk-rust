@@ -438,7 +438,7 @@ impl GenericExtProcServer {
 /// `Canceled` code is a cancellation, and a raw context cancellation error is
 /// too. Context cancellation is normalized into a `Canceled` status by the
 /// transport, so checking the status covers both cases.
-fn is_stream_cancelled(err: Option<&Error>) -> bool {
+pub fn is_stream_cancelled(err: Option<&Error>) -> bool {
     let Some(err) = err else {
         return false;
     };

@@ -182,10 +182,16 @@ Cancellation can reach the SDK in one of two ways during the stream:
 In both cases the SDK still invokes the processor's `ErrorHandler` with the cancellation error and the last known phase, so that an implementation can clean up any state it holds for the in-flight phase. The stream itself is not marked errored, no phase error is counted, and no error status is returned. A processor that stores per-request state should therefore treat an `ErrorHandler` call carrying a cancellation as a signal to clean up, rather than as a processing failure:
 
 ```rust
+use envoy_extproc_sdk::{Error, RequestContext, RequestPhase, is_stream_cancelled};
+
 async fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
-    // A stream cancellation is a graceful end, not a processing failure: the
-    // processor can clean up any state held for the in-flight phase here and
-    // should not treat the error as a failure.
+    if is_stream_cancelled(Some(&err)) {
+        // A stream cancellation is a graceful end, not a processing failure:
+        // clean up any state held for the in-flight phase and return normally.
+        return;
+    }
+
+    // ...real processing error handling...
 }
 ```
 
