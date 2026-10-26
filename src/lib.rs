@@ -49,5 +49,5 @@ pub use headers::AllHeaders;
 pub use health::HealthServer;
 pub use metrics::Metrics;
 pub use options::{ProcessingOptions, ServerOptions};
-pub use server::{serve, GenericExtProcServer, RequestProcessor};
+pub use server::{is_stream_cancelled, serve, GenericExtProcServer, RequestProcessor};
 pub use tester::{TesterRequestBody, TesterRequestProcessor};
