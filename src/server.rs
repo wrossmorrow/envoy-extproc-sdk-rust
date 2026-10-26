@@ -656,6 +656,10 @@ async fn run_phase_task(
         .metrics
         .stream_duration_seconds
         .observe((Instant::now() - rc.started).as_secs_f64());
+    server
+        .metrics
+        .external_processing_seconds
+        .observe(rc.duration.as_secs_f64());
 }
 
 #[tonic::async_trait]
@@ -1700,7 +1704,7 @@ mod tests {
         });
 
         let mut stream = ProcessStream {
-            server,
+            server: server.clone(),
             rx: out_rx,
             errored: false,
         };
@@ -1715,6 +1719,25 @@ mod tests {
             .expect("timed out waiting for phase response")
             .expect("stream ended before a phase response was produced");
         assert!(response.is_ok());
+
+        // End the inbound stream so the phase task completes and observes its
+        // histograms; the external processing histogram records the time spent
+        // in phase processing (here, the sleeping processor's phase).
+        drop(in_tx);
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out waiting for stream end");
+        assert!(end.is_none());
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_external_processing_seconds")
+            .expect("expected external processing seconds family");
+        let histogram = family.metric[0].histogram.as_ref().unwrap();
+        assert!(histogram.sample_sum.unwrap() > 0.0);
     }
 
     #[test]
