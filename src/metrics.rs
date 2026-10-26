@@ -16,6 +16,10 @@ pub struct Metrics {
     pub total_streams: Counter,
     /// Stream duration in seconds (native histogram).
     pub stream_duration_seconds: Histogram,
+    /// External processing time in seconds (native histogram): the time spent
+    /// in external processing across the stream's phase processing calls,
+    /// excluding upstream request handling.
+    pub external_processing_seconds: Histogram,
     /// Total number of request headers processed.
     pub total_request_headers: Counter,
     /// Total number of request body messages processed.
@@ -66,6 +70,13 @@ impl Metrics {
                 prometheus::HistogramOpts::new(
                     "extproc_stream_duration_seconds",
                     "Stream duration in seconds (native histogram).",
+                ),
+            )
+            .unwrap(),
+            external_processing_seconds: prometheus::Histogram::with_opts(
+                prometheus::HistogramOpts::new(
+                    "extproc_external_processing_seconds",
+                    "External processing time in seconds (native histogram).",
                 ),
             )
             .unwrap(),
@@ -129,6 +140,7 @@ impl Metrics {
         registry.register(Box::new(self.phase_errors.clone()))?;
         registry.register(Box::new(self.total_streams.clone()))?;
         registry.register(Box::new(self.stream_duration_seconds.clone()))?;
+        registry.register(Box::new(self.external_processing_seconds.clone()))?;
         registry.register(Box::new(self.total_request_headers.clone()))?;
         registry.register(Box::new(self.total_request_body.clone()))?;
         registry.register(Box::new(self.total_request_trailers.clone()))?;
@@ -150,6 +162,7 @@ impl Metrics {
             &self.phase_errors,
             &self.total_streams,
             &self.stream_duration_seconds,
+            &self.external_processing_seconds,
             &self.total_request_headers,
             &self.total_request_body,
             &self.total_request_trailers,
@@ -179,7 +192,7 @@ mod tests {
     #[test]
     fn test_metrics_collectors_cover_every_field() {
         let metrics = Metrics::new();
-        assert_eq!(metrics.collectors().len(), 15);
+        assert_eq!(metrics.collectors().len(), 16);
         assert_eq!(
             metrics.collectors().len(),
             Metrics::new().collectors().len()
@@ -209,5 +222,13 @@ mod tests {
             .find(|f| f.name() == "extproc_total_request_headers")
             .expect("expected total request headers family");
         assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
+
+        metrics.external_processing_seconds.observe(0.05);
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_external_processing_seconds")
+            .expect("expected external processing seconds family");
+        assert_eq!(family.type_(), MetricType::HISTOGRAM);
     }
 }
