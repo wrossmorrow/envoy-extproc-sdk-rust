@@ -1,5 +1,9 @@
 # An Envoy ExternalProcessor SDK (rust)
 
+## Statement on AI Use
+
+This repository has a human-led agentic-coded port of a [similar SDK written in go](https://github.com/wrossmorrow/envoy-extproc-sdk-go). All commits authored by `wrossmorrow-pi-bot` (or earlier `flint-agent`) are from this workflow. [Recursive's flint](https://huggingface.co/RecursiveSI/flint) was used with the [pi harness](https://pi.dev/) in a [local sandbox](https://github.com/wrossmorrow/local-flint-pi). More or less every commit was made through PR's created and submitted by the agent and reviewed and checked by the human (mostly in the sandbox not on GitHub). The source material (the go SDK) was human-written, with the exception of a few more recent changes (also authored by `wrossmorrow-pi-bot`). 
+
 ## Overview
 
 [`envoy`](https://www.envoyproxy.io/), one of the most powerful and widely used reverse proxies, is able to query an [ExternalProcessor](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter) in its filter chain. Such a processor is a gRPC service that streams messages back and forth to modify HTTP requests being processed by `envoy`. This functionality opens the door to quickly and robustly implement customized functionality at the edge, instead of in targeted services. While powerful, implementing these services still requires dealing with complicated `envoy` specs, managing information sharing across request phases, and an understanding of gRPC, none of which are exactly straightforward.
@@ -324,3 +328,7 @@ The `EchoRequestProcessor` defined in `src/bin/processors/echo.rs` is an example
 ### Router
 
 The `RoutingRequestProcessor` defined in `src/bin/processors/router.rs` routes requests to different upstreams, either via the `x-route-to-upstream` request header or via a JSON request body declaring the upstream to send to. It overwrites the `:authority` header and clears the route cache to make the change take effect. (The Go SDK has a matching `examples/router.go`.)
+
+## Production Readiness
+
+This SDK has not been used by the author in production (but the go and [an older Java SDK](https://github.com/wrossmorrow/envoy-extproc-sdk-java) have been), and if you do issues, contributions, or other communications are welcome.
