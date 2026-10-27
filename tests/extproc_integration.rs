@@ -32,20 +32,20 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 // ---------------------------------------------------------------------------
 
 /// The gRPC address of the ext_proc server under test, from the
-/// `EXTO_PROC_GRPC_ADDR` environment variable and defaulting to the SDK default
+/// `EXTPROC_GRPC_ADDR` environment variable and defaulting to the SDK default
 /// (`127.0.0.1:50051`).
 fn grpc_addr() -> std::net::SocketAddr {
-    std::env::var("EXTO_PROC_GRPC_ADDR")
+    std::env::var("EXTPROC_GRPC_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 50051)))
 }
 
 /// The metrics HTTP address of the ext_proc server under test, from the
-/// `EXTO_PROC_METRICS_ADDR` environment variable and defaulting to the SDK
+/// `EXTPROC_METRICS_ADDR` environment variable and defaulting to the SDK
 /// default (`127.0.0.1:9090`).
 fn metrics_addr() -> std::net::SocketAddr {
-    std::env::var("EXTO_PROC_METRICS_ADDR")
+    std::env::var("EXTPROC_METRICS_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 9090)))

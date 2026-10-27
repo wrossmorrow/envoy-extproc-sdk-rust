@@ -29,7 +29,7 @@ use serde::Deserialize;
 // Harness
 // ---------------------------------------------------------------------------
 
-/// The gateway under test (envoy), from the `EXTO_PROC_ECHO_URL` environment
+/// The gateway under test (envoy), from the `EXTPROC_ECHO_URL` environment
 /// variable and defaulting to the docker compose harness address.
 const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 
@@ -45,7 +45,7 @@ const BYPASS_PATH: &str = "/no-extproc";
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn base_url() -> String {
-    std::env::var("EXTO_PROC_ECHO_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    std::env::var("EXTPROC_ECHO_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
 
 fn http_client() -> Client<HttpConnector, Full<HyperBytes>> {
