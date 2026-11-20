@@ -20,6 +20,7 @@ on:
   pull_request:
     paths:
       - 'conformance/**'
+      - '.github/workflows/conformance.yaml'
 
 jobs:
   resolve-matrix:
@@ -65,7 +66,7 @@ jobs:
           TEST_RUN: ${{ inputs.test_run }}
         run: |
           set -euo pipefail
-          cargo test --manifest-path conformance/Cargo.toml -v
+          cargo test --manifest-path Cargo.toml -v
       - name: Upload conformance results
         if: always()
         uses: actions/upload-artifact@v4
@@ -92,7 +93,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo run --manifest-path conformance/Cargo.toml --bin report -- --results-dir conformance --markdown-out "${GITHUB_STEP_SUMMARY}" --json-out conformance-summary.json
+          cargo run --manifest-path Cargo.toml --bin report -- --results-dir conformance --markdown-out "${GITHUB_STEP_SUMMARY}" --json-out conformance-summary.json
       - name: Upload conformance summary
         if: always()
         uses: actions/upload-artifact@v4
