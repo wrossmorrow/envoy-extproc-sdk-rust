@@ -20,6 +20,7 @@ jobs:
       - name: Check build(s)
         run: |
           cargo check --all-targets
+          cargo check --manifest-path conformance/Cargo.toml --all-targets
       # tests/Dockerfile is covered by the integration job, but o/w examples/Dockerfile not covered
       - name: Check example image build
         run: |

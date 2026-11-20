@@ -12,7 +12,7 @@ COPY tests ./tests
 
 RUN cargo build --release --bin extproc-tester
 
-FROM golang:${GO_VERSION_TAG} AS healthcheck
+FROM golang:1.25-alpine AS healthcheck
 
 RUN go install github.com/grpc-ecosystem/grpc-health-probe@v0.4.39
 

@@ -1,0 +1,272 @@
+# Migration notes
+
+## v0.3.0 (from v0.2.x)
+
+This release has no breaking source-level API changes — existing
+`RequestProcessor` implementations compile without modification.
+
+### Observability mode (`observability_mode: true`)
+
+`RequestContext::observability_mode` exposes `ProcessingRequest.observability_mode`.
+When `true`, processor callbacks run and SDK metrics are recorded while
+`GenericExtProcServer` suppresses `ProcessingResponse` sends (keeping Envoy's
+`spurious_msgs_received == 0`), synthetic response headers
+(`UpdateExtProcHeader`, `UpdateDurationHeader`), and `extproc_empty_responses`
+increments.
+
+Note Envoy's `ExternalProcessor.observability_mode` requirement: Envoy only
+delivers body messages in observability mode when the body mode is `STREAMED`,
+`GRPC`, or `NONE` (not `BUFFERED`).
+
+### Exported server constructor (`new_with_processor`)
+
+`GenericExtProcServer::new_with_processor(processor, options, metrics)` is now
+exported so callers can register `GenericExtProcServer` on custom `tonic`
+`Server` instances or in-process test harnesses without calling
+`GenericExtProcServer::serve`.
+
+### Header append actions enforced (`AddHeader`, `AppendHeader`, `OverwriteHeader`, `UpdateHeader`)
+
+Envoy's `ext_proc` filter ignores `HeaderValueOption.append_action` and
+evaluates the deprecated `HeaderValueOption.append` (defaulting to `false` /
+overwrite; see [envoyproxy/envoy#48886](https://github.com/envoyproxy/envoy/issues/48886)),
+which previously caused both `AddHeader` and `AppendHeader` to overwrite existing
+headers:
+
+- `AppendHeader` / `append_headers` (`APPEND_IF_EXISTS_OR_ADD`) now set
+  `HeaderValueOption.append = Some(true)` so Envoy appends values rather than
+  overwriting (including multi-filter `x-extproc-names` and
+  `x-extproc-duration-ns`).
+- `AddHeader` / `add_headers` (`ADD_IF_ABSENT`) and
+  `OverwriteHeader` / `update_header(..., "OVERWRITE_IF_EXISTS")` are enforced
+  against the phase header keys observed on the stream. Callers that previously
+  called `AddHeader` while unintentionally relying on overwriting an existing
+  header should switch to `OverwriteHeader`. (Under
+  `request_header_mode: SKIP`, incoming request headers are not sent to the
+  SDK, so request-header existence is not observed during
+  `RequestBody`.)
+
+## v0.2.0 – v0.2.1 (from v0.1.x)
+
+- **Graceful stream cancellation (v0.2.0)**: Mid-stream downstream or Envoy
+  cancellations (`codes.Canceled` / `context.Canceled`) during `Recv`, `Send`, or
+  idle `ctx.Done()` end the stream gracefully without incrementing error
+  counters while still notifying `ErrorHandler` for per-request state cleanup.
+- **Processing duration metric (v0.2.1)**: Added the
+  `extproc_external_processing_seconds` native histogram measuring cumulative
+  processor callback time per stream (distinct from
+  `extproc_stream_duration_seconds`).
+
+## v0.1.0 (from v0.0.x)
+
+This release changes public API in several places and changes runtime behavior
+in a few more. Read the "Header representation" and "RequestProcessor" sections
+first; those affect every consumer.
+
+### Envoy no longer sends `HeaderValue.value`
+
+More recent Envoy releases populate `HeaderValue.raw_value` for ext_proc and
+leave `value` empty. This is a change in Envoy, not in this SDK, but it
+invalidated the SDK's original header handling code that keyed off which proto
+field was set and could see an empty result on every request.
+
+If you are upgrading from an older Envoy at the same time, this is the change most
+likely to alter what your implementations observe.
+
+### Header representation (`AllHeaders`)
+
+Both maps are now always populated and hold one entry per occurrence, in wire
+order:
+
+```rust
+// before
+pub struct AllHeaders {
+    pub headers: HashMap<String, Vec<String>>,
+    pub raw_headers: HashMap<String, Vec<Vec<u8>>>,
+}
+
+// after
+pub struct AllHeaders {
+    pub headers: HashMap<String, Vec<String>>,
+    pub raw_headers: HashMap<String, Vec<Vec<u8>>>,
+}
+```
+
+Three behavior changes come with it:
+
+- **Values are no longer split on commas.** Previously every value was passed
+  through `strings.Split(v, ",")`, which unintentionally corrupted `Date`,
+  `User-Agent`, `Cookie`, and any value containing a quoted comma. Use
+  `SplitList(name)` where a comma delimited list is genuinely expected
+  (`Accept`, `Cache-Control`, `Vary`).
+- **Repeated headers are preserved.** Previously a repeated header overwrote
+  the earlier value; `Set-Cookie` lost all but the last. Both maps now hold one
+  entry per occurrence, in wire order.
+- **Keys are lower cased on ingest**, matching what Envoy sends. (Consistency is
+  the reason we're not just using `http::Header`s which canonicalize the names.)
+
+Prefer the new accessors over indexing the maps. They are case insensitive:
+
+```rust
+let v = headers.Get("content-type"); // first value
+let vs = headers.Values("set-cookie"); // all values, wire order
+let raw = headers.RawValues("x-binary"); // Vec<Vec<u8>>, for non-UTF-8 values
+if headers.Has("authorization") { ... }
+let parts = headers.SplitList("accept"); // opt-in comma splitting
+```
+
+### `RequestProcessor` gained two methods
+
+Every implementation must now add these methods, even if trivial:
+
+```rust
+// called when the SDK hits an error during request processing;
+// phase is one of the REQUEST_PHASE_* constants
+fn error_handler(&self, ctx: &mut RequestContext, phase: RequestPhase, err: Error);
+
+// called on shutdown, after in-flight streams have drained
+fn close(&self, grace_period_seconds: i32) -> Result<(), Error>;
+```
+
+A no-op `Close` returning `Ok(())` and an `ErrorHandler` that logs are starting
+points or maybe even enough. But if you (say) write to durable data layers you
+might want commits or other flushes in `Close`.
+
+### `GenericExtProcServer::serve` and the exported constructor
+
+```rust
+// before
+GenericExtProcServer::new(name, processor, options, metrics).serve(server_options)
+
+// after
+GenericExtProcServer::new(name, processor, options, metrics).serve(server_options)
+GenericExtProcServer::new_with_processor(processor, options, metrics)? // register on a custom tonic Server
+```
+
+### `ServerOptions` is new; `ProcessingOptions` changed
+
+Server level settings moved out of `ProcessingOptions` into a new
+`ServerOptions` type, constructible from defaults, JSON, or YAML:
+
+```rust
+let sopts = ServerOptions::new();
+// ExtProcPort                    50051
+// MetricsHTTPPort                9090
+// MaxConcurrentStreams           1000
+// UnreadyPropagationDelaySeconds 5
+// TerminationGracePeriodSeconds  10
+```
+
+`ProcessingOptions` dropped phase logging knobs and gained
+`AbortOnProcessorFailure`; the constructor was renamed to match existence of
+two options types:
+
+```rust
+// before
+let opts = ProcessingOptions::new();
+// after
+let opts = ProcessingOptions::new();
+// (AbortOnProcessorFailure, UpdateExtProcHeader, UpdateDurationHeader)
+```
+
+### `HeaderValue` sends `raw_value`
+
+`to_envoy_header_value` now always emits `raw_value`, converting `value` to
+bytes when that is the field you set. Setting *both* `value` and `raw_value` is
+now invalid and reported by `is_valid()`; previously both were passed through to
+Envoy, _which is not permitted by the proto_.
+
+### Body mutation split from `Content-Length`
+
+`replace_body_chunk` and `clear_body_chunk` no longer touch `Content-Length`.
+They operate on the body of *one message*, and under a `STREAMED` body mode that
+message is only part of the body, so its length is not the message length.
+Setting the header there produced a wrong `Content-Length` on every streamed
+chunk.
+
+Two whole-body methods now carry that behavior:
+
+```rust
+// before: set Content-Length to len(body) regardless of processing mode
+ctx.replace_body_chunk(body);
+ctx.clear_body_chunk();
+
+// after: pick by what you actually configured in envoy
+ctx.replace_body(body);      // BUFFERED - one message is the whole body; sets Content-Length
+ctx.clear_body();            // BUFFERED - clears and sets Content-Length: 0
+ctx.replace_body_chunk(body); // STREAMED - one chunk; leaves Content-Length alone
+ctx.clear_body_chunk();      // STREAMED - clears this chunk only
+```
+
+If your filter config uses `request_body_mode: BUFFERED` /
+`response_body_mode: BUFFERED` — which the examples and the test harness do —
+replace `replace_body_chunk` with `replace_body` and `clear_body_chunk` with
+`clear_body` to keep the old behavior. Under STREAMED, the chunk methods are what
+you wanted all along.
+
+Note also that a chunked HTTP/1.1 message carries no `Content-Length`, so neither
+whole-body method produces a meaningful header in that case.
+
+The `Content-Length` constant is also now lower cased (`content-length`),
+matching the header names envoy actually sends; the previous mixed-case key could
+fail to match the existing header when overwriting.
+
+### Shutdown behavior
+
+`GenericExtProcServer::serve` now performs a real graceful shutdown on
+SIGTERM/SIGINT, fixing bugs in previous versions:
+
+1. The gRPC health service starts reporting `NOT_SERVING`
+2. It waits `UnreadyPropagationDelaySeconds` (default 5) so load balancers doing
+   active health checking observe that
+3. `GracefulStop` sends GOAWAY and waits for in-flight streams, bounded by
+   `TerminationGracePeriodSeconds`, falling back to a hard `Stop`
+4. The processor's `close` runs last. Note it always runs after the server has
+   stopped, whether streams drained or were aborted so it can flush or commit to
+   any durable data layers (if any). Worst case, shutdown takes
+   `UnreadyPropagationDelaySeconds + TerminationGracePeriodSeconds` before
+   `close` is called; 15s with defaults. A Kubernetes pod's own
+   `terminationGracePeriodSeconds` (default 30) must exceed that plus however
+   long your `close` needs.
+
+Two consequences: a `SIGTERM` now takes at least `UnreadyPropagationDelaySeconds`
+to return (set it to `0` in tests and local runs), and the health service now
+reports real status. Previously `Check` returned `SERVING` unconditionally, so
+`MarkUnready` had no observable effect.
+
+### Metrics
+
+Prometheus metrics are new in this release and are registered to a private
+registry, served on `MetricsHTTPPort`:
+
+| Metric | Meaning |
+| --- | --- |
+| `extproc_active_streams` | gauge, streams in flight |
+| `extproc_total_streams` | streams opened |
+| `extproc_errored_streams` | streams that ended in error, counted once per stream |
+| `extproc_phase_errors_total` | phase processing errors, may repeat within one stream |
+| `extproc_stream_duration_seconds` | native histogram |
+| `extproc_total_request_headers` | request header phases |
+| `extproc_request_body_messages_total` | request body messages |
+| `extproc_total_request_trailers` | request trailer phases |
+| `extproc_total_response_headers` | response header phases |
+| `extproc_response_body_messages_total` | response body messages |
+| `extproc_total_response_trailers` | response trailer phases |
+| `extproc_request_body_bytes_total` | request body bytes |
+| `extproc_response_body_bytes_total` | response body bytes |
+| `extproc_empty_responses` | phases that produced no response |
+| `extproc_response_send_errors` | failures sending to Envoy |
+
+Note that `*_body_messages_total` counts _messages_ while `*_body_bytes_total`
+counts _bytes_; they are not two views of the same quantity.
+
+Likewise `extproc_errored_streams` and `extproc_phase_errors_total` are
+different questions: the first is how many requests were affected, the second how
+many phases actually failed. With `AbortOnProcessorFailure: false` a stream
+continues past a failed phase, so one stream can contribute several phase errors.
+The ratio tells you whether you are seeing one pathological stream or a broad
+failure.
+
+### Rust version
+
+The crate now requires Rust 1.90 (see `rust-version` in `Cargo.toml`).

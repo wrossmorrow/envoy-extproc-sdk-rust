@@ -1,0 +1,102 @@
+name: Envoy Conformance
+on:
+  workflow_dispatch:
+    inputs:
+      envoy_version:
+        description: "Specific Envoy image tag (leave empty for full matrix)"
+        required: false
+        default: ""
+        type: string
+      test_run:
+        description: "Optional test filter"
+        required: false
+        default: ""
+        type: string
+  schedule:
+    - cron: '0 9 * * 1'
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'conformance/**'
+
+jobs:
+  resolve-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Build Envoy version matrix
+        id: set-matrix
+        env:
+          ENVOY_INPUT: ${{ inputs.envoy_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ENVOY_INPUT}" ]; then
+            matrix=$(jq -cn --arg v "${ENVOY_INPUT}" '[{"envoy": $v, "canary": false}]')
+          else
+            matrix=$(jq -c '[(.supported[] | {"envoy": ., "canary": false}), (.canary[] | {"envoy": ., "canary": true})]' conformance/envoy-versions.json)
+          fi
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  conformance:
+    needs: resolve-matrix
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.canary }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Pull Envoy image
+        run: docker pull "envoyproxy/envoy:${{ matrix.envoy }}"
+      - name: Run conformance suite
+        working-directory: conformance
+        shell: bash
+        env:
+          ENVOY_TAG: ${{ matrix.envoy }}
+          TEST_RUN: ${{ inputs.test_run }}
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path conformance/Cargo.toml -v
+      - name: Upload conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results-${{ matrix.envoy }}
+          path: conformance/results-${{ matrix.envoy }}.json
+          if-no-files-found: ignore
+
+  report:
+    needs: [resolve-matrix, conformance]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download conformance results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: conformance-results-*
+          merge-multiple: true
+          path: conformance/results
+      - name: Generate conformance summary
+        working-directory: conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --manifest-path conformance/Cargo.toml --bin report -- --results-dir conformance --markdown-out "${GITHUB_STEP_SUMMARY}" --json-out conformance-summary.json
+      - name: Upload conformance summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-summary
+          path: conformance/conformance-summary.json
+          if-no-files-found: ignore

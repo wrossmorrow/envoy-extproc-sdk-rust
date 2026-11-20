@@ -11,7 +11,7 @@ use envoy_types::pb::envoy::service::ext_proc::v3::processing_request::Request a
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse;
 
-use crate::context::{HeaderValue, RequestContext, RequestPhase};
+use crate::context::{header_key_set, HeaderValue, RequestContext, RequestPhase};
 use crate::headers::{gen_headers, AllHeaders};
 use crate::metrics::Metrics;
 use crate::options::ProcessingOptions;
@@ -176,7 +176,17 @@ impl GenericExtProcServer {
             // Without abort: mirror the Go SDK — send an empty continue
             // response and keep the stream alive.
             let response = rc.empty_continue_response(phase)?;
+            // In observability mode no responses are sent at all, whether the
+            // phase errored or not.
+            if proc_req.observability_mode {
+                return Ok((None, phase));
+            }
             return Ok((response, phase));
+        }
+        if proc_req.observability_mode {
+            // Observability mode: callbacks run and metrics are recorded, but
+            // no ProcessingResponse is sent (spurious_msgs_received == 0).
+            return Ok((None, phase));
         }
 
         outcome
@@ -191,6 +201,8 @@ impl GenericExtProcServer {
         let phase_start = Instant::now();
         let metrics = &self.metrics;
         let options = &self.options;
+        let obs = proc_req.observability_mode;
+        rc.observability_mode = obs;
 
         let outcome = async {
             match &proc_req.request {
@@ -212,6 +224,7 @@ impl GenericExtProcServer {
                 Some(ProcessingRequestOneof::RequestBody(b)) => {
                     *phase = RequestPhase::RequestBody;
                     rc.set_phase(*phase);
+                    rc.phase_header_keys = Some(rc.req_header_keys.clone());
                     metrics.total_request_body.inc();
                     metrics.request_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
@@ -233,6 +246,7 @@ impl GenericExtProcServer {
                             return Err("failed to generate request trailers".into());
                         }
                     };
+                    rc.phase_header_keys = Some(header_key_set(&trailers));
                     rc.duration += phase_start.elapsed();
                     self.processor
                         .process_request_trailers(rc, &trailers)
@@ -253,12 +267,14 @@ impl GenericExtProcServer {
                             return Err("failed to generate response headers".into());
                         }
                     };
+                    rc.resp_header_keys = header_key_set(&headers);
+                    rc.phase_header_keys = Some(rc.resp_header_keys.clone());
                     rc.end_of_stream = h.end_of_stream;
                     self.processor
                         .process_response_headers(rc, &headers)
                         .await?;
                     rc.duration += phase_start.elapsed();
-                    if options.as_ref().is_some_and(|o| o.update_ext_proc_header) {
+                    if !obs && options.as_ref().is_some_and(|o| o.update_ext_proc_header) {
                         rc.append_header(
                             "x-extproc-names",
                             &HeaderValue {
@@ -267,7 +283,8 @@ impl GenericExtProcServer {
                             },
                         )?;
                     }
-                    if rc.end_of_stream
+                    if !obs
+                        && rc.end_of_stream
                         && options.as_ref().is_some_and(|o| o.update_duration_header)
                     {
                         rc.append_header(
@@ -282,12 +299,14 @@ impl GenericExtProcServer {
                 Some(ProcessingRequestOneof::ResponseBody(b)) => {
                     *phase = RequestPhase::ResponseBody;
                     rc.set_phase(*phase);
+                    rc.phase_header_keys = Some(rc.resp_header_keys.clone());
                     metrics.total_response_body.inc();
                     metrics.response_body_bytes.inc_by(b.body.len() as f64);
                     rc.end_of_stream = b.end_of_stream;
                     self.processor.process_response_body(rc, &b.body).await?;
                     rc.duration += phase_start.elapsed();
-                    if rc.end_of_stream
+                    if !obs
+                        && rc.end_of_stream
                         && options.as_ref().is_some_and(|o| o.update_duration_header)
                     {
                         rc.append_header(
@@ -314,6 +333,7 @@ impl GenericExtProcServer {
                             return Err("failed to generate response trailers".into());
                         }
                     };
+                    rc.phase_header_keys = Some(header_key_set(&trailers));
                     rc.duration += phase_start.elapsed();
                     self.processor
                         .process_response_trailers(rc, &trailers)
@@ -325,7 +345,24 @@ impl GenericExtProcServer {
                 }
             }
 
+            // Resolve the phase's header mutation against the phase header key
+            // set, then build the envoy-facing response. The post-mutation key
+            // set is carried into the next phase of the same kind (e.g. mutations
+            // made during the request headers phase inform the request body
+            // phase).
+            let (_resolved, next_keys) = rc.resolved_header_mutation();
             let response = rc.get_response(*phase)?;
+            if let Some(next) = next_keys {
+                match *phase {
+                    RequestPhase::RequestHeaders | RequestPhase::RequestBody => {
+                        rc.req_header_keys = next;
+                    }
+                    RequestPhase::ResponseHeaders | RequestPhase::ResponseBody => {
+                        rc.resp_header_keys = next;
+                    }
+                    _ => {}
+                }
+            }
             Ok((response, *phase))
         }
         .await;
@@ -335,6 +372,28 @@ impl GenericExtProcServer {
         }
 
         outcome
+    }
+
+    /// Create a new generic ext_proc server wrapping a processor, resolving
+    /// the processor name and defaults for options and metrics. Returns an
+    /// error when the processor is not supplied, mirroring the Go SDK's
+    /// `NewGenericExtProcServer`. Use this when registering the server on a
+    /// custom `tonic` `Server` instead of via
+    /// [`GenericExtProcServer::serve`](GenericExtProcServer::serve).
+    pub fn new_with_processor(
+        processor: Option<Arc<dyn RequestProcessor>>,
+        options: Option<ProcessingOptions>,
+        metrics: Metrics,
+    ) -> Result<Self, Error> {
+        let processor = processor.ok_or_else(|| "processor is nil".to_string())?;
+        let name = processor.name();
+        let resolved_options = options.unwrap_or_else(|| processor.options().clone());
+        Ok(Self {
+            name,
+            processor,
+            options: Some(resolved_options),
+            metrics,
+        })
     }
 
     /// Set up and serve the ext_proc gRPC server, metrics endpoint, and
@@ -508,6 +567,9 @@ fn init_req_ctx(
             .as_ref()
             .ok_or_else(|| "missing headers".to_string())?,
     )?;
+
+    rc.req_header_keys = rc.all_headers.headers.keys().cloned().collect();
+    rc.phase_header_keys = Some(rc.req_header_keys.clone());
 
     let empty: Vec<envoy_types::pb::envoy::config::core::v3::HeaderValue> = Vec::new();
     let hs: &[envoy_types::pb::envoy::config::core::v3::HeaderValue] = headers
@@ -730,6 +792,16 @@ mod tests {
             headers: headers.cloned(),
             attributes: HashMap::new(),
             end_of_stream,
+        }
+    }
+
+    fn http_body(body: &[u8], end_of_stream: bool) -> HttpBody {
+        HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
         }
     }
 
@@ -1828,5 +1900,450 @@ mod tests {
             .find(|f| f.name() == "extproc_errored_streams")
             .expect("expected errored streams family");
         assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+    }
+    // -------------------------------------------------------------------------
+    // Observability mode (envoy `observability_mode: true`)
+    // -------------------------------------------------------------------------
+
+    struct ObservabilityProcessor {
+        name: String,
+        opts: Option<ProcessingOptions>,
+        phases: Arc<Mutex<Vec<(RequestPhase, bool)>>>,
+    }
+
+    impl ObservabilityProcessor {
+        fn new(name: &str, opts: Option<ProcessingOptions>) -> Self {
+            Self {
+                name: name.to_string(),
+                opts,
+                phases: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn record(&self, ctx: &RequestContext) {
+            self.phases
+                .lock()
+                .unwrap()
+                .push((ctx.get_phase(), ctx.observability_mode));
+        }
+    }
+
+    #[async_trait]
+    impl RequestProcessor for ObservabilityProcessor {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn options(&self) -> &ProcessingOptions {
+            self.opts.as_ref().unwrap()
+        }
+        async fn process_request_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.record(ctx);
+            ctx.continue_request()
+        }
+        async fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.record(ctx);
+            ctx.continue_request()
+        }
+        async fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            self.record(ctx);
+            ctx.continue_request()
+        }
+        async fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.record(ctx);
+            ctx.continue_request()
+        }
+        async fn process_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            self.record(ctx);
+            ctx.continue_request()
+        }
+        async fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            self.record(ctx);
+            ctx.continue_request()
+        }
+        async fn error_handler(
+            &self,
+            _ctx: &mut RequestContext,
+            _phase: RequestPhase,
+            _err: Error,
+        ) {
+        }
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn processing_request_with_mode(
+        request: Option<ProcessingRequestOneof>,
+        observability_mode: bool,
+    ) -> ProcessingRequest {
+        ProcessingRequest {
+            metadata_context: None,
+            attributes: HashMap::new(),
+            observability_mode,
+            protocol_config: None,
+            flow_control_init: None,
+            client_window_update: None,
+            request,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_observability_mode_suppresses_responses() {
+        // In envoy `observability_mode: true`, processor callbacks run and the
+        // SDK metrics are recorded, but no ProcessingResponse is sent (keeping
+        // envoy's spurious_msgs_received == 0).
+        let proc = Arc::new(ObservabilityProcessor::new(
+            "obs",
+            Some(ProcessingOptions {
+                update_ext_proc_header: true,
+                update_duration_header: true,
+                abort_on_processor_failure: false,
+            }),
+        ));
+        let server = GenericExtProcServer::new(
+            "obs".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions {
+                update_ext_proc_header: true,
+                update_duration_header: true,
+                abort_on_processor_failure: false,
+            }),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        let req_hdrs = processing_request_with_mode(
+            Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+                Some(&envoy_header_map(&[(":method", "POST")])),
+                false,
+            ))),
+            true,
+        );
+        let (resp, phase) = server.process_phase(&req_hdrs, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_none());
+
+        let req_body = processing_request_with_mode(
+            Some(ProcessingRequestOneof::RequestBody(http_body(
+                b"hello", true,
+            ))),
+            true,
+        );
+        let (resp, phase) = server.process_phase(&req_body, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestBody);
+        assert!(resp.is_none());
+
+        let resp_hdrs = processing_request_with_mode(
+            Some(ProcessingRequestOneof::ResponseHeaders(http_headers(
+                Some(&envoy_header_map(&[(":status", "200")])),
+                false,
+            ))),
+            true,
+        );
+        let (resp, phase) = server.process_phase(&resp_hdrs, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::ResponseHeaders);
+        assert!(resp.is_none());
+
+        let resp_body = processing_request_with_mode(
+            Some(ProcessingRequestOneof::ResponseBody(http_body(
+                b"world", true,
+            ))),
+            true,
+        );
+        let (resp, phase) = server.process_phase(&resp_body, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::ResponseBody);
+        assert!(resp.is_none());
+
+        // The processor saw the phases with observability_mode set, and no
+        // response was ever sent (no spurious messages).
+        let recorded = proc.phases.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 4);
+        assert_eq!(
+            recorded[0],
+            (RequestPhase::RequestHeaders, true),
+            "expected the request headers phase to run with observability_mode"
+        );
+        assert_eq!(
+            recorded[3],
+            (RequestPhase::ResponseBody, true),
+            "expected the response body phase to run with observability_mode"
+        );
+
+        // Metrics: no phase errors, no empty responses, body bytes still
+        // counted, no send errors. (Total streams is incremented by the
+        // `ExternalProcessor::process` entrypoint, not by `process_phase`.)
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_empty_responses")
+            .expect("expected empty responses family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_response_send_errors")
+            .expect("expected response send errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_request_body_bytes_total")
+            .expect("expected request body bytes family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 5.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_response_body_bytes_total")
+            .expect("expected response body bytes family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_observability_mode_processor_error_counts_phase_error() {
+        // Without AbortOnProcessorFailure, a phase error under observability
+        // mode counts the phase error but sends no response and no empty
+        // response.
+        let proc = Arc::new(ErroringProcessor {
+            opts: ProcessingOptions {
+                abort_on_processor_failure: false,
+                ..ProcessingOptions::new()
+            },
+        });
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request_with_mode(
+            Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+                Some(&envoy_header_map(&[(":method", "GET")])),
+                false,
+            ))),
+            true,
+        );
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_none());
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_empty_responses")
+            .expect("expected empty responses family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_observability_mode_abort_on_failure_propagates() {
+        let proc = Arc::new(ErroringProcessor {
+            opts: ProcessingOptions {
+                abort_on_processor_failure: true,
+                ..ProcessingOptions::new()
+            },
+        });
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions {
+                abort_on_processor_failure: true,
+                ..ProcessingOptions::new()
+            }),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request_with_mode(
+            Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+                Some(&envoy_header_map(&[(":method", "GET")])),
+                false,
+            ))),
+            true,
+        );
+        let err = server.process_phase(&req, &mut rc).await.unwrap_err();
+        assert!(err.to_string().contains("processor exploded"));
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_header_existence_carries_into_body_phase() {
+        // Mutations from an earlier phase of the same kind inform later phases:
+        // the request headers phase adds a header (ADD_IF_ABSENT), and the
+        // request body phase must resolve its adds against the carried key set
+        // rather than an empty set.
+        struct AddHeadersProcessor {
+            opts: ProcessingOptions,
+        }
+
+        impl AddHeadersProcessor {
+            fn new() -> Self {
+                Self {
+                    opts: ProcessingOptions::new(),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl RequestProcessor for AddHeadersProcessor {
+            fn name(&self) -> String {
+                "adder".to_string()
+            }
+            fn options(&self) -> &ProcessingOptions {
+                &self.opts
+            }
+            async fn process_request_headers(
+                &self,
+                ctx: &mut RequestContext,
+                _headers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.add_header(
+                    "x-added-in-hdrs",
+                    &HeaderValue {
+                        value: String::new(),
+                        raw_value: Some(b"v1".to_vec()),
+                    },
+                )?;
+                ctx.continue_request()
+            }
+            async fn process_request_trailers(
+                &self,
+                ctx: &mut RequestContext,
+                _trailers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_request_body(
+                &self,
+                ctx: &mut RequestContext,
+                _body: &[u8],
+            ) -> Result<(), Error> {
+                // x-added-in-hdrs was added in the request headers phase, so
+                // ADD_IF_ABSENT here must skip it; x-added-in-body is new and is
+                // added.
+                ctx.add_header(
+                    "x-added-in-hdrs",
+                    &HeaderValue {
+                        value: String::new(),
+                        raw_value: Some(b"v2".to_vec()),
+                    },
+                )?;
+                ctx.add_header(
+                    "x-added-in-body",
+                    &HeaderValue {
+                        value: String::new(),
+                        raw_value: Some(b"v3".to_vec()),
+                    },
+                )?;
+                ctx.continue_request()
+            }
+            async fn process_response_headers(
+                &self,
+                ctx: &mut RequestContext,
+                _headers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_response_body(
+                &self,
+                ctx: &mut RequestContext,
+                _body: &[u8],
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn process_response_trailers(
+                &self,
+                ctx: &mut RequestContext,
+                _trailers: &AllHeaders,
+            ) -> Result<(), Error> {
+                ctx.continue_request()
+            }
+            async fn error_handler(
+                &self,
+                _ctx: &mut RequestContext,
+                _phase: RequestPhase,
+                _err: Error,
+            ) {
+            }
+            fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let server = GenericExtProcServer::new(
+            "adder".to_string(),
+            Arc::new(AddHeadersProcessor::new()),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        let req_hdrs = processing_request(Some(ProcessingRequestOneof::RequestHeaders(
+            http_headers(Some(&envoy_header_map(&[(":method", "GET")])), false),
+        )));
+        let (resp, phase) = server.process_phase(&req_hdrs, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_some());
+        let mutation = rc.response.header_mutation.as_ref().unwrap();
+        assert_eq!(mutation.set_headers.len(), 1);
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-added-in-hdrs"
+        );
+
+        let req_body = processing_request(Some(ProcessingRequestOneof::RequestBody(http_body(
+            b"body", true,
+        ))));
+        let (resp, phase) = server.process_phase(&req_body, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestBody);
+        assert!(resp.is_some());
+        // The resolved mutation for the request body phase is filtered against
+        // the carried phase header key set: the re-add of `x-added-in-hdrs`
+        // (ADD_IF_ABSENT) is skipped because the request headers phase added it,
+        // and only the new `x-added-in-body` add survives.
+        let (hm, _) = rc.resolved_header_mutation();
+        let set = hm
+            .clone()
+            .expect("expected a resolved mutation")
+            .set_headers;
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].header.as_ref().unwrap().key, "x-added-in-body");
     }
 }
