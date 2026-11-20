@@ -93,7 +93,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo run --manifest-path Cargo.toml --bin report -- --results-dir conformance --markdown-out "${GITHUB_STEP_SUMMARY}" --json-out conformance-summary.json
+          cargo run --manifest-path Cargo.toml --bin report -- --results-dir ./ --markdown-out "${GITHUB_STEP_SUMMARY}" --json-out conformance-summary.json
       - name: Upload conformance summary
         if: always()
         uses: actions/upload-artifact@v4
