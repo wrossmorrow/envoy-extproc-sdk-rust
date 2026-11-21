@@ -482,6 +482,7 @@ mod tests {
             r#"{"Action":"pass","Package":"envoy-conformance","Test":"envoy_conformance::headers_mutations_http1"}"#,
             r#"{"Action":"pass","Package":"envoy-conformance","Test":"envoy_conformance::headers_mutations_h2c"}"#,
             r#"{"Action":"pass","Package":"envoy-conformance","Test":"envoy_conformance::headers_multivalue_and_context_state"}"#,
+            r#"{"Action":"pass","Package":"envoy-conformance","Test":"envoy_conformance::mode_override"}"#,
             r#"{"Action":"skip","Package":"envoy-conformance","Test":"envoy_conformance::header_append_action_envoy_gap"}"#,
             r#"{"Action":"skip","Package":"envoy-conformance","Test":"envoy_conformance::observability_mode_envoy_gap"}"#,
         ]
@@ -537,7 +538,7 @@ mod tests {
             .results
             .get("v1.40-latest")
             .expect("mode cell");
-        assert_eq!(mode_cell.status, CellStatus::Unsupported);
-        assert_eq!(mode_cell.display, "\u{2014}");
+        assert_eq!(mode_cell.status, CellStatus::Pass);
+        assert_eq!(mode_cell.display, "PASS (1/1)");
     }
 }

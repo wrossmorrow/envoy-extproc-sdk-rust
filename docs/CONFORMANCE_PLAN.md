@@ -137,7 +137,7 @@ surface that a feature matrix should track:
 | `ImmediateResponse` (`Status`, `Headers`, `Body`) | Supported (partial) | Missing `GrpcStatus` and `Details` (`%RESPONSE_CODE_DETAILS%`) |
 | `ObservabilityMode` (`ProcessingRequest.observability_mode`) | Supported | Suppresses outbound `ProcessingResponse` when `observability_mode == true`; body delivery restricted to `STREAMED`/`GRPC`/`NONE` |
 | `ProtocolConfiguration` (`ProcessingRequest.protocol_config`) | Not Yet Supported | Sent on the first message in newer Envoys; exposing it on the context helps detect `BUFFERED` vs. `STREAMED` |
-| `ModeOverride` (`ProcessingResponse.mode_override`) | Not implemented | High-value capability for dynamic per-request body/trailer toggling |
+| `ModeOverride` (`ProcessingResponse.mode_override`) | Supported | `ModeOverride`, `OverrideMode`, `ClearModeOverride`, `SkipRemainingPhases` expose dynamic per-request body/trailer toggling; requires envoy `ext_proc` `allow_mode_override: true` |
 | `MetadataContext` & `DynamicMetadata` | Not implemented | High-value for reading `metadata_context` and writing `dynamic_metadata` |
 | `Attributes` (`request_attributes` / `response_attributes`) | Not implemented | Read-only CEL/connection attributes on `ProcessingRequest.attributes` |
 | `OverrideMessageTimeout` | Not implemented | Allows extending per-phase timeout dynamically up to `max_message_timeout` |
