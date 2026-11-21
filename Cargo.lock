@@ -185,6 +185,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prometheus",
+ "prost",
  "regex",
  "serde",
  "serde_json",

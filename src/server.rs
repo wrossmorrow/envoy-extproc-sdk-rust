@@ -752,6 +752,7 @@ impl ExternalProcessor for GenericExtProcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -1186,6 +1187,36 @@ mod tests {
         assert!(!rc.end_of_stream);
         assert_eq!(rc.get_phase(), RequestPhase::RequestHeaders);
         assert_eq!(proc.recorded_phases(), vec![RequestPhase::RequestHeaders]);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_outbound_response_is_wire_valid() {
+        // Fast protocol invariant check: every outbound `ProcessingResponse`
+        // emitted by the SDK must be structurally wire-valid. Encode the
+        // response and decode it back (prost message round-trip) so malformed
+        // outbound frames surface here instead of as spurious envoy messages.
+        let proc = Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new())));
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "POST")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_some());
+        let response = resp.as_ref().unwrap();
+        let bytes = response.encode_to_vec();
+        let decoded = ProcessingResponse::decode(&bytes[..])
+            .expect("outbound ProcessingResponse must decode");
+        assert_eq!(decoded, *response);
     }
 
     #[tokio::test]
