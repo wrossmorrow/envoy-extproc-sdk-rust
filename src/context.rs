@@ -15,6 +15,10 @@ use envoy_types::pb::envoy::service::ext_proc::v3::CommonResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::HeaderMutation;
 use envoy_types::pb::envoy::service::ext_proc::v3::ImmediateResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse;
+use envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::ProcessingMode;
+pub use envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::processing_mode::{
+    BodySendMode, HeaderSendMode,
+};
 
 use crate::headers::AllHeaders;
 use crate::Error;
@@ -259,6 +263,61 @@ pub fn build_header_values_from_map(
     out
 }
 
+/// A dynamic processing mode override, as requested by an external processor
+/// via [`override_mode`](RequestContext::override_mode), and surfaced to envoy
+/// as [`ProcessingResponse::mode_override`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse::mode_override).
+///
+/// Envoy only honors overrides while the `ext_proc` filter is configured with
+/// `allow_mode_override: true`, and only during the phases where an override
+/// may be expressed (see [`override_mode`](RequestContext::override_mode)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct ModeOverride {
+    /// How envoy should send response headers in subsequent phases. Use
+    /// [`HeaderSendMode::Default`] to keep the filter's configured mode.
+    pub response_header_mode: HeaderSendMode,
+    /// How envoy should send request bodies in subsequent phases. Use
+    /// [`BodySendMode::None`] to not send the body at all.
+    pub request_body_mode: BodySendMode,
+    /// How envoy should send response bodies in subsequent phases. Use
+    /// [`BodySendMode::None`] to not send the body at all.
+    pub response_body_mode: BodySendMode,
+    /// How envoy should send request trailers in subsequent phases. Use
+    /// [`HeaderSendMode::Default`] to keep the filter's configured mode, or
+    /// [`HeaderSendMode::Skip`] to not send them.
+    pub request_trailer_mode: HeaderSendMode,
+    /// How envoy should send response trailers in subsequent phases. Use
+    /// [`HeaderSendMode::Default`] to keep the filter's configured mode, or
+    /// [`HeaderSendMode::Skip`] to not send them.
+    pub response_trailer_mode: HeaderSendMode,
+}
+
+impl ModeOverride {
+    /// Convert the override into envoy's [`ProcessingMode`], validating that
+    /// every mode value is one envoy accepts. Envoy has no "keep default" body
+    /// mode (`BodySendMode::None` means "do not send"), so callers overriding
+    /// during the request headers phase should set both body modes explicitly.
+    pub fn to_envoy_processing_mode(&self) -> Result<ProcessingMode, Error> {
+        let response_header_mode = HeaderSendMode::try_from(self.response_header_mode as i32)
+            .map_err(|_| "invalid mode override: unknown response header mode".to_string())?;
+        let request_trailer_mode = HeaderSendMode::try_from(self.request_trailer_mode as i32)
+            .map_err(|_| "invalid mode override: unknown request trailer mode".to_string())?;
+        let response_trailer_mode = HeaderSendMode::try_from(self.response_trailer_mode as i32)
+            .map_err(|_| "invalid mode override: unknown response trailer mode".to_string())?;
+        let request_body_mode = BodySendMode::try_from(self.request_body_mode as i32)
+            .map_err(|_| "invalid mode override: unknown request body mode".to_string())?;
+        let response_body_mode = BodySendMode::try_from(self.response_body_mode as i32)
+            .map_err(|_| "invalid mode override: unknown response body mode".to_string())?;
+        Ok(ProcessingMode {
+            request_header_mode: i32::from(HeaderSendMode::Default),
+            response_header_mode: i32::from(response_header_mode),
+            request_body_mode: i32::from(request_body_mode),
+            response_body_mode: i32::from(response_body_mode),
+            request_trailer_mode: i32::from(request_trailer_mode),
+            response_trailer_mode: i32::from(response_trailer_mode),
+        })
+    }
+}
+
 /// The mutable, phase-scoped response being assembled by a processor.
 #[derive(Clone, Default)]
 pub struct PhaseResponse {
@@ -270,6 +329,10 @@ pub struct PhaseResponse {
     pub continue_request: Option<CommonResponse>,
     /// An immediate response to the data plane, if set.
     pub immediate_response: Option<ImmediateResponse>,
+    /// The dynamic mode override pending for the current phase, attached to
+    /// the header responses envoy accepts alongside `mode_override`. Cleared
+    /// by [`reset_phase`](RequestContext::reset_phase).
+    pub mode_override: Option<ProcessingMode>,
     /// Whether to clear the route cache after the current phase.
     pub clear_route_cache: bool,
 }
@@ -285,6 +348,7 @@ impl PhaseResponse {
         self.body_mutation = None;
         self.continue_request = None;
         self.immediate_response = None;
+        self.mode_override = None;
         self.clear_route_cache = false;
     }
 }
@@ -423,6 +487,66 @@ impl RequestContext {
         self.response.clear_route_cache = false;
     }
 
+    /// Override how envoy sends headers, bodies, and trailers in subsequent
+    /// phases of the current request/response, via envoy's
+    /// `ProcessingResponse.mode_override`.
+    ///
+    /// Only the request headers and response headers phases accept an
+    /// override (the phases in which envoy lets a processor express one);
+    /// errors are returned for every other phase without mutating state. The
+    /// override is attached to the next phase response envoy sends for this
+    /// exchange, and cleared by [`reset_phase`](RequestContext::reset_phase).
+    ///
+    /// Requires the envoy `ext_proc` filter to be configured with
+    /// `allow_mode_override: true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called during a phase that does not accept
+    /// overrides, or when a mode value is not valid for envoy.
+    pub fn override_mode(&mut self, mode: ModeOverride) -> Result<(), Error> {
+        let allows_override = matches!(
+            self.phase,
+            RequestPhase::Undetermined
+                | RequestPhase::RequestHeaders
+                | RequestPhase::ResponseHeaders
+        );
+        if !allows_override {
+            return Err(format!(
+                "mode_override is only supported during header phases, not {}",
+                self.get_phase_name()
+            )
+            .into());
+        }
+        let envoy_mode = mode.to_envoy_processing_mode()?;
+        self.response.mode_override = Some(envoy_mode);
+        Ok(())
+    }
+
+    /// Clear any pending mode override for the current phase, without sending
+    /// a response. See [`override_mode`](RequestContext::override_mode).
+    pub fn clear_mode_override(&mut self) {
+        self.response.mode_override = None;
+    }
+
+    /// Skip all remaining phases of the current request/response, via envoy's
+    /// `ProcessingResponse.mode_override`, and continue the exchange without
+    /// further processing. See [`override_mode`](RequestContext::override_mode).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current phase does not accept an override, or
+    /// when the resulting mode values are not valid for envoy.
+    pub fn skip_remaining_phases(&mut self) -> Result<(), Error> {
+        self.override_mode(ModeOverride {
+            response_header_mode: HeaderSendMode::Skip,
+            request_body_mode: BodySendMode::None,
+            response_body_mode: BodySendMode::None,
+            request_trailer_mode: HeaderSendMode::Skip,
+            response_trailer_mode: HeaderSendMode::Skip,
+        })
+    }
+
     /// Build the [`ProcessingResponse`] for the given phase, honoring an
     /// immediate response set by the processor when the phase allows it, and
     /// otherwise returning a "continue" response.
@@ -497,6 +621,14 @@ impl RequestContext {
 
         Ok(Some(ProcessingResponse {
             response,
+            mode_override: if matches!(
+                phase,
+                RequestPhase::RequestHeaders | RequestPhase::ResponseHeaders
+            ) {
+                self.response.mode_override.clone()
+            } else {
+                None
+            },
             ..Default::default()
         }))
     }
