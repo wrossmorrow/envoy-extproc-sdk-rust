@@ -14,19 +14,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use envoy_conformance::{
-    check_docker_available, mode_override_allowlist_denied_handler,
-    mode_override_allowlist_ok_handler, mode_override_default_from_protocol_config_handler,
-    mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,
-    mode_override_resp_stream_handler, mode_override_skip_handler, protocol_config_handler,
-    register_scenario_handlers, start_conformance_extproc_server, start_envoy_runner,
-    upstream_host_for_runner, CaseHandler, ConformanceExtProcServer, ConformanceProcessor,
-    EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
+    cel_attributes_persist_handler, check_docker_available, dynamic_metadata_emitter_handler,
+    dynamic_metadata_immediate_deny_handler, dynamic_metadata_receiver_handler,
+    mode_override_allowlist_denied_handler, mode_override_allowlist_ok_handler,
+    mode_override_default_from_protocol_config_handler, mode_override_disabled_handler,
+    mode_override_full_resp_handler, mode_override_handler, mode_override_resp_stream_handler,
+    mode_override_skip_handler, protocol_config_handler, register_scenario_handlers,
+    start_conformance_extproc_server, start_envoy_runner, upstream_host_for_runner, CaseHandler,
+    ConformanceExtProcServer, ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho,
+    UpstreamServer,
 };
 use envoy_extproc_sdk::{
     AllHeaders, BodySendMode, Error, HeaderValue, ProcessingOptions, ProtocolConfig,
     RequestContext, RequestPhase,
 };
 use envoy_types::pb::envoy::config::core::v3::header_value_option::HeaderAppendAction;
+use envoy_types::pb::google::protobuf::value::Kind as ValueKind;
+use envoy_types::pb::google::protobuf::Value;
 use http_body::Frame;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Bytes as HyperBytes;
@@ -1985,5 +1989,181 @@ fn observability_mode_envoy_gap() {
         assert!(!echo.headers.contains_key("x-should-not-appear"));
         assert!(handler.saw_observability.load(Ordering::SeqCst));
         assert_no_spurious(h).await;
+    });
+}
+
+fn dynamic_metadata_value_to_string(v: &Value) -> String {
+    match v.kind.as_ref() {
+        Some(ValueKind::StringValue(s)) => s.clone(),
+        _ => panic!("expected a string dynamic metadata value"),
+    }
+}
+
+fn dynamic_metadata_value_to_f64(v: &Value) -> f64 {
+    match v.kind.as_ref() {
+        Some(ValueKind::NumberValue(n)) => *n,
+        _ => panic!("expected a number dynamic metadata value"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12. Dynamic metadata & CEL attributes (dynamic_metadata_and_attributes)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dynamic_metadata_and_attributes() {
+    run_conformance(|h| async move {
+        // Sub-scenario: dynamic metadata emitted downstream across a chained
+        // pair of ext_proc filters, honoring the receiving_namespaces allowlist
+        // and the ImmediateResponse path.
+        {
+            let case_id = "meta-chain-allowlist";
+            h.default_proc
+                .register(case_id, dynamic_metadata_emitter_handler());
+            let saw_request_headers = Arc::new(AtomicBool::new(false));
+            let saw_request_body = Arc::new(AtomicBool::new(false));
+            let saw_response_headers = Arc::new(AtomicBool::new(false));
+            let saw_allowed_tenant = Arc::new(AtomicBool::new(false));
+            let saw_unallowed_namespace = Arc::new(AtomicBool::new(false));
+            let receiver = dynamic_metadata_receiver_handler(
+                saw_request_headers.clone(),
+                saw_request_body.clone(),
+                saw_response_headers.clone(),
+                saw_allowed_tenant.clone(),
+                saw_unallowed_namespace.clone(),
+            );
+            h.secondary_proc.register(case_id, receiver);
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/metadata-chain/check",
+                &[("x-conformance-case", case_id)],
+                full_body(b"meta-body"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            assert_eq!(
+                resp.headers
+                    .get("x-meta-verified")
+                    .and_then(|v| v.to_str().ok()),
+                Some("ok"),
+                "unexpected response headers: {:?}",
+                resp.headers
+            );
+            assert!(saw_request_headers.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(saw_request_body.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(saw_response_headers.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(saw_allowed_tenant.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!saw_unallowed_namespace.load(std::sync::atomic::Ordering::SeqCst));
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: an immediate response carries the emitted dynamic
+        // metadata and terminates the exchange with the processor's status and
+        // body.
+        {
+            let case_id = "meta-immediate-deny";
+            h.default_proc
+                .register(case_id, dynamic_metadata_immediate_deny_handler());
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::GET,
+                "/profile/metadata-chain/deny",
+                &[("x-conformance-case", case_id)],
+                full_body(b""),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::FORBIDDEN);
+            assert_eq!(
+                resp.headers.get("x-denied").and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "unexpected response headers: {:?}",
+                resp.headers
+            );
+            assert_eq!(resp.body, b"denied");
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: evaluated CEL attributes persist across the phases of
+        // the exchange, with request attributes flattened by attribute name and
+        // response attributes merged per phase.
+        {
+            let case_id = "cel-attrs-persist";
+            let observations = Arc::new(Mutex::new(HashMap::new()));
+            h.default_proc.register(
+                case_id,
+                cel_attributes_persist_handler(observations.clone()),
+            );
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/attributes/items?filter=active",
+                &[
+                    ("x-conformance-case", case_id),
+                    ("x-upstream-status", "201"),
+                ],
+                full_body(b"attr-probe"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::CREATED);
+
+            {
+                let observations = observations.lock().unwrap();
+                assert!(observations.contains_key("req_headers"));
+                assert!(observations.contains_key("req_body"));
+                assert!(observations.contains_key("resp_headers"));
+                assert!(observations.contains_key("resp_body"));
+                let attrs = observations
+                    .get("req_headers")
+                    .expect("req_headers observations");
+                assert_eq!(
+                    attrs
+                        .get("request.path")
+                        .map(dynamic_metadata_value_to_string),
+                    Some("/profile/attributes/items?filter=active".to_string())
+                );
+                assert_eq!(
+                    attrs
+                        .get("request.url_path")
+                        .map(dynamic_metadata_value_to_string),
+                    Some("/profile/attributes/items".to_string())
+                );
+                assert_eq!(
+                    attrs
+                        .get("request.method")
+                        .map(dynamic_metadata_value_to_string),
+                    Some("POST".to_string())
+                );
+                assert_eq!(
+                    attrs
+                        .get("request.protocol")
+                        .map(dynamic_metadata_value_to_string),
+                    Some("HTTP/1.1".to_string())
+                );
+                assert_eq!(
+                    attrs
+                        .get("xds.route_name")
+                        .map(dynamic_metadata_value_to_string),
+                    Some("conformance_attributes_route".to_string())
+                );
+
+                let resp_attrs = observations
+                    .get("resp_body")
+                    .expect("resp_body observations");
+                assert_eq!(
+                    resp_attrs
+                        .get("response.code")
+                        .map(dynamic_metadata_value_to_f64),
+                    Some(201.0)
+                );
+            }
+            assert_no_spurious(h).await;
+        }
     });
 }

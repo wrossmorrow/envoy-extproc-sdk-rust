@@ -209,6 +209,16 @@ impl GenericExtProcServer {
         if let Some(pc) = &proc_req.protocol_config {
             rc.protocol_config = Some(ProtocolConfig::from_proto(pc)?);
         }
+        // Envoy forwards dynamic metadata (via `metadata_options
+        // .forwarding_namespaces`) and evaluates CEL attributes (via
+        // `request_attributes` / `response_attributes`) on each processing
+        // message; merge them into the context, across phases of the stream.
+        if let Some(md) = &proc_req.metadata_context {
+            rc.merge_metadata_context(md);
+        }
+        if !proc_req.attributes.is_empty() {
+            rc.merge_attributes(&proc_req.attributes);
+        }
 
         let outcome = async {
             match &proc_req.request {
@@ -775,6 +785,9 @@ mod tests {
 
     use envoy_types::pb::envoy::config::core::v3::HeaderMap as EnvoyHeaderMap;
     use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
+    use envoy_types::pb::envoy::config::core::v3::Metadata;
+    use envoy_types::pb::google::protobuf::value::Kind as ValueKind;
+    use envoy_types::pb::google::protobuf::{Any, Struct, Value};
 
     use prometheus::Registry;
 
@@ -811,6 +824,18 @@ mod tests {
             end_of_stream_without_message: false,
             grpc_message_compressed: false,
             drain_complete: false,
+        }
+    }
+
+    fn string_value(s: &str) -> Value {
+        Value {
+            kind: Some(ValueKind::StringValue(s.to_string())),
+        }
+    }
+
+    fn bool_value(b: bool) -> Value {
+        Value {
+            kind: Some(ValueKind::BoolValue(b)),
         }
     }
 
@@ -1364,6 +1389,227 @@ mod tests {
             .find(|f| f.name() == "extproc_errored_streams")
             .expect("expected errored streams family");
         assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
+    }
+
+    // Inbound dynamic metadata observed during a phase, keyed by namespace and
+    // then metadata key.
+    #[derive(Default, Clone)]
+    struct ObservedMetadata {
+        namespaces: HashMap<String, HashMap<String, Value>>,
+    }
+
+    // Test processor that emits outbound dynamic metadata during the request
+    // body phase and records the inbound metadata seen during the response body
+    // phase.
+    struct DynamicMetadataProcessor {
+        name: String,
+        opts: Option<ProcessingOptions>,
+        emit_dynamic_metadata: bool,
+        inbound_metadata: Arc<Mutex<Option<ObservedMetadata>>>,
+    }
+
+    impl DynamicMetadataProcessor {
+        fn new(
+            name: &str,
+            opts: Option<ProcessingOptions>,
+            emit_dynamic_metadata: bool,
+            inbound_metadata: Arc<Mutex<Option<ObservedMetadata>>>,
+        ) -> Self {
+            Self {
+                name: name.to_string(),
+                opts,
+                emit_dynamic_metadata,
+                inbound_metadata,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RequestProcessor for DynamicMetadataProcessor {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn options(&self) -> &ProcessingOptions {
+            self.opts.as_ref().unwrap()
+        }
+        async fn process_request_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            if self.emit_dynamic_metadata {
+                ctx.set_dynamic_metadata("com.example.out", "checked", bool_value(true))?;
+            }
+            ctx.continue_request()
+        }
+        async fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            *self.inbound_metadata.lock().unwrap() = Some(ObservedMetadata {
+                namespaces: ctx.metadata.clone(),
+            });
+            ctx.continue_request()
+        }
+        async fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn error_handler(
+            &self,
+            _ctx: &mut RequestContext,
+            _phase: RequestPhase,
+            _err: Error,
+        ) {
+        }
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_dynamic_metadata_and_attributes() {
+        // Inbound envoy dynamic metadata and evaluated CEL attributes are
+        // merged into the context and persist across phases of the stream;
+        // outbound dynamic metadata set during a phase is attached to that
+        // phase's envoy-facing response, and cleared on the next phase.
+        let inbound_metadata = Arc::new(Mutex::new(None));
+        let server = GenericExtProcServer::new(
+            "dynamic-metadata".to_string(),
+            Arc::new(DynamicMetadataProcessor::new(
+                "dynamic-metadata",
+                Some(ProcessingOptions::new()),
+                true,
+                inbound_metadata.clone(),
+            )),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+
+        // Phase 1: inbound metadata_context and attributes, merged into context.
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let mut req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(
+            http_headers(Some(&envoy_header_map(&[(":method", "POST")])), false),
+        )));
+        let mut fields = HashMap::new();
+        fields.insert("sub".to_string(), string_value("alice"));
+        let mut filter_metadata = HashMap::new();
+        filter_metadata.insert(
+            "com.example.auth".to_string(),
+            Struct {
+                fields: fields.clone(),
+            },
+        );
+        let mut typed_filter_metadata = HashMap::new();
+        typed_filter_metadata.insert(
+            "com.example.typed".to_string(),
+            Any {
+                type_url: "type.googleapis.com/google.protobuf.StringValue".to_string(),
+                value: b"typed-v1".to_vec(),
+            },
+        );
+        req.metadata_context = Some(Metadata {
+            filter_metadata,
+            typed_filter_metadata,
+        });
+        let mut attr_fields = HashMap::new();
+        attr_fields.insert("request.protocol".to_string(), string_value("HTTP/2"));
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "envoy.filters.http.ext_proc".to_string(),
+            Struct {
+                fields: attr_fields,
+            },
+        );
+        req.attributes = attrs;
+        server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(
+            rc.metadata
+                .get("com.example.auth")
+                .and_then(|m| m.get("sub")),
+            Some(&string_value("alice"))
+        );
+        assert_eq!(
+            rc.typed_metadata
+                .get("com.example.typed")
+                .map(|a| a.type_url.clone()),
+            Some("type.googleapis.com/google.protobuf.StringValue".to_string())
+        );
+        assert_eq!(
+            rc.attributes.get("request.protocol"),
+            Some(&string_value("HTTP/2"))
+        );
+
+        // Phase 2: request body — the processor emits outbound dynamic metadata,
+        // which the phase response carries.
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestBody(HttpBody {
+            body: b"payload".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestBody);
+        let resp = resp.expect("expected a continue response");
+        assert!(resp.dynamic_metadata.is_some());
+        let envoy_struct = resp.dynamic_metadata.as_ref().unwrap();
+        let emitted = envoy_struct
+            .fields
+            .get("com.example.out")
+            .and_then(|v| v.kind.as_ref())
+            .and_then(|k| match k {
+                ValueKind::StructValue(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected a struct value for the emitted namespace");
+        assert_eq!(emitted.fields.get("checked"), Some(&bool_value(true)));
+
+        // Phase 3: response body — the inbound metadata persists across phases.
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::ResponseBody(HttpBody {
+            body: b"resp".to_vec(),
+            end_of_stream: true,
+            end_of_stream_without_message: false,
+            grpc_message_compressed: false,
+            drain_complete: false,
+        })));
+        server.process_phase(&req, &mut rc).await.unwrap();
+        let seen = inbound_metadata.lock().unwrap().take();
+        let seen = seen.expect("expected inbound metadata during response body phase");
+        assert_eq!(
+            seen.namespaces
+                .get("com.example.auth")
+                .and_then(|m| m.get("sub")),
+            Some(&string_value("alice"))
+        );
     }
 
     #[tokio::test]

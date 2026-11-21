@@ -18,6 +18,9 @@ const OBSERVABILITY_FILTER_NAME: &str = "envoy.filters.http.ext_proc.observabili
 const EXTPROC_MODE_OVERRIDE_FILTER_NAME: &str = "extproc_mode_override";
 const EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME: &str = "extproc_mode_override_allowlist";
 const EXTPROC_SEND_BODY_NO_WAIT_FILTER_NAME: &str = "extproc_send_body_no_wait";
+const EXTPROC_META_FIRST_FILTER_NAME: &str = "extproc_meta_first";
+const EXTPROC_META_SECOND_FILTER_NAME: &str = "extproc_meta_second";
+const EXTPROC_ATTRIBUTES_FILTER_NAME: &str = "extproc_attributes";
 
 const OBSERVED_HEADER_SEND: &str = "SEND";
 const OBSERVED_HEADER_SKIP: &str = "SKIP";
@@ -265,6 +268,52 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         None,
         true,
     ));
+    http_filters.push(ext_proc_filter_json_with_dynamic_metadata(
+        EXTPROC_META_FIRST_FILTER_NAME,
+        DEFAULT_EXT_PROC_CLUSTER,
+        5_000,
+        &default_mode,
+        Some(&json!({
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.MetadataOptions",
+            "receivingNamespaces": {
+                "untyped": ["com.conformance.extproc"],
+            },
+        })),
+        &[],
+        &[],
+        true,
+    ));
+    http_filters.push(ext_proc_filter_json_with_dynamic_metadata(
+        EXTPROC_META_SECOND_FILTER_NAME,
+        SECONDARY_EXT_PROC_CLUSTER,
+        5_000,
+        &default_mode,
+        Some(&json!({
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.MetadataOptions",
+            "forwardingNamespaces": {
+                "untyped": ["com.conformance.extproc", "com.conformance.unallowed"],
+            },
+        })),
+        &[],
+        &[],
+        true,
+    ));
+    http_filters.push(ext_proc_filter_json_with_dynamic_metadata(
+        EXTPROC_ATTRIBUTES_FILTER_NAME,
+        DEFAULT_EXT_PROC_CLUSTER,
+        5_000,
+        &default_mode,
+        None,
+        &[
+            "request.path".to_string(),
+            "request.url_path".to_string(),
+            "request.method".to_string(),
+            "request.protocol".to_string(),
+            "xds.route_name".to_string(),
+        ],
+        &["response.code".to_string()],
+        true,
+    ));
     http_filters.push(json!({
         "name": ROUTER_FILTER_NAME,
         "typed_config": {
@@ -389,6 +438,48 @@ fn ext_proc_filter_json(
     filter["typed_config"]["allow_mode_override"] = json!(allow_mode_override);
     if let Some(modes) = allowed_override_modes {
         filter["typed_config"]["allowed_override_modes"] = Value::Array(modes.clone());
+    }
+    filter
+}
+
+/// Build an ext_proc filter JSON with dynamic metadata options
+/// (`metadataOptions`) and CEL request/response attributes (`requestAttributes` /
+/// `responseAttributes`) attached, for the `dynamic_metadata_and_attributes`
+/// conformance scenarios. The filters built here are disabled by default and
+/// enabled per-route by the dynamic metadata & CEL attributes scenarios.
+#[allow(clippy::too_many_arguments)]
+fn ext_proc_filter_json_with_dynamic_metadata(
+    name: &str,
+    cluster_name: &str,
+    message_timeout_ms: u64,
+    mode: &Value,
+    metadata_options: Option<&Value>,
+    request_attributes: &[String],
+    response_attributes: &[String],
+    disabled: bool,
+) -> Value {
+    let mut filter = ext_proc_filter_json(
+        name,
+        cluster_name,
+        false,
+        message_timeout_ms,
+        false,
+        disabled,
+        mode,
+        false,
+        None,
+        false,
+    );
+    if let Some(metadata_options) = metadata_options {
+        filter["typed_config"]["metadataOptions"] = metadata_options.clone();
+    }
+    if !request_attributes.is_empty() {
+        let values: Vec<Value> = request_attributes.iter().map(|s| json!(s)).collect();
+        filter["typed_config"]["requestAttributes"] = Value::Array(values);
+    }
+    if !response_attributes.is_empty() {
+        let values: Vec<Value> = response_attributes.iter().map(|s| json!(s)).collect();
+        filter["typed_config"]["responseAttributes"] = Value::Array(values);
     }
     filter
 }
@@ -703,6 +794,23 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
             )],
             UPSTREAM_PRIMARY_CLUSTER,
         ),
+        profile_route_json(
+            "/profile/metadata-chain",
+            &[
+                (EXTPROC_META_FIRST_FILTER_NAME, mode, None),
+                (EXTPROC_META_SECOND_FILTER_NAME, mode, None),
+            ],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        {
+            let mut attributes_route = profile_route_json(
+                "/profile/attributes",
+                &[(EXTPROC_ATTRIBUTES_FILTER_NAME, mode, None)],
+                UPSTREAM_PRIMARY_CLUSTER,
+            );
+            attributes_route["name"] = json!("conformance_attributes_route");
+            attributes_route
+        },
         route_json(
             "/mode/none/protocol-config",
             &processing_mode_json(
@@ -969,7 +1077,7 @@ mod tests {
             .get("http_filters")
             .and_then(|f| f.as_array())
             .expect("http_filters");
-        assert_eq!(filters.len(), 11);
+        assert_eq!(filters.len(), 14);
         assert!(filters
             .iter()
             .find(|f| f.get("name").and_then(|n| n.as_str())
@@ -1057,5 +1165,101 @@ mod tests {
     fn bootstrap_json_rejects_empty_version() {
         let bad = BootstrapParams::new("", "127.0.0.1", 1, 2, 3, 4, 5, 6, 7);
         assert!(build_bootstrap_json(&bad).is_err());
+    }
+
+    #[test]
+    fn bootstrap_json_includes_dynamic_metadata_filters_and_routes() {
+        let bootstrap = build_bootstrap(&params()).expect("bootstrap should build");
+        let hcm = bootstrap
+            .get("static_resources")
+            .expect("static_resources")
+            .get("listeners")
+            .and_then(|l| l.as_array())
+            .and_then(|l| l.first())
+            .and_then(|l| l.get("filter_chains"))
+            .and_then(|fc| fc.as_array())
+            .and_then(|fc| fc.first())
+            .and_then(|fc| fc.get("filters"))
+            .and_then(|f| f.as_array())
+            .and_then(|f| f.first())
+            .expect("http connection manager filter");
+        let typed = hcm.get("typed_config").expect("typed_config");
+        let filters = typed
+            .get("http_filters")
+            .and_then(|f| f.as_array())
+            .expect("http_filters");
+        let find_filter = |name: &str| {
+            filters
+                .iter()
+                .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(name))
+                .unwrap_or_else(|| panic!("filter {name} should be present"))
+        };
+        let meta_first = find_filter(EXTPROC_META_FIRST_FILTER_NAME);
+        let receiving_namespaces = meta_first
+            .get("typed_config")
+            .and_then(|t| t.get("metadataOptions"))
+            .and_then(|m| m.get("receivingNamespaces"))
+            .and_then(|m| m.get("untyped"))
+            .and_then(|v| v.as_array())
+            .expect("meta first receivingNamespaces");
+        assert_eq!(receiving_namespaces.len(), 1);
+        assert_eq!(
+            receiving_namespaces[0].as_str(),
+            Some("com.conformance.extproc")
+        );
+        let meta_second = find_filter(EXTPROC_META_SECOND_FILTER_NAME);
+        let forwarding_namespaces = meta_second
+            .get("typed_config")
+            .and_then(|t| t.get("metadataOptions"))
+            .and_then(|m| m.get("forwardingNamespaces"))
+            .and_then(|m| m.get("untyped"))
+            .and_then(|v| v.as_array())
+            .expect("meta second forwardingNamespaces");
+        assert_eq!(forwarding_namespaces.len(), 2);
+        assert_eq!(
+            forwarding_namespaces[0].as_str(),
+            Some("com.conformance.extproc")
+        );
+        assert_eq!(
+            forwarding_namespaces[1].as_str(),
+            Some("com.conformance.unallowed")
+        );
+        let attributes = find_filter(EXTPROC_ATTRIBUTES_FILTER_NAME);
+        let request_attributes = attributes
+            .get("typed_config")
+            .and_then(|t| t.get("requestAttributes"))
+            .and_then(|v| v.as_array())
+            .expect("attributes requestAttributes");
+        assert_eq!(request_attributes.len(), 5);
+        assert_eq!(request_attributes[0].as_str(), Some("request.path"));
+        assert_eq!(request_attributes[4].as_str(), Some("xds.route_name"));
+        let response_attributes = attributes
+            .get("typed_config")
+            .and_then(|t| t.get("responseAttributes"))
+            .and_then(|v| v.as_array())
+            .expect("attributes responseAttributes");
+        assert_eq!(response_attributes.len(), 1);
+        assert_eq!(response_attributes[0].as_str(), Some("response.code"));
+
+        let virtual_hosts = typed
+            .get("route_config")
+            .and_then(|rc| rc.get("virtual_hosts"))
+            .and_then(|v| v.as_array())
+            .expect("virtual hosts");
+        let routes = virtual_hosts[1]
+            .get("routes")
+            .and_then(|r| r.as_array())
+            .expect("routes");
+        let prefixes: Vec<&str> = routes
+            .iter()
+            .map(|r| {
+                r.get("match")
+                    .and_then(|m| m.get("prefix"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(prefixes.contains(&"/profile/metadata-chain"));
+        assert!(prefixes.contains(&"/profile/attributes"));
     }
 }
