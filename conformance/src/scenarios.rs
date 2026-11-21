@@ -15,6 +15,8 @@ use envoy_types::pb::envoy::service::ext_proc::v3::body_mutation::Mutation as Bo
 use envoy_types::pb::envoy::service::ext_proc::v3::BodyMutation;
 use envoy_types::pb::envoy::service::ext_proc::v3::HeaderMutation;
 use envoy_types::pb::envoy::service::ext_proc::v3::ImmediateResponse;
+use envoy_types::pb::google::protobuf::value::Kind as ValueKind;
+use envoy_types::pb::google::protobuf::Value;
 
 use crate::processor::{CaseHandler, ConformanceProcessor};
 
@@ -31,6 +33,10 @@ pub const SCENARIO_MODE_OVERRIDE_FULL_RESP: &str = "mode-override-full-resp";
 pub const SCENARIO_MODE_OVERRIDE_ALLOWLIST_OK: &str = "mode-override-allowlist-ok";
 pub const SCENARIO_MODE_OVERRIDE_ALLOWLIST_DENIED: &str = "mode-override-allowlist-denied";
 pub const SCENARIO_PROTOCOL_CONFIG: &str = "protocol_config";
+pub const SCENARIO_DYNAMIC_METADATA_AND_ATTRIBUTES: &str = "dynamic_metadata_and_attributes";
+pub const SCENARIO_META_CHAIN_ALLOWLIST: &str = "meta-chain-allowlist";
+pub const SCENARIO_META_IMMEDIATE_DENY: &str = "meta-immediate-deny";
+pub const SCENARIO_CEL_ATTRIBUTES_PERSIST: &str = "cel-attrs-persist";
 
 /// Scenario handler for `immediate_response_request_headers`: responds with
 /// an immediate response (status 200, `x-scenario-response` header, empty body)
@@ -405,6 +411,251 @@ impl CaseHandler for ModeOverrideAllowlistDeniedScenarioHandler {
     }
 }
 
+/// Scenario handler for the `dynamic_metadata_and_attributes` sub-scenario
+/// `meta-chain-allowlist`: the first (default-cluster) ext_proc filter emits
+/// dynamic metadata during the request phases, and the second (secondary-cluster)
+/// ext_proc filter receives it during the request phases and echoes a
+/// verification response header during the response headers phase.
+struct DynamicMetadataEmitterHandler;
+
+impl CaseHandler for DynamicMetadataEmitterHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.set_dynamic_metadata(
+            "com.conformance.extproc",
+            "tenant",
+            Value {
+                kind: Some(ValueKind::StringValue("acme".to_string())),
+            },
+        )?;
+        ctx.set_dynamic_metadata(
+            "com.conformance.extproc",
+            "score",
+            Value {
+                kind: Some(ValueKind::NumberValue(42.0)),
+            },
+        )?;
+        ctx.set_dynamic_metadata(
+            "com.conformance.unallowed",
+            "secret",
+            Value {
+                kind: Some(ValueKind::StringValue("dropped".to_string())),
+            },
+        )?;
+        ctx.continue_request()
+    }
+
+    fn request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        ctx.set_dynamic_metadata(
+            "com.conformance.extproc",
+            "body_checked",
+            Value {
+                kind: Some(ValueKind::BoolValue(true)),
+            },
+        )?;
+        ctx.continue_request()
+    }
+}
+
+/// Scenario handler for the `dynamic_metadata_and_attributes` sub-scenario
+/// `meta-chain-allowlist` (second filter of the chain): observes the inbound
+/// dynamic metadata forwarded by the first filter and echoes a verification
+/// response header during the response headers phase.
+struct DynamicMetadataReceiverHandler {
+    saw_request_headers: Arc<AtomicBool>,
+    saw_request_body: Arc<AtomicBool>,
+    saw_response_headers: Arc<AtomicBool>,
+    saw_allowed_tenant: Arc<AtomicBool>,
+    saw_unallowed_namespace: Arc<AtomicBool>,
+}
+
+impl DynamicMetadataReceiverHandler {
+    fn new(
+        saw_request_headers: Arc<AtomicBool>,
+        saw_request_body: Arc<AtomicBool>,
+        saw_response_headers: Arc<AtomicBool>,
+        saw_allowed_tenant: Arc<AtomicBool>,
+        saw_unallowed_namespace: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            saw_request_headers,
+            saw_request_body,
+            saw_response_headers,
+            saw_allowed_tenant,
+            saw_unallowed_namespace,
+        }
+    }
+}
+
+impl CaseHandler for DynamicMetadataReceiverHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.saw_request_headers
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let allowed_tenant = ctx
+            .metadata
+            .get("com.conformance.extproc")
+            .and_then(|m| m.get("tenant"))
+            .and_then(|v| match v.kind.as_ref() {
+                Some(ValueKind::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            });
+        if allowed_tenant.as_deref() == Some("acme") {
+            self.saw_allowed_tenant
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if ctx.metadata.contains_key("com.conformance.unallowed") {
+            self.saw_unallowed_namespace
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        ctx.continue_request()
+    }
+
+    fn request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        self.saw_request_body
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ctx.continue_request()
+    }
+
+    fn response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.saw_response_headers
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ctx.add_header(
+            "x-meta-verified",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"ok".to_vec()),
+            },
+        )?;
+        ctx.continue_request()
+    }
+}
+
+/// Scenario handler for the `dynamic_metadata_and_attributes` sub-scenario
+/// `meta-immediate-deny`: emits dynamic metadata and responds with an immediate
+/// response (which carries the emitted dynamic metadata) instead of continuing.
+struct DynamicMetadataImmediateDenyHandler;
+
+impl CaseHandler for DynamicMetadataImmediateDenyHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.set_dynamic_metadata(
+            "com.conformance.extproc",
+            "denied_by",
+            Value {
+                kind: Some(ValueKind::StringValue("policy".to_string())),
+            },
+        )?;
+        ctx.cancel_request(
+            403,
+            &HashMap::from([(
+                "x-denied".to_string(),
+                HeaderValue {
+                    value: "1".to_string(),
+                    raw_value: None,
+                },
+            )]),
+            b"denied",
+        )
+    }
+}
+
+/// Scenario handler for the `dynamic_metadata_and_attributes` sub-scenario
+/// `cel-attrs-persist`: records the evaluated CEL attributes observed during
+/// each phase of the exchange, so the live-envoy conformance test can assert on
+/// their persistence and content across phases.
+struct CelAttributesHandler {
+    observations: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
+}
+
+impl CelAttributesHandler {
+    fn new(observations: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>) -> Self {
+        Self { observations }
+    }
+
+    fn record(&self, ctx: &RequestContext, phase: &str) {
+        self.observations
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), ctx.attributes.clone());
+    }
+}
+
+impl CaseHandler for CelAttributesHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.record(ctx, "req_headers");
+        ctx.continue_request()
+    }
+
+    fn request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        self.record(ctx, "req_body");
+        ctx.continue_request()
+    }
+
+    fn response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.record(ctx, "resp_headers");
+        ctx.continue_request()
+    }
+
+    fn response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        self.record(ctx, "resp_body");
+        ctx.continue_request()
+    }
+}
+
+/// Scenario handler factories for the `dynamic_metadata_and_attributes`
+/// conformance scenario and its sub-scenarios.
+pub fn dynamic_metadata_emitter_handler() -> Arc<dyn CaseHandler> {
+    Arc::new(DynamicMetadataEmitterHandler)
+}
+
+pub fn dynamic_metadata_receiver_handler(
+    saw_request_headers: Arc<AtomicBool>,
+    saw_request_body: Arc<AtomicBool>,
+    saw_response_headers: Arc<AtomicBool>,
+    saw_allowed_tenant: Arc<AtomicBool>,
+    saw_unallowed_namespace: Arc<AtomicBool>,
+) -> Arc<dyn CaseHandler> {
+    Arc::new(DynamicMetadataReceiverHandler::new(
+        saw_request_headers,
+        saw_request_body,
+        saw_response_headers,
+        saw_allowed_tenant,
+        saw_unallowed_namespace,
+    ))
+}
+
+pub fn dynamic_metadata_immediate_deny_handler() -> Arc<dyn CaseHandler> {
+    Arc::new(DynamicMetadataImmediateDenyHandler)
+}
+
+pub fn cel_attributes_persist_handler(
+    observations: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
+) -> Arc<dyn CaseHandler> {
+    Arc::new(CelAttributesHandler::new(observations))
+}
+
 /// Scenario handlers keyed by scenario id, for the cases covered by the
 /// conformance feature manifest.
 pub fn scenario_handlers() -> Vec<(String, Arc<dyn CaseHandler>)> {
@@ -457,6 +708,14 @@ pub fn scenario_handlers() -> Vec<(String, Arc<dyn CaseHandler>)> {
         (
             "mode-override-default-from-protocol-config".to_string(),
             mode_override_default_from_protocol_config_handler(Arc::new(AtomicBool::new(false))),
+        ),
+        (
+            SCENARIO_META_IMMEDIATE_DENY.to_string(),
+            dynamic_metadata_immediate_deny_handler(),
+        ),
+        (
+            SCENARIO_CEL_ATTRIBUTES_PERSIST.to_string(),
+            cel_attributes_persist_handler(Arc::new(Mutex::new(HashMap::new()))),
         ),
     ]
 }

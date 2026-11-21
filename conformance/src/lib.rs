@@ -34,7 +34,9 @@ pub use report::{
     SummaryReport, TestOutcome, VersionResult, VersionTestRun,
 };
 pub use scenarios::{
-    buffered_body_replace_grow_and_shrink_handler, get_nobody_mode_none_handler,
+    buffered_body_replace_grow_and_shrink_handler, cel_attributes_persist_handler,
+    dynamic_metadata_emitter_handler, dynamic_metadata_immediate_deny_handler,
+    dynamic_metadata_receiver_handler, get_nobody_mode_none_handler,
     immediate_response_request_headers_handler, mode_override_allowlist_denied_handler,
     mode_override_allowlist_ok_handler, mode_override_default_from_protocol_config_handler,
     mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,

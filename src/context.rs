@@ -8,6 +8,7 @@ use http::Extensions;
 pub use envoy_types::pb::envoy::config::core::v3::header_value_option::HeaderAppendAction;
 use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
 use envoy_types::pb::envoy::config::core::v3::HeaderValueOption;
+use envoy_types::pb::envoy::config::core::v3::Metadata;
 pub use envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::processing_mode::{
     BodySendMode, HeaderSendMode,
 };
@@ -20,6 +21,8 @@ use envoy_types::pb::envoy::service::ext_proc::v3::HeaderMutation;
 use envoy_types::pb::envoy::service::ext_proc::v3::ImmediateResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProtocolConfiguration;
+use envoy_types::pb::google::protobuf::value::Kind as ValueKind;
+use envoy_types::pb::google::protobuf::{Any, Struct, Value};
 
 use crate::headers::AllHeaders;
 use crate::Error;
@@ -393,6 +396,10 @@ pub struct PhaseResponse {
     pub continue_request: Option<CommonResponse>,
     /// An immediate response to the data plane, if set.
     pub immediate_response: Option<ImmediateResponse>,
+    /// Outbound dynamic metadata pending for the current phase, attached to
+    /// the phase response envoy sends (including immediate responses), and
+    /// cleared by [`reset_phase`](RequestContext::reset_phase).
+    pub dynamic_metadata: Option<Struct>,
     /// The dynamic mode override pending for the current phase, attached to
     /// the header responses envoy accepts alongside `mode_override`. Cleared
     /// by [`reset_phase`](RequestContext::reset_phase).
@@ -412,6 +419,7 @@ impl PhaseResponse {
         self.body_mutation = None;
         self.continue_request = None;
         self.immediate_response = None;
+        self.dynamic_metadata = None;
         self.mode_override = None;
         self.clear_route_cache = false;
     }
@@ -457,6 +465,28 @@ pub struct RequestContext {
     /// envoy did not send a `protocol_config`.
     pub protocol_config: Option<ProtocolConfig>,
 
+    /// Inbound untyped dynamic metadata forwarded by envoy for the current
+    /// stream, merged across phases, keyed first by namespace and then by
+    /// metadata key. Populated from the
+    /// [`ProcessingRequest::metadata_context`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest::metadata_context)
+    /// envoy sends when the ext_proc filter is configured with
+    /// `metadata_options.forwarding_namespaces`.
+    pub metadata: HashMap<String, HashMap<String, Value>>,
+
+    /// Inbound typed dynamic metadata forwarded by envoy for the current
+    /// stream, keyed by namespace, from the
+    /// [`ProcessingRequest::metadata_context`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest::metadata_context)
+    /// envoy sends when the ext_proc filter is configured with typed forwarding.
+    pub typed_metadata: HashMap<String, Any>,
+
+    /// Evaluated envoy/CEL attributes for the current stream, merged across
+    /// phases, flattened by attribute name (e.g. `request.protocol`,
+    /// `response.code`). Populated from the
+    /// [`ProcessingRequest::attributes`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest::attributes)
+    /// envoy sends for the `request_attributes` / `response_attributes`
+    /// configured on the ext_proc filter.
+    pub attributes: HashMap<String, Value>,
+
     /// Arbitrary custom values shared across phases of a request, stored in a
     /// type-keyed map ([`http::Extensions`]) so values are strongly typed
     /// rather than string-keyed trait objects.
@@ -500,6 +530,9 @@ impl RequestContext {
             end_of_stream: false,
             observability_mode: false,
             protocol_config: None,
+            metadata: HashMap::new(),
+            typed_metadata: HashMap::new(),
+            attributes: HashMap::new(),
             data: Extensions::new(),
             phase: RequestPhase::Undetermined,
             response: PhaseResponse::default(),
@@ -619,6 +652,162 @@ impl RequestContext {
         })
     }
 
+    /// Merge an inbound envoy [`Metadata`] context into the current context,
+    /// accumulating across the phases of the stream. Unmerged namespaces and
+    /// keys persist across phases; values for the same key overwrite earlier
+    /// ones, mirroring envoy's later-values-override semantics.
+    ///
+    /// Called by the SDK when a
+    /// [`ProcessingRequest`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest)
+    /// arrives with a `metadata_context`, i.e. when the ext_proc filter is
+    /// configured with `metadata_options.forwarding_namespaces`.
+    pub fn merge_metadata_context(&mut self, md: &Metadata) {
+        if !md.filter_metadata.is_empty() {
+            for (namespace, struct_) in &md.filter_metadata {
+                if struct_.fields.is_empty() {
+                    continue;
+                }
+                let namespace_map = self.metadata.entry(namespace.clone()).or_default();
+                for (key, value) in &struct_.fields {
+                    namespace_map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        if !md.typed_filter_metadata.is_empty() {
+            for (namespace, any) in &md.typed_filter_metadata {
+                self.typed_metadata.insert(namespace.clone(), any.clone());
+            }
+        }
+    }
+
+    /// Merge an inbound envoy attributes map into the current context,
+    /// accumulating across the phases of the stream. Attributes are flattened
+    /// by attribute name, and later phases overwrite earlier values for the
+    /// same attribute name.
+    ///
+    /// Called by the SDK when a
+    /// [`ProcessingRequest`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest)
+    /// arrives with `attributes`, i.e. when the ext_proc filter is configured
+    /// with `request_attributes` / `response_attributes`.
+    pub fn merge_attributes(&mut self, attrs: &HashMap<String, Struct>) {
+        for struct_ in attrs.values() {
+            if struct_.fields.is_empty() {
+                continue;
+            }
+            for (key, value) in &struct_.fields {
+                self.attributes.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    /// Set a single dynamic metadata key/value in the current phase's pending
+    /// outbound `ProcessingResponse.dynamic_metadata`, attaching it to the next
+    /// phase response envoy sends for this exchange. Envoy only accepts
+    /// namespaces listed in the ext_proc filter's
+    /// `metadata_options.receiving_namespaces.untyped`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace or key is empty.
+    pub fn set_dynamic_metadata(
+        &mut self,
+        namespace: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Error> {
+        if namespace.is_empty() {
+            return Err("dynamic metadata namespace cannot be empty".into());
+        }
+        if key.is_empty() {
+            return Err("dynamic metadata key cannot be empty".into());
+        }
+        let namespace_map = self.ensure_dynamic_metadata_namespace(namespace)?;
+        namespace_map.insert(key.to_string(), value);
+        Ok(())
+    }
+
+    /// Set multiple dynamic metadata values under `namespace` in the current
+    /// phase's pending outbound `ProcessingResponse.dynamic_metadata`.
+    ///
+    /// Validation is all-or-nothing: when the namespace or any key is empty, no
+    /// changes are applied. Values are merged into the namespace map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace or any key is empty.
+    pub fn set_dynamic_metadata_namespace(
+        &mut self,
+        namespace: &str,
+        values: &HashMap<String, Value>,
+    ) -> Result<(), Error> {
+        if namespace.is_empty() {
+            return Err("dynamic metadata namespace cannot be empty".into());
+        }
+        let mut converted = HashMap::with_capacity(values.len());
+        for (k, v) in values {
+            if k.is_empty() {
+                return Err("dynamic metadata key cannot be empty".into());
+            }
+            converted.insert(k.clone(), v.clone());
+        }
+        let namespace_map = self.ensure_dynamic_metadata_namespace(namespace)?;
+        for (k, v) in converted {
+            namespace_map.insert(k, v);
+        }
+        Ok(())
+    }
+
+    /// Clear the pending outbound dynamic metadata for the current phase, so
+    /// the next phase response envoy sends carries no dynamic metadata. See
+    /// [`clear_dynamic_metadata`](RequestContext::clear_dynamic_metadata).
+    pub fn clear_dynamic_metadata(&mut self) {
+        self.response.dynamic_metadata = None;
+    }
+
+    /// Ensure the outbound dynamic metadata namespace entry exists for
+    /// `namespace`, creating an empty namespace struct when the current phase
+    /// has no pending dynamic metadata yet, and return it.
+    fn ensure_dynamic_metadata_namespace(
+        &mut self,
+        namespace: &str,
+    ) -> Result<&mut HashMap<String, Value>, Error> {
+        if namespace.is_empty() {
+            return Err("dynamic metadata namespace cannot be empty".into());
+        }
+        if self.response.dynamic_metadata.is_none() {
+            self.response.dynamic_metadata = Some(Struct {
+                fields: HashMap::new(),
+            });
+        }
+        let envoy_struct = self
+            .response
+            .dynamic_metadata
+            .as_mut()
+            .expect("dynamic metadata just ensured");
+        let is_struct = envoy_struct
+            .fields
+            .get(namespace)
+            .is_some_and(|v| matches!(v.kind.as_ref(), Some(ValueKind::StructValue(_))));
+        if !is_struct {
+            envoy_struct.fields.insert(
+                namespace.to_string(),
+                Value {
+                    kind: Some(ValueKind::StructValue(Struct {
+                        fields: HashMap::new(),
+                    })),
+                },
+            );
+        }
+        let value = envoy_struct
+            .fields
+            .get_mut(namespace)
+            .expect("dynamic metadata namespace just ensured");
+        if let Some(ValueKind::StructValue(namespace_struct)) = value.kind.as_mut() {
+            return Ok(&mut namespace_struct.fields);
+        }
+        Err("dynamic metadata namespace entry is not a struct".into())
+    }
+
     /// Build the [`ProcessingResponse`] for the given phase, honoring an
     /// immediate response set by the processor when the phase allows it, and
     /// otherwise returning a "continue" response.
@@ -641,6 +830,7 @@ impl RequestContext {
                     response: Some(ProcessingResponseResponse::ImmediateResponse(
                         immediate.clone(),
                     )),
+                    dynamic_metadata: self.response.dynamic_metadata.clone(),
                     ..Default::default()
                 }));
             }
@@ -693,6 +883,7 @@ impl RequestContext {
 
         Ok(Some(ProcessingResponse {
             response,
+            dynamic_metadata: self.response.dynamic_metadata.clone(),
             mode_override: if matches!(
                 phase,
                 RequestPhase::RequestHeaders | RequestPhase::ResponseHeaders
@@ -1155,6 +1346,7 @@ mod tests {
             }),
             body_mutation: None,
             immediate_response: None,
+            dynamic_metadata: None,
             continue_request: None,
             mode_override: None,
             clear_route_cache: true,
@@ -1799,5 +1991,245 @@ mod tests {
         assert!(rc.response.body_mutation.is_some());
         rc.clear_body_chunk().unwrap();
         assert!(rc.response.body_mutation.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic metadata & CEL attributes (envoy `ProcessingRequest.metadata_context`,
+    // `ProcessingRequest.attributes`, `ProcessingResponse.dynamic_metadata`)
+    // -----------------------------------------------------------------------
+
+    fn string_value(s: &str) -> Value {
+        Value {
+            kind: Some(ValueKind::StringValue(s.to_string())),
+        }
+    }
+
+    fn bool_value(b: bool) -> Value {
+        Value {
+            kind: Some(ValueKind::BoolValue(b)),
+        }
+    }
+
+    fn number_value(n: f64) -> Value {
+        Value {
+            kind: Some(ValueKind::NumberValue(n)),
+        }
+    }
+
+    fn struct_value(fields: HashMap<String, Value>) -> Value {
+        Value {
+            kind: Some(ValueKind::StructValue(Struct { fields })),
+        }
+    }
+
+    fn envoy_metadata(
+        filter_metadata: HashMap<String, Struct>,
+        typed_filter_metadata: HashMap<String, Any>,
+    ) -> Metadata {
+        Metadata {
+            filter_metadata,
+            typed_filter_metadata,
+        }
+    }
+
+    fn namespace_dynamic_metadata(rc: &RequestContext, namespace: &str) -> HashMap<String, Value> {
+        let envoy_struct = rc
+            .response
+            .dynamic_metadata
+            .as_ref()
+            .expect("expected pending dynamic metadata");
+        let value = envoy_struct
+            .fields
+            .get(namespace)
+            .expect("expected namespace entry");
+        match value.kind.as_ref() {
+            Some(ValueKind::StructValue(struct_)) => struct_.fields.clone(),
+            _ => panic!("expected struct value for namespace {}", namespace),
+        }
+    }
+
+    #[test]
+    fn test_dynamic_metadata_validation_and_merging() {
+        let mut rc = RequestContext::new();
+        // Empty namespaces and keys are rejected, without mutating state.
+        assert!(rc.set_dynamic_metadata("", "k", string_value("v")).is_err());
+        assert!(rc
+            .set_dynamic_metadata("com.example.ns", "", string_value("v"))
+            .is_err());
+        assert!(rc.response.dynamic_metadata.is_none());
+
+        // A single key can be set under a namespace.
+        assert!(rc
+            .set_dynamic_metadata("com.example.ns", "initial", string_value("ok"))
+            .is_ok());
+        assert_eq!(
+            namespace_dynamic_metadata(&rc, "com.example.ns").get("initial"),
+            Some(&string_value("ok"))
+        );
+
+        // A failed namespace update must not apply partial changes.
+        let mut bad = HashMap::new();
+        bad.insert("".to_string(), string_value("bad"));
+        assert!(rc
+            .set_dynamic_metadata_namespace("com.example.ns", &bad)
+            .is_err());
+        assert_eq!(
+            namespace_dynamic_metadata(&rc, "com.example.ns").get("initial"),
+            Some(&string_value("ok"))
+        );
+
+        // A namespace update merges values into the namespace map.
+        let mut values = HashMap::new();
+        values.insert("count".to_string(), number_value(42.0));
+        values.insert("tags".to_string(), struct_value(HashMap::new()));
+        values.insert(
+            "nested".to_string(),
+            struct_value(HashMap::from([("enabled".to_string(), bool_value(true))])),
+        );
+        assert!(rc
+            .set_dynamic_metadata_namespace("com.example.ns", &values)
+            .is_ok());
+        let merged = namespace_dynamic_metadata(&rc, "com.example.ns");
+        assert_eq!(merged.get("initial"), Some(&string_value("ok")));
+        assert_eq!(merged.get("count"), Some(&number_value(42.0)));
+        assert_eq!(
+            merged.get("nested").and_then(|v| v.kind.as_ref()),
+            Some(&ValueKind::StructValue(Struct {
+                fields: HashMap::from([("enabled".to_string(), bool_value(true),)]),
+            }))
+        );
+
+        // A second namespace can be set independently.
+        assert!(rc
+            .set_dynamic_metadata("com.example.other", "flag", bool_value(true))
+            .is_ok());
+        assert_eq!(
+            namespace_dynamic_metadata(&rc, "com.example.other").get("flag"),
+            Some(&bool_value(true))
+        );
+    }
+
+    #[test]
+    fn test_dynamic_metadata_attached_to_all_phases_and_immediate_response_and_reset_clears_outbound(
+    ) {
+        let phases = [
+            RequestPhase::RequestHeaders,
+            RequestPhase::RequestBody,
+            RequestPhase::RequestTrailers,
+            RequestPhase::ResponseHeaders,
+            RequestPhase::ResponseBody,
+            RequestPhase::ResponseTrailers,
+        ];
+        for phase in phases {
+            let mut rc = RequestContext::new();
+            rc.reset_phase().unwrap();
+            rc.set_phase(phase);
+            assert!(rc
+                .set_dynamic_metadata("com.example.phase", "name", string_value("x"))
+                .is_ok());
+            let resp = rc.get_response(phase).unwrap().unwrap();
+            assert!(resp.dynamic_metadata.is_some());
+            assert_eq!(
+                namespace_dynamic_metadata(&rc, "com.example.phase").get("name"),
+                Some(&string_value("x"))
+            );
+
+            rc.clear_dynamic_metadata();
+            let resp = rc.get_response(phase).unwrap().unwrap();
+            assert!(resp.dynamic_metadata.is_none());
+        }
+
+        // Immediate responses carry the pending dynamic metadata.
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        assert!(rc
+            .set_dynamic_metadata("com.example.auth", "denied", bool_value(true))
+            .is_ok());
+        rc.cancel_request(403, &HashMap::new(), &[]).unwrap();
+        let resp = rc
+            .get_response(RequestPhase::RequestHeaders)
+            .unwrap()
+            .unwrap();
+        assert!(resp.dynamic_metadata.is_some());
+        assert_eq!(
+            namespace_dynamic_metadata(&rc, "com.example.auth").get("denied"),
+            Some(&bool_value(true))
+        );
+
+        // Phase resets clear the pending outbound dynamic metadata, while the
+        // inbound metadata and attributes persist across phases.
+        rc.reset_phase().unwrap();
+        assert!(rc.response.dynamic_metadata.is_none());
+        assert!(rc.metadata.is_empty());
+        assert!(rc.attributes.is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_metadata_inbound_merge_and_persistence_across_phases() {
+        let mut rc = RequestContext::new();
+        let mut fields = HashMap::new();
+        fields.insert("sub".to_string(), string_value("alice"));
+        fields.insert("role".to_string(), string_value("reader"));
+        let mut filter_metadata = HashMap::new();
+        filter_metadata.insert(
+            "com.example.auth".to_string(),
+            Struct {
+                fields: fields.clone(),
+            },
+        );
+        let mut typed_filter_metadata = HashMap::new();
+        typed_filter_metadata.insert(
+            "com.example.typed".to_string(),
+            Any {
+                type_url: "type.googleapis.com/google.protobuf.StringValue".to_string(),
+                value: b"typed-v1".to_vec(),
+            },
+        );
+        rc.merge_metadata_context(&envoy_metadata(filter_metadata, typed_filter_metadata));
+
+        let mut attr_fields = HashMap::new();
+        attr_fields.insert("request.protocol".to_string(), string_value("HTTP/2"));
+        attr_fields.insert("xds.route_name".to_string(), string_value("r1"));
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "envoy.filters.http.ext_proc".to_string(),
+            Struct {
+                fields: attr_fields,
+            },
+        );
+        rc.merge_attributes(&attrs);
+
+        assert_eq!(
+            rc.metadata
+                .get("com.example.auth")
+                .and_then(|m| m.get("sub")),
+            Some(&string_value("alice"))
+        );
+        assert_eq!(
+            rc.typed_metadata
+                .get("com.example.typed")
+                .map(|a| a.type_url.clone()),
+            Some("type.googleapis.com/google.protobuf.StringValue".to_string())
+        );
+        assert_eq!(
+            rc.attributes.get("request.protocol"),
+            Some(&string_value("HTTP/2"))
+        );
+
+        // Phase resets clear only the outbound pending metadata; the inbound
+        // metadata and attributes persist across phases of the stream.
+        rc.reset_phase().unwrap();
+        assert!(rc.response.dynamic_metadata.is_none());
+        assert_eq!(
+            rc.metadata
+                .get("com.example.auth")
+                .and_then(|m| m.get("sub")),
+            Some(&string_value("alice"))
+        );
+        assert_eq!(
+            rc.attributes.get("request.protocol"),
+            Some(&string_value("HTTP/2"))
+        );
     }
 }
