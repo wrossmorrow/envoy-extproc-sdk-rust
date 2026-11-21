@@ -1,5 +1,34 @@
 # Migration notes
 
+## v0.4.0 (from v0.3.x)
+
+This release is purely additive and has no breaking source-level API changes — existing `RequestProcessor` implementations compile and run without modification.
+
+### Dynamic processing mode overrides (`mode_override`)
+
+Added per-request dynamic processing mode overrides for the request headers and response headers phases (requires `allow_mode_override: true` on Envoy's `ext_proc` filter):
+
+- Exported the typed mode enums `HeaderSendMode` (`Default`, `Send`, `Skip`) and `BodySendMode` (`None`, `Streamed`, `Buffered`, `BufferedPartial`, `FullDuplexStreamed`, `Grpc`), the `ModeOverride` struct, and `ModeOverride::to_envoy_processing_mode()`.
+- Added `RequestContext::override_mode(ModeOverride) -> Result<(), Error>`, `RequestContext::clear_mode_override()`, and `RequestContext::skip_remaining_phases() -> Result<(), Error>` (the override is cleared between phases by `reset_phase` and omitted on `ImmediateResponse`).
+- Updated the masker example and `examples/envoy.yaml` to opt dynamically into buffered bodies.
+- **Envoy notes**: `BodySendMode` has no `DEFAULT` value (`BodySendMode::None` is `0`). Additionally, when Envoy configures `allowed_override_modes`, Envoy resolves `DEFAULT` header/trailer fields in the response mode override against the filter's static `processing_mode` before checking the allowlist, so `allowed_override_modes` entries must specify explicit `SEND`/`SKIP` values rather than `DEFAULT`.
+
+### Stream protocol configuration (`protocol_config`)
+
+- Added `ProtocolConfig` (`request_body_mode`, `response_body_mode`, `send_body_without_waiting_for_header_response`) and `RequestContext::protocol_config: Option<ProtocolConfig>`, captured from the first `ProcessingRequest` of each stream (including under `request_header_mode: SKIP`) and retained across all phases of that stream.
+- Added `RequestContext::default_mode_override() -> ModeOverride`, pre-populated with the captured protocol config's body send modes so callers overriding a single body direction do not zero the other direction to `BodySendMode::None`.
+
+### Dynamic metadata and CEL attributes (`metadata_context`, `dynamic_metadata`, `attributes`)
+
+- **Inbound (`RequestContext`)**: Added stream-accumulated `Metadata` and `TypedMetadata` (from envoy `metadata_context`, i.e. `metadata_options.forwarding_namespaces`) and `Attributes` (flattened evaluated envoy/CEL `request_attributes` / `response_attributes`).
+- **Outbound (`RequestContext`)**: Added per-phase `set_dynamic_metadata`, `set_dynamic_metadata_namespace` (all-or-nothing), and `clear_dynamic_metadata`, attached across all phase responses as well as `ImmediateResponse` (`CancelRequest`).
+- **Envoy notes**: Returned namespaces are ignored unless listed in `metadata_options.receiving_namespaces.untyped`.
+
+### Per-message timeout overrides (`override_message_timeout`)
+
+- Added `RequestContext::override_message_timeout(Duration) -> Result<(), Error>`, which immediately transmits an interim `ProcessingResponse` mid-phase asking envoy to replace the current phase's `message_timeout` timer (`1ms <= timeout <= max_message_timeout`, at most once per phase, and a safe no-op when the context runs in envoy `observability_mode`).
+- **Operational warning**: `ext_proc` executes inline on envoy's request/response hot path. Extending per-message timeouts pins downstream streams and any `BodySendMode::Buffered` bodies in memory, sends an extra gRPC message on the stream, and multiplies concurrent active streams under load (`ServerOptions::MaxConcurrentStreams`, envoy cluster circuit breakers, and route timeouts must be sized accordingly). Envoy ignores overrides unless `max_message_timeout >= timeout` is configured (`0` by default = disabled).
+
 ## v0.3.0 (from v0.2.x)
 
 This release has no breaking source-level API changes — existing

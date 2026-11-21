@@ -16,6 +16,8 @@ The SDK is implemented as the `envoy_extproc_sdk` crate and uses the [`envoy-typ
 
 Several examples are provided here in the [examples](#examples), which can be reviewed to examine usage patterns.
 
+> Upgrading from a `v0.3.x` release? See [MIGRATION.md](MIGRATION.md); this release adds the `mode_override`, `protocol_config`, dynamic metadata & CEL attributes, and `override_message_timeout` features.
+>
 > Upgrading from a `v0.2.x` release? See [MIGRATION.md](MIGRATION.md); this release adds the exported server constructor and observability mode and enforces header append actions.
 >
 > Looking for supported Envoy versions, `ext_proc` v3 feature coverage, or the conformance roadmap? See [CONFORMANCE.md](CONFORMANCE.md) and [docs/CONFORMANCE_PLAN.md](docs/CONFORMANCE_PLAN.md).
