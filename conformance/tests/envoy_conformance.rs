@@ -15,14 +15,16 @@ use std::time::Duration;
 
 use envoy_conformance::{
     check_docker_available, mode_override_allowlist_denied_handler,
-    mode_override_allowlist_ok_handler, mode_override_disabled_handler,
-    mode_override_full_resp_handler, mode_override_handler, mode_override_resp_stream_handler,
-    mode_override_skip_handler, register_scenario_handlers, start_conformance_extproc_server,
-    start_envoy_runner, upstream_host_for_runner, CaseHandler, ConformanceExtProcServer,
-    ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
+    mode_override_allowlist_ok_handler, mode_override_default_from_protocol_config_handler,
+    mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,
+    mode_override_resp_stream_handler, mode_override_skip_handler, protocol_config_handler,
+    register_scenario_handlers, start_conformance_extproc_server, start_envoy_runner,
+    upstream_host_for_runner, CaseHandler, ConformanceExtProcServer, ConformanceProcessor,
+    EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
 };
 use envoy_extproc_sdk::{
-    AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
+    AllHeaders, BodySendMode, Error, HeaderValue, ProcessingOptions, ProtocolConfig,
+    RequestContext, RequestPhase,
 };
 use envoy_types::pb::envoy::config::core::v3::header_value_option::HeaderAppendAction;
 use http_body::Frame;
@@ -1303,6 +1305,208 @@ fn mode_override() {
             .await;
             assert_eq!(denied_resp.status, StatusCode::OK);
             assert!(!denied_saw_body.load(Ordering::SeqCst));
+            assert_no_spurious(h).await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 10b. Protocol configuration (protocol_config)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn protocol_config() {
+    run_conformance(|h| async move {
+        // Sub-scenario: the envoy protocol configuration is captured from the
+        // first message of the stream and retained across the phases, and
+        // reflects the filter's configured body modes for the probed paths.
+        let cases = [
+            (
+                "none",
+                ProtocolConfig {
+                    request_body_mode: BodySendMode::None,
+                    response_body_mode: BodySendMode::None,
+                    send_body_without_waiting_for_header_response: false,
+                },
+                false,
+            ),
+            (
+                "buffered",
+                ProtocolConfig {
+                    request_body_mode: BodySendMode::Buffered,
+                    response_body_mode: BodySendMode::Buffered,
+                    send_body_without_waiting_for_header_response: false,
+                },
+                true,
+            ),
+            (
+                "streamed",
+                ProtocolConfig {
+                    request_body_mode: BodySendMode::Streamed,
+                    response_body_mode: BodySendMode::Streamed,
+                    send_body_without_waiting_for_header_response: false,
+                },
+                true,
+            ),
+            (
+                "buffered-partial",
+                ProtocolConfig {
+                    request_body_mode: BodySendMode::BufferedPartial,
+                    response_body_mode: BodySendMode::BufferedPartial,
+                    send_body_without_waiting_for_header_response: false,
+                },
+                true,
+            ),
+        ];
+
+        for (name, want, expect_bodies) in cases {
+            let case_id = format!("proto-cfg-{name}");
+            let recorder = Arc::new(Mutex::new(HashMap::new()));
+            h.default_proc
+                .register(&case_id, protocol_config_handler(recorder.clone()));
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                &format!("/mode/{name}/protocol-config"),
+                &[("x-conformance-case", &case_id)],
+                full_body(b"probe-body"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+
+            let expected_phases: &[&str] = if expect_bodies {
+                &["req_headers", "resp_headers", "req_body", "resp_body"]
+            } else {
+                &["req_headers", "resp_headers"]
+            };
+            {
+                let observed = recorder.lock().unwrap();
+                for phase in expected_phases.iter().copied() {
+                    let got = observed.get(phase);
+                    assert_eq!(
+                        got,
+                        Some(&want),
+                        "phase {phase} ProtocolConfig = {got:?}, want {want:?}"
+                    );
+                }
+                if !expect_bodies {
+                    assert!(!observed.contains_key("req_body"));
+                    assert!(!observed.contains_key("resp_body"));
+                }
+            }
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: with `request_header_mode: SKIP`, the protocol
+        // configuration arrives with the response headers phase and must be
+        // captured there (the request headers phase never runs).
+        {
+            let case_id = "proto-cfg-skip-req-hdrs";
+            let recorder = Arc::new(Mutex::new(HashMap::new()));
+            h.default_proc
+                .register(case_id, protocol_config_handler(recorder.clone()));
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::GET,
+                "/mode/skip-req-headers/protocol-config",
+                &[("x-conformance-case", case_id)],
+                full_body(b""),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+
+            {
+                let observed = recorder.lock().unwrap();
+                assert_eq!(
+                    observed.get("resp_headers"),
+                    Some(&ProtocolConfig {
+                        request_body_mode: BodySendMode::None,
+                        response_body_mode: BodySendMode::Buffered,
+                        send_body_without_waiting_for_header_response: false,
+                    })
+                );
+                assert_eq!(
+                    observed.get("resp_body"),
+                    Some(&ProtocolConfig {
+                        request_body_mode: BodySendMode::None,
+                        response_body_mode: BodySendMode::Buffered,
+                        send_body_without_waiting_for_header_response: false,
+                    })
+                );
+                assert!(observed.get("req_headers").is_none());
+            }
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: `send_body_without_waiting_for_header_response` is
+        // surfaced on the captured protocol configuration, alongside the
+        // streamed body modes of the `send-body-without-waiting` profile.
+        {
+            let case_id = "proto-cfg-no-wait";
+            let recorder = Arc::new(Mutex::new(HashMap::new()));
+            h.default_proc
+                .register(case_id, protocol_config_handler(recorder.clone()));
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/send-body-without-waiting/check",
+                &[("x-conformance-case", case_id)],
+                full_body(b"fast-stream-body"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(echo.body, "fast-stream-body");
+
+            {
+                let observed = recorder.lock().unwrap();
+                let want = ProtocolConfig {
+                    request_body_mode: BodySendMode::Streamed,
+                    response_body_mode: BodySendMode::Streamed,
+                    send_body_without_waiting_for_header_response: true,
+                };
+                for phase in ["req_headers", "req_body", "resp_headers", "resp_body"] {
+                    assert_eq!(
+                        observed.get(phase),
+                        Some(&want),
+                        "phase {phase} ProtocolConfig = {:?}, want {want:?}",
+                        observed.get(phase)
+                    );
+                }
+            }
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: `DefaultModeOverride` pre-populates body modes from
+        // the captured protocol configuration, preserving the response body
+        // mode until the processor overrides it.
+        {
+            let case_id = "proto-cfg-default-override";
+            let saw_response_body = Arc::new(AtomicBool::new(false));
+            h.default_proc.register(
+                case_id,
+                mode_override_default_from_protocol_config_handler(saw_response_body.clone()),
+            );
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/mode-override-resp-buffered/check",
+                &[("x-conformance-case", case_id)],
+                full_body(b"raw-req"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(echo.body, "mutated-req");
+            assert!(saw_response_body.load(Ordering::SeqCst));
             assert_no_spurious(h).await;
         }
     });

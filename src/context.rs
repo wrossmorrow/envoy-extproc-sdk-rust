@@ -19,6 +19,7 @@ use envoy_types::pb::envoy::service::ext_proc::v3::CommonResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::HeaderMutation;
 use envoy_types::pb::envoy::service::ext_proc::v3::ImmediateResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse;
+use envoy_types::pb::envoy::service::ext_proc::v3::ProtocolConfiguration;
 
 use crate::headers::AllHeaders;
 use crate::Error;
@@ -318,6 +319,69 @@ impl ModeOverride {
     }
 }
 
+impl RequestContext {
+    /// Returns a [`ModeOverride`] pre-populated with envoy's configured body
+    /// modes from the [`ProtocolConfig`](RequestContext::protocol_config) (when
+    /// present) and [`HeaderSendMode::Default`] for header and trailer modes.
+    ///
+    /// Because envoy's body send mode has no "keep default" enum (`BodySendMode::None`
+    /// means "do not send"), callers overriding a single body mode during the
+    /// request headers phase can start from `DefaultModeOverride()` to preserve
+    /// the other direction's body mode.
+    pub fn default_mode_override(&self) -> ModeOverride {
+        let Some(pc) = &self.protocol_config else {
+            return ModeOverride::default();
+        };
+        ModeOverride {
+            response_header_mode: HeaderSendMode::Default,
+            request_body_mode: pc.request_body_mode,
+            response_body_mode: pc.response_body_mode,
+            request_trailer_mode: HeaderSendMode::Default,
+            response_trailer_mode: HeaderSendMode::Default,
+        }
+    }
+}
+
+/// The envoy ext_proc filter's protocol configuration for the current stream,
+/// captured from the first
+/// [`ProcessingRequest`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest)
+/// of the stream and retained across the phases of that stream.
+///
+/// Envoy sends the protocol configuration only on the first message of a
+/// processing stream; the SDK surfaces it on the [`RequestContext`] so
+/// processors can adapt to the filter's configured body modes instead of
+/// assuming defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ProtocolConfig {
+    /// How envoy should send the request body in subsequent phases, from the
+    /// filter's `processing_mode.request_body_mode`.
+    pub request_body_mode: BodySendMode,
+    /// How envoy should send the response body in subsequent phases, from the
+    /// filter's `processing_mode.response_body_mode`.
+    pub response_body_mode: BodySendMode,
+    /// Whether envoy should send the request body without waiting for the
+    /// response headers phase to complete, from the filter's
+    /// `send_body_without_waiting_for_header_response`.
+    pub send_body_without_waiting_for_header_response: bool,
+}
+
+impl ProtocolConfig {
+    /// Convert an envoy
+    /// [`ProtocolConfiguration`](envoy_types::pb::envoy::service::ext_proc::v3::ProtocolConfiguration)
+    /// into the typed SDK [`ProtocolConfig`], rejecting body modes the envoy
+    /// protocol does not define.
+    pub fn from_proto(pc: &ProtocolConfiguration) -> Result<Self, Error> {
+        Ok(Self {
+            request_body_mode: BodySendMode::try_from(pc.request_body_mode)
+                .map_err(|_| "invalid protocol_config: unknown request body mode".to_string())?,
+            response_body_mode: BodySendMode::try_from(pc.response_body_mode)
+                .map_err(|_| "invalid protocol_config: unknown response body mode".to_string())?,
+            send_body_without_waiting_for_header_response: pc
+                .send_body_without_waiting_for_header_response,
+        })
+    }
+}
+
 /// The mutable, phase-scoped response being assembled by a processor.
 #[derive(Clone, Default)]
 pub struct PhaseResponse {
@@ -386,6 +450,13 @@ pub struct RequestContext {
     /// 0`).
     pub observability_mode: bool,
 
+    /// The envoy ext_proc filter's protocol configuration for the current
+    /// stream, captured from the first
+    /// [`ProcessingRequest`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest)
+    /// of the stream and retained across the phases of that stream. `None` when
+    /// envoy did not send a `protocol_config`.
+    pub protocol_config: Option<ProtocolConfig>,
+
     /// Arbitrary custom values shared across phases of a request, stored in a
     /// type-keyed map ([`http::Extensions`]) so values are strongly typed
     /// rather than string-keyed trait objects.
@@ -428,6 +499,7 @@ impl RequestContext {
             duration: Duration::ZERO,
             end_of_stream: false,
             observability_mode: false,
+            protocol_config: None,
             data: Extensions::new(),
             phase: RequestPhase::Undetermined,
             response: PhaseResponse::default(),
@@ -1279,6 +1351,85 @@ mod tests {
             .unwrap();
         assert!(resp.mode_override.is_none());
         assert!(resp.response.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol configuration (envoy `ProcessingRequest.protocol_config`)
+    // -----------------------------------------------------------------------
+
+    fn envoy_protocol_configuration(
+        request_body_mode: i32,
+        response_body_mode: i32,
+        send_body_without_waiting_for_header_response: bool,
+    ) -> ProtocolConfiguration {
+        ProtocolConfiguration {
+            request_body_mode,
+            response_body_mode,
+            send_body_without_waiting_for_header_response,
+        }
+    }
+
+    #[test]
+    fn test_protocol_config_from_proto() {
+        let pc = ProtocolConfig::from_proto(&envoy_protocol_configuration(
+            BodySendMode::Buffered as i32,
+            BodySendMode::Streamed as i32,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(pc.request_body_mode, BodySendMode::Buffered);
+        assert_eq!(pc.response_body_mode, BodySendMode::Streamed);
+        assert!(pc.send_body_without_waiting_for_header_response);
+
+        // Unknown body modes are rejected.
+        assert!(ProtocolConfig::from_proto(&envoy_protocol_configuration(-1, -1, false)).is_err());
+    }
+
+    #[test]
+    fn test_default_mode_override_handles_nil_and_populated() {
+        // Without a protocol config, the default override is the zero override.
+        let rc = RequestContext::new();
+        assert_eq!(rc.default_mode_override(), ModeOverride::default());
+
+        let mut rc = RequestContext::new();
+        rc.protocol_config = Some(ProtocolConfig {
+            request_body_mode: BodySendMode::None,
+            response_body_mode: BodySendMode::Buffered,
+            send_body_without_waiting_for_header_response: true,
+        });
+        let mode = rc.default_mode_override();
+        assert_eq!(mode.response_header_mode, HeaderSendMode::Default);
+        assert_eq!(mode.request_body_mode, BodySendMode::None);
+        assert_eq!(mode.response_body_mode, BodySendMode::Buffered);
+        assert_eq!(mode.request_trailer_mode, HeaderSendMode::Default);
+        assert_eq!(mode.response_trailer_mode, HeaderSendMode::Default);
+
+        // The default override preserves the envoy-configured response body
+        // mode until the processor overrides it.
+        let envoy_mode = mode
+            .to_envoy_processing_mode()
+            .expect("expected valid default mode override");
+        assert_eq!(
+            envoy_mode.response_body_mode,
+            i32::from(BodySendMode::Buffered)
+        );
+    }
+
+    #[test]
+    fn test_reset_and_init_preserve_protocol_config() {
+        let mut rc = RequestContext::new();
+        let expected = ProtocolConfig {
+            request_body_mode: BodySendMode::Buffered,
+            response_body_mode: BodySendMode::Streamed,
+            send_body_without_waiting_for_header_response: true,
+        };
+        rc.protocol_config = Some(expected);
+
+        rc.reset_phase().unwrap();
+        assert_eq!(rc.protocol_config, Some(expected));
+
+        rc.reset_phase().unwrap();
+        assert_eq!(rc.protocol_config, Some(expected));
     }
 
     #[test]

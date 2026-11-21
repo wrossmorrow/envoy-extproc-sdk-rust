@@ -11,7 +11,7 @@ use envoy_types::pb::envoy::service::ext_proc::v3::processing_request::Request a
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest;
 use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse;
 
-use crate::context::{header_key_set, HeaderValue, RequestContext, RequestPhase};
+use crate::context::{header_key_set, HeaderValue, ProtocolConfig, RequestContext, RequestPhase};
 use crate::headers::{gen_headers, AllHeaders};
 use crate::metrics::Metrics;
 use crate::options::ProcessingOptions;
@@ -203,6 +203,12 @@ impl GenericExtProcServer {
         let options = &self.options;
         let obs = proc_req.observability_mode;
         rc.observability_mode = obs;
+        // Envoy encodes the protocol configuration only on the first message
+        // of a processing stream; capture it when present and retain it across
+        // the phases of the stream.
+        if let Some(pc) = &proc_req.protocol_config {
+            rc.protocol_config = Some(ProtocolConfig::from_proto(pc)?);
+        }
 
         let outcome = async {
             match &proc_req.request {
@@ -765,6 +771,7 @@ mod tests {
     use envoy_types::pb::envoy::service::ext_proc::v3::HttpHeaders;
     use envoy_types::pb::envoy::service::ext_proc::v3::HttpTrailers;
     use envoy_types::pb::envoy::service::ext_proc::v3::ProcessingRequest;
+    use envoy_types::pb::envoy::service::ext_proc::v3::ProtocolConfiguration;
 
     use envoy_types::pb::envoy::config::core::v3::HeaderMap as EnvoyHeaderMap;
     use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
@@ -773,7 +780,7 @@ mod tests {
 
     use crate::context::{
         default_phase_if_invalid, request_phase_to_string, BodySendMode, HeaderSendMode,
-        ModeOverride, RequestContext, RequestPhase,
+        ModeOverride, ProtocolConfig, RequestContext, RequestPhase,
     };
     use crate::headers::AllHeaders;
 
@@ -1357,6 +1364,124 @@ mod tests {
             .find(|f| f.name() == "extproc_errored_streams")
             .expect("expected errored streams family");
         assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_protocol_config_captured_and_retained_across_phases() {
+        // The envoy protocol configuration arrives with the first message of
+        // the stream and must be captured, then retained across the phases of
+        // that stream (phase resets must not clear it).
+        let server = GenericExtProcServer::new(
+            "test".to_string(),
+            Arc::new(TestProcessor::new("test", Some(ProcessingOptions::new()))),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+
+        // No protocol config on the wire: the context keeps none.
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "POST")])),
+            false,
+        ))));
+        server.process_phase(&req, &mut rc).await.unwrap();
+        assert!(rc.protocol_config.is_none());
+
+        // Protocol configuration arrives with the first message: captured, and
+        // retained across the phases of the stream.
+        let mut req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(
+            http_headers(Some(&envoy_header_map(&[(":method", "POST")])), false),
+        )));
+        req.protocol_config = Some(ProtocolConfiguration {
+            request_body_mode: i32::from(BodySendMode::Buffered),
+            response_body_mode: i32::from(BodySendMode::Streamed),
+            send_body_without_waiting_for_header_response: true,
+        });
+        server.process_phase(&req, &mut rc).await.unwrap();
+        let pc = rc
+            .protocol_config
+            .as_ref()
+            .expect("expected protocol config");
+        assert_eq!(pc.request_body_mode, BodySendMode::Buffered);
+        assert_eq!(pc.response_body_mode, BodySendMode::Streamed);
+        assert!(pc.send_body_without_waiting_for_header_response);
+
+        for phase_req in [
+            ProcessingRequestOneof::RequestBody(HttpBody {
+                body: b"payload".to_vec(),
+                end_of_stream: true,
+                end_of_stream_without_message: false,
+                grpc_message_compressed: false,
+                drain_complete: false,
+            }),
+            ProcessingRequestOneof::ResponseHeaders(HttpHeaders {
+                headers: Some(envoy_header_map(&[])),
+                attributes: HashMap::new(),
+                end_of_stream: true,
+            }),
+            ProcessingRequestOneof::ResponseBody(HttpBody {
+                body: b"resp".to_vec(),
+                end_of_stream: true,
+                end_of_stream_without_message: false,
+                grpc_message_compressed: false,
+                drain_complete: false,
+            }),
+        ] {
+            let req = processing_request(Some(phase_req));
+            server.process_phase(&req, &mut rc).await.unwrap();
+            let pc = rc
+                .protocol_config
+                .as_ref()
+                .expect("expected protocol config");
+            assert_eq!(pc.request_body_mode, BodySendMode::Buffered);
+            assert_eq!(pc.response_body_mode, BodySendMode::Streamed);
+            assert!(pc.send_body_without_waiting_for_header_response);
+        }
+
+        // The protocol config is captured even when the request headers phase
+        // was skipped (i.e. it arrives with the response headers phase).
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let mut req =
+            processing_request(Some(ProcessingRequestOneof::ResponseHeaders(HttpHeaders {
+                headers: Some(envoy_header_map(&[])),
+                attributes: HashMap::new(),
+                end_of_stream: true,
+            })));
+        req.protocol_config = Some(ProtocolConfiguration {
+            request_body_mode: i32::from(BodySendMode::None),
+            response_body_mode: i32::from(BodySendMode::Buffered),
+            send_body_without_waiting_for_header_response: false,
+        });
+        server.process_phase(&req, &mut rc).await.unwrap();
+        let pc = rc
+            .protocol_config
+            .as_ref()
+            .expect("expected protocol config");
+        assert_eq!(pc.request_body_mode, BodySendMode::None);
+        assert_eq!(pc.response_body_mode, BodySendMode::Buffered);
+        assert!(!pc.send_body_without_waiting_for_header_response);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_default_mode_override_uses_protocol_config() {
+        // A processor that starts from the context's default mode override
+        // preserves envoy's configured response body mode until it overrides.
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.protocol_config = Some(ProtocolConfig {
+            request_body_mode: BodySendMode::None,
+            response_body_mode: BodySendMode::Buffered,
+            send_body_without_waiting_for_header_response: false,
+        });
+
+        let mode = rc.default_mode_override();
+        assert_eq!(mode.response_header_mode, HeaderSendMode::Default);
+        assert_eq!(mode.request_body_mode, BodySendMode::None);
+        assert_eq!(mode.response_body_mode, BodySendMode::Buffered);
+        assert_eq!(mode.request_trailer_mode, HeaderSendMode::Default);
+        assert_eq!(mode.response_trailer_mode, HeaderSendMode::Default);
     }
 
     #[tokio::test]
