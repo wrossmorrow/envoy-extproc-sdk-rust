@@ -1261,5 +1261,15 @@ mod tests {
             .collect();
         assert!(prefixes.contains(&"/profile/metadata-chain"));
         assert!(prefixes.contains(&"/profile/attributes"));
+
+        // Envoy requires the router filter to be the terminal HTTP filter;
+        // any ext_proc filter placed after it makes the bootstrap invalid and
+        // the whole envoy process fail to start (conformance e2e stall/failure).
+        let last_filter = filters
+            .last()
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .expect("last http filter should be the router");
+        assert_eq!(last_filter, ROUTER_FILTER_NAME);
     }
 }
