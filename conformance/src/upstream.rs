@@ -9,15 +9,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+use http_body::Frame;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{HeaderMap, HeaderValue};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Header used by conformance scenarios to carry the active case ID.
 pub const CASE_HEADER: &str = "x-conformance-case";
@@ -28,6 +30,7 @@ const RAW_BODY_CONTENT_TYPE_HEADER: &str = "x-upstream-content-type";
 const DELAY_HEADER: &str = "x-upstream-delay-ms";
 const STATUS_HEADER: &str = "x-upstream-status";
 const CHUNKS_HEADER: &str = "x-upstream-chunks";
+const RESP_TRAILER_HEADER: &str = "x-upstream-resp-trailer";
 
 const DEFAULT_STATUS: u16 = 200;
 const DEFAULT_RAW_BODY_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
@@ -44,7 +47,7 @@ pub struct UpstreamEcho {
     pub path: String,
     pub raw_query: String,
     pub headers: HashMap<String, Vec<String>>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub trailers: HashMap<String, Vec<String>>,
     pub body: String,
     pub body_bytes: usize,
@@ -61,7 +64,7 @@ impl UpstreamServer {
     /// Start a new upstream echo server on an ephemeral loopback port.
     pub async fn start(name: &str) -> Result<Self, String> {
         let listener = Arc::new(
-            TcpListener::bind("127.0.0.1:0")
+            TcpListener::bind("0.0.0.0:0")
                 .await
                 .map_err(|e| format!("listen upstream {name:?}: {e}"))?,
         );
@@ -76,13 +79,6 @@ impl UpstreamServer {
         });
         let task = task_server.clone();
         tokio::spawn(async move {
-            let mut builder = auto::Builder::new(TokioExecutor::new());
-            let auto = builder.http2();
-            let svc_server = task.clone();
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let server = svc_server.clone();
-                async move { server.handle(req).await }
-            });
             loop {
                 let (io, _) = match task.listener.accept().await {
                     Ok(v) => v,
@@ -91,10 +87,22 @@ impl UpstreamServer {
                         break;
                     }
                 };
-                let conn = auto.serve_connection(hyper_util::rt::TokioIo::new(io), svc.clone());
-                if let Err(e) = conn.await {
-                    tracing::warn!("upstream {} connection error: {}", task.name, e);
-                }
+                let conn_server = task.clone();
+                let conn_name = task.name.clone();
+                tokio::spawn(async move {
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    let auto = builder.http2();
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let server = conn_server.clone();
+                        async move { server.handle(req).await }
+                    });
+                    if let Err(e) = auto
+                        .serve_connection(hyper_util::rt::TokioIo::new(io), svc)
+                        .await
+                    {
+                        tracing::warn!("upstream {} connection error: {}", conn_name, e);
+                    }
+                });
             }
         });
         Ok(UpstreamServer {
@@ -127,7 +135,7 @@ impl UpstreamServer {
     async fn handle(
         self: Arc<Self>,
         req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, std::io::Error> {
+    ) -> Result<Response<BoxBody<Bytes, std::io::Error>>, std::io::Error> {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path().to_string();
@@ -206,9 +214,58 @@ impl UpstreamServer {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             builder = builder.header(CASE_HEADER, value);
         }
-        let response = builder
-            .body(Full::new(Bytes::from(payload)))
-            .map_err(std::io::Error::other)?;
+        if !resp_trailers.is_empty() {
+            let names: Vec<String> = resp_trailers.keys().cloned().collect();
+            if let Ok(val) = HeaderValue::from_str(&names.join(", ")) {
+                builder = builder.header("trailer", val);
+            }
+        }
+        let body: BoxBody<Bytes, std::io::Error> = if chunks <= 1 && resp_trailers.is_empty() {
+            Full::new(Bytes::from(payload))
+                .map_err(|never| match never {})
+                .boxed()
+        } else {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
+            let trailer_map = resp_trailers;
+            tokio::spawn(async move {
+                let chunk_count = chunks.max(1) as usize;
+                let step = (payload.len() / chunk_count).max(1);
+                let mut offset = 0;
+                for i in 0..chunk_count {
+                    if offset >= payload.len() {
+                        break;
+                    }
+                    let end = if i + 1 == chunk_count {
+                        payload.len()
+                    } else {
+                        (offset + step).min(payload.len())
+                    };
+                    let slice = Bytes::copy_from_slice(&payload[offset..end]);
+                    offset = end;
+                    if tx.send(Ok(Frame::data(slice))).await.is_err() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                if payload.is_empty() {
+                    let _ = tx.send(Ok(Frame::data(Bytes::new()))).await;
+                }
+                if !trailer_map.is_empty() {
+                    let mut hmap = HeaderMap::new();
+                    for (k, v) in trailer_map {
+                        if let (Ok(name), Ok(val)) = (
+                            HeaderName::from_bytes(k.as_bytes()),
+                            HeaderValue::from_str(&v),
+                        ) {
+                            hmap.append(name, val);
+                        }
+                    }
+                    let _ = tx.send(Ok(Frame::trailers(hmap))).await;
+                }
+            });
+            StreamBody::new(ReceiverStream::new(rx)).boxed()
+        };
+        let response = builder.body(body).map_err(std::io::Error::other)?;
         Ok(response)
     }
 }
@@ -254,8 +311,18 @@ fn trailers_of(trailers: Option<&HeaderMap>) -> HashMap<String, Vec<String>> {
     out
 }
 
-fn response_trailers(_headers: &HeaderMap) -> HashMap<String, String> {
-    HashMap::new()
+fn response_trailers(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for val in headers.get_all(RESP_TRAILER_HEADER) {
+        if let Ok(s) = val.to_str() {
+            for part in s.split(',') {
+                if let Some((k, v)) = part.trim().split_once('=') {
+                    out.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn header_u64(headers: &HeaderMap, name: &str) -> u64 {
@@ -416,5 +483,30 @@ mod tests {
         server.close().unwrap();
         assert_eq!(status, StatusCode::from_u16(503).unwrap());
         assert_eq!(body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn response_trailers_are_sent_over_http1() {
+        let server = UpstreamServer::start("trailer-test").await.expect("start");
+        let client = client();
+        let uri: hyper::http::Uri = format!("{}/trailers", server.url()).parse().unwrap();
+        let req = hyper::Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("te", "trailers")
+            .header("x-upstream-resp-trailer", "x-up-trailer=up-tval")
+            .body(Full::new(HyperBytes::new()))
+            .unwrap();
+        let resp = client.request(req).await.expect("send");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let collected = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect");
+        let trailers = collected.trailers().cloned().unwrap_or_default();
+        assert_eq!(
+            trailers.get("x-up-trailer").and_then(|v| v.to_str().ok()),
+            Some("up-tval"),
+            "trailers={trailers:?}"
+        );
     }
 }

@@ -34,4 +34,4 @@ futures-util = "0.3"
 async-trait = "0.1"
 prometheus = "0.14"
 tracing = "0.1"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }

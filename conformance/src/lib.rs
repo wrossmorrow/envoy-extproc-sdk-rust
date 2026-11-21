@@ -18,12 +18,16 @@ pub mod scenarios;
 pub mod upstream;
 
 pub use bootstrap::{build_bootstrap, build_bootstrap_json, BootstrapParams};
-pub use envoy_runner::{check_docker_available, start_envoy_runner, EnvoyConfig, EnvoyRunner};
+pub use envoy_runner::{
+    check_docker_available, start_envoy_runner, upstream_host_for_runner, EnvoyConfig, EnvoyRunner,
+};
 pub use envoy_versions::{
     load_envoy_versions, resolve_envoy_version, sync_envoy_versions_from_eol, EnvoyVersionManifest,
 };
 pub use features::{load_features_manifest, FeatureSpec, FeatureStatus, FeaturesManifest};
-pub use processor::{CaseHandler, ConformanceProcessor};
+pub use processor::{
+    start_conformance_extproc_server, CaseHandler, ConformanceExtProcServer, ConformanceProcessor,
+};
 pub use report::{
     build_summary_report, load_results_dir, render_markdown_table, render_step_summary,
     update_conformance_doc, validate_strict, CellStatus, CellSummary, FeatureSummary,

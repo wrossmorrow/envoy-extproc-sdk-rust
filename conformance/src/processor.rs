@@ -8,7 +8,10 @@ use envoy_extproc_sdk::{
     AllHeaders, Error, GenericExtProcServer, Metrics, ProcessingOptions, RequestContext,
     RequestPhase, RequestProcessor,
 };
+use envoy_types::pb::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use prometheus::Registry;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 
 /// Header used by conformance scenarios to route a request to its registered
 /// case handler.
@@ -304,6 +307,43 @@ impl ConformanceExtProcServer {
     pub fn close(&self, grace_period_seconds: i32) -> Result<(), Error> {
         self.server.close(grace_period_seconds)
     }
+}
+
+/// Start an in-process gRPC `ExternalProcessor` server for `processor` on an
+/// ephemeral `0.0.0.0:0` port and return the server handle plus bound port.
+pub async fn start_conformance_extproc_server(
+    processor: ConformanceProcessor,
+) -> Result<(ConformanceExtProcServer, u16), Error> {
+    let metrics = Metrics::new();
+    let opts = processor.options().clone();
+    let server = GenericExtProcServer::new_with_processor(
+        Some(Arc::new(processor)),
+        Some(opts),
+        metrics.clone(),
+    )?;
+    let handle = ConformanceExtProcServer::new(server.clone(), metrics);
+
+    let listener = TcpListener::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("bind conformance ext_proc server: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("conformance ext_proc server local addr: {e}"))?
+        .port();
+
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        if let Err(e) = tonic::transport::Server::builder()
+            .max_concurrent_streams(1024)
+            .add_service(ExternalProcessorServer::new(server))
+            .serve_with_incoming(incoming)
+            .await
+        {
+            tracing::warn!("conformance ext_proc server stopped: {e}");
+        }
+    });
+
+    Ok((handle, port))
 }
 
 #[cfg(test)]

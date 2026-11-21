@@ -2,6 +2,7 @@
 //! conformance scenarios and queries its admin interface.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +40,19 @@ pub struct EnvoyConfig {
     pub admin_port: u16,
     /// Envoy bootstrap configuration (JSON) used when launching Envoy.
     pub bootstrap_json: String,
+}
+
+static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Return `"127.0.0.1"` when `ENVOY_BIN` is configured, or
+/// `"host.docker.internal"` when Envoy runs inside Docker.
+pub fn upstream_host_for_runner() -> String {
+    if let Ok(envoy_bin) = std::env::var("ENVOY_BIN") {
+        if !envoy_bin.is_empty() {
+            return "127.0.0.1".to_string();
+        }
+    }
+    "host.docker.internal".to_string()
 }
 
 /// Manages a live Envoy proxy instance (containerized or via `ENVOY_BIN`) for
@@ -101,9 +115,9 @@ impl EnvoyRunner {
 
     /// Stop the Envoy container or child process.
     pub async fn close(&mut self) -> Result<(), Error> {
-        if let Some(name) = &self.container_name {
+        if let Some(name) = self.container_name.take() {
             let output = Command::new("docker")
-                .args(["rm", "-f", name])
+                .args(["rm", "-f", &name])
                 .output()
                 .await
                 .map_err(|e| format!("docker rm -f {name} failed: {e}"))?;
@@ -121,6 +135,19 @@ impl EnvoyRunner {
             let _ = child.wait().await;
         }
         Ok(())
+    }
+}
+
+impl Drop for EnvoyRunner {
+    fn drop(&mut self) {
+        if let Some(name) = self.container_name.take() {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &name])
+                .output();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
     }
 }
 
@@ -237,8 +264,7 @@ async fn wait_ready(runner: &mut EnvoyRunner, timeout: Duration) -> Result<(), E
             }
         }
         let url = format!("{}/ready", runner.admin_url());
-        let status = get_status(&client, &url).await?;
-        if status == StatusCode::OK {
+        if let Ok(StatusCode::OK) = get_status(&client, &url).await {
             return Ok(());
         }
         if tokio::time::Instant::now() > deadline {
@@ -293,7 +319,23 @@ async fn start_binary_envoy(
         cfg.admin_port
     };
 
-    let bootstrap_json = bootstrap_json_from_cfg(cfg)?;
+    let resolved_cfg = EnvoyConfig {
+        version: version.to_string(),
+        upstream_host: if cfg.upstream_host.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            cfg.upstream_host.clone()
+        },
+        primary_upstream_port: cfg.primary_upstream_port,
+        secondary_upstream_port: cfg.secondary_upstream_port,
+        ext_proc_port: cfg.ext_proc_port,
+        abort_ext_proc_port: cfg.abort_ext_proc_port,
+        secondary_ext_proc_port: cfg.secondary_ext_proc_port,
+        listener_port,
+        admin_port,
+        bootstrap_json: cfg.bootstrap_json.clone(),
+    };
+    let bootstrap_json = bootstrap_json_from_cfg(&resolved_cfg)?;
     let mut cmd = Command::new(envoy_bin);
     cmd.args(["--config-yaml", &bootstrap_json])
         .args(["--log-level", "warn"])
@@ -345,8 +387,34 @@ async fn start_binary_envoy(
 
 async fn start_docker_envoy(version: &str, cfg: &EnvoyConfig) -> Result<EnvoyRunner, Error> {
     check_docker_available().await?;
-    let bootstrap_json = bootstrap_json_from_cfg(cfg)?;
-    let container_name = format!("extproc-conformance-{}", std::process::id());
+    let resolved_cfg = EnvoyConfig {
+        version: version.to_string(),
+        upstream_host: if cfg.upstream_host.is_empty() {
+            "host.docker.internal".to_string()
+        } else {
+            cfg.upstream_host.clone()
+        },
+        primary_upstream_port: cfg.primary_upstream_port,
+        secondary_upstream_port: cfg.secondary_upstream_port,
+        ext_proc_port: cfg.ext_proc_port,
+        abort_ext_proc_port: cfg.abort_ext_proc_port,
+        secondary_ext_proc_port: cfg.secondary_ext_proc_port,
+        listener_port: if cfg.listener_port == 0 {
+            DOCKER_LISTENER_PORT
+        } else {
+            cfg.listener_port
+        },
+        admin_port: if cfg.admin_port == 0 {
+            DOCKER_ADMIN_PORT
+        } else {
+            cfg.admin_port
+        },
+        bootstrap_json: cfg.bootstrap_json.clone(),
+    };
+    let bootstrap_json = bootstrap_json_from_cfg(&resolved_cfg)?;
+    let seq = CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let container_name = format!("extproc-conformance-{}-{}", std::process::id(), seq);
+    let image = format!("envoyproxy/envoy:{version}");
     let run_cmd = Command::new("docker")
         .args([
             "run",
@@ -357,9 +425,9 @@ async fn start_docker_envoy(version: &str, cfg: &EnvoyConfig) -> Result<EnvoyRun
             "--add-host",
             "host.docker.internal:host-gateway",
         ])
-        .args(["-p", &format!("127.0.0.1::{}", DOCKER_LISTENER_PORT)])
-        .args(["-p", &format!("127.0.0.1::{}", DOCKER_ADMIN_PORT)])
-        .arg("envoyproxy/envoy")
+        .args(["-p", &format!("127.0.0.1::{}", resolved_cfg.listener_port)])
+        .args(["-p", &format!("127.0.0.1::{}", resolved_cfg.admin_port)])
+        .arg(&image)
         .args(["envoy", "--config-yaml", &bootstrap_json])
         .args(["--log-level", "warn"])
         .args(["--concurrency", "2"])
@@ -383,8 +451,8 @@ async fn start_docker_envoy(version: &str, cfg: &EnvoyConfig) -> Result<EnvoyRun
         admin_addr: String::new(),
     };
     let container_name = runner.container_name.as_deref().unwrap().to_string();
-    let listener_port = resolve_docker_port(&container_name, DOCKER_LISTENER_PORT).await?;
-    let admin_port = resolve_docker_port(&container_name, DOCKER_ADMIN_PORT).await?;
+    let listener_port = resolve_docker_port(&container_name, resolved_cfg.listener_port).await?;
+    let admin_port = resolve_docker_port(&container_name, resolved_cfg.admin_port).await?;
     runner.proxy_addr = format!("127.0.0.1:{listener_port}");
     runner.admin_addr = format!("127.0.0.1:{admin_port}");
 
@@ -422,9 +490,16 @@ pub async fn start_envoy_runner(cfg: &EnvoyConfig) -> Result<EnvoyRunner, Error>
 }
 
 async fn envoy_version_from_env() -> Result<String, Error> {
-    if let Ok(v) = std::env::var("ENVOY_VERSION") {
-        if !v.is_empty() {
-            return Ok(v);
+    for key in ["ENVOY_VERSION", "ENVOY_TAG"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    if let Ok(manifest) = crate::envoy_versions::EnvoyVersionManifest::load() {
+        if !manifest.default.is_empty() {
+            return Ok(manifest.default);
         }
     }
     Ok("v1.40-latest".to_string())

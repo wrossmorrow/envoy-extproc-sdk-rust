@@ -143,10 +143,18 @@ impl HeaderValue {
         // append_action (envoyproxy/envoy#48886). Setting Append=true for
         // APPEND_IF_EXISTS_OR_ADD preserves append behavior without colliding
         // with a non-zero append_action.
-        if action == HeaderAppendAction::AppendIfExistsOrAdd {
-            option.append = Some(envoy_types::pb::google::protobuf::BoolValue { value: true });
-        }
+        option.append = append_flag_for_action(action);
         Ok(option)
+    }
+}
+
+fn append_flag_for_action(
+    action: HeaderAppendAction,
+) -> Option<envoy_types::pb::google::protobuf::BoolValue> {
+    if action == HeaderAppendAction::AppendIfExistsOrAdd {
+        Some(envoy_types::pb::google::protobuf::BoolValue { value: true })
+    } else {
+        None
     }
 }
 
@@ -628,10 +636,9 @@ impl RequestContext {
         hv: &HeaderValue,
         action: HeaderAppendAction,
     ) -> Result<(), Error> {
-        let envoy_hv = hv.to_envoy_header_value(name);
         let option = HeaderValueOption {
-            header: Some(envoy_hv),
-            append: None,
+            header: Some(hv.to_envoy_header_value(name)),
+            append: append_flag_for_action(action),
             append_action: action as i32,
             keep_empty_value: false,
         };
@@ -670,11 +677,12 @@ impl RequestContext {
         headers: &HashMap<String, HeaderValue>,
         action: HeaderAppendAction,
     ) -> Result<(), Error> {
-        let mut options = Vec::new();
+        let append = append_flag_for_action(action);
+        let mut options = Vec::with_capacity(headers.len());
         for (n, hv) in headers {
             options.push(HeaderValueOption {
                 header: Some(hv.to_envoy_header_value(n)),
-                append: None,
+                append,
                 append_action: action as i32,
                 keep_empty_value: false,
             });

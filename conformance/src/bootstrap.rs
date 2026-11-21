@@ -92,7 +92,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         EXTPROC_FILTER_NAME,
         DEFAULT_EXT_PROC_CLUSTER,
         false,
-        5,
+        5000,
         false,
         false,
         &default_mode,
@@ -102,26 +102,31 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         UPSTREAM_PRIMARY_CLUSTER,
         &params.upstream_host,
         params.primary_upstream_port,
+        false,
     );
     let secondary_cluster = cluster_json(
         UPSTREAM_SECONDARY_CLUSTER,
         &params.upstream_host,
         params.secondary_upstream_port,
+        false,
     );
     let ext_proc_cluster = cluster_json(
         DEFAULT_EXT_PROC_CLUSTER,
         &params.upstream_host,
         params.ext_proc_port,
+        true,
     );
     let abort_ext_proc_cluster = cluster_json(
         ABORT_EXT_PROC_CLUSTER,
         &params.upstream_host,
         params.abort_ext_proc_port,
+        true,
     );
     let secondary_ext_proc_cluster = cluster_json(
         SECONDARY_EXT_PROC_CLUSTER,
         &params.upstream_host,
         params.secondary_ext_proc_port,
+        true,
     );
 
     let mut http_filters = vec![default_filter.clone()];
@@ -147,7 +152,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         "envoy.filters.http.ext_proc.abort",
         ABORT_EXT_PROC_CLUSTER,
         false,
-        5,
+        5000,
         false,
         true,
         &default_mode,
@@ -156,7 +161,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         "envoy.filters.http.ext_proc.chain_first",
         DEFAULT_EXT_PROC_CLUSTER,
         false,
-        5,
+        5000,
         false,
         true,
         &default_mode,
@@ -165,7 +170,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         "envoy.filters.http.ext_proc.chain_second",
         SECONDARY_EXT_PROC_CLUSTER,
         false,
-        5,
+        5000,
         false,
         true,
         &default_mode,
@@ -174,7 +179,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         OBSERVABILITY_FILTER_NAME,
         DEFAULT_EXT_PROC_CLUSTER,
         true,
-        5,
+        5000,
         true,
         true,
         &processing_mode_json(
@@ -229,7 +234,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         "admin": {
             "address": {
                 "socket_address": {
-                    "address": "127.0.0.1",
+                    "address": "0.0.0.0",
                     "port_value": params.admin_port,
                 },
             },
@@ -259,13 +264,14 @@ fn ext_proc_filter_json(
     name: &str,
     cluster_name: &str,
     failure_mode_allow: bool,
-    message_timeout_seconds: u64,
+    message_timeout_ms: u64,
     observability_mode: bool,
     disabled: bool,
     mode: &Value,
 ) -> Value {
-    let _ = disabled;
-    json!({
+    let seconds = message_timeout_ms / 1000;
+    let nanos = (message_timeout_ms % 1000) * 1_000_000;
+    let mut filter = json!({
         "name": name,
         "typed_config": {
             "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
@@ -277,14 +283,19 @@ fn ext_proc_filter_json(
             "failure_mode_allow": failure_mode_allow,
             "observability_mode": observability_mode,
             "message_timeout": {
-                "seconds": message_timeout_seconds,
+                "seconds": seconds,
+                "nanos": nanos,
             },
             "mutation_rules": {
                 "allow_all_routing": true,
             },
             "processing_mode": mode,
         },
-    })
+    });
+    if disabled {
+        filter["disabled"] = json!(true);
+    }
+    filter
 }
 
 fn ext_proc_overrides_json(mode: &Value, failure_mode_allow: Option<bool>) -> Value {
@@ -336,7 +347,227 @@ fn route_json(
     })
 }
 
+fn profile_route_json(
+    prefix: &str,
+    enable_filters: &[(&str, &Value, Option<bool>)],
+    cluster: &str,
+) -> Value {
+    let mut per_filter = serde_json::Map::new();
+    per_filter.insert(
+        EXTPROC_FILTER_NAME.to_string(),
+        json!({
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+            "disabled": true,
+        }),
+    );
+    for (filter_name, mode, failure_mode_allow) in enable_filters {
+        per_filter.insert(
+            (*filter_name).to_string(),
+            json!({
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+                "overrides": ext_proc_overrides_json(mode, *failure_mode_allow),
+            }),
+        );
+    }
+    json!({
+        "match": {
+            "prefix": prefix,
+        },
+        "route": {
+            "cluster": cluster,
+        },
+        "typed_per_filter_config": Value::Object(per_filter),
+    })
+}
+
+fn buffered_partial_route_json(
+    prefix: &str,
+    mode: &Value,
+    buffer_limit_bytes: u32,
+    cluster: &str,
+) -> Value {
+    json!({
+        "match": {
+            "prefix": prefix,
+        },
+        "route": {
+            "cluster": cluster,
+        },
+        "per_request_buffer_limit_bytes": buffer_limit_bytes,
+        "typed_per_filter_config": {
+            EXTPROC_FILTER_NAME: {
+                "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+                "overrides": ext_proc_overrides_json(mode, Some(false)),
+            },
+        },
+    })
+}
+
 fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
+    let primary_routes = vec![
+        route_json(
+            "/mode/disabled",
+            mode,
+            Some(false),
+            true,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/buffered-partial",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_BUFFERED_PARTIAL,
+                OBSERVED_BODY_BUFFERED_PARTIAL,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        buffered_partial_route_json(
+            "/mode/buffered-partial-small",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_BUFFERED_PARTIAL,
+                OBSERVED_BODY_BUFFERED_PARTIAL,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            1024,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/buffered",
+            mode,
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/streamed",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_STREAMED,
+                OBSERVED_BODY_STREAMED,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/trailers",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_STREAMED,
+                OBSERVED_BODY_STREAMED,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/none",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_NONE,
+                OBSERVED_BODY_NONE,
+                OBSERVED_HEADER_SKIP,
+                OBSERVED_HEADER_SKIP,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/skip-req-headers",
+            &processing_mode_json(
+                OBSERVED_HEADER_SKIP,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_NONE,
+                OBSERVED_BODY_BUFFERED,
+                OBSERVED_HEADER_SKIP,
+                OBSERVED_HEADER_SKIP,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/timeout-fail-closed",
+            &[(
+                "envoy.filters.http.ext_proc.short_timeout_fail_closed",
+                mode,
+                Some(false),
+            )],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/timeout-fail-open",
+            &[(
+                "envoy.filters.http.ext_proc.short_timeout_fail_open",
+                mode,
+                Some(true),
+            )],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/abort-fail-closed",
+            &[("envoy.filters.http.ext_proc.abort", mode, Some(false))],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/abort-fail-open",
+            &[("envoy.filters.http.ext_proc.abort", mode, Some(true))],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/chained",
+            &[
+                ("envoy.filters.http.ext_proc.chain_first", mode, Some(false)),
+                (
+                    "envoy.filters.http.ext_proc.chain_second",
+                    mode,
+                    Some(false),
+                ),
+            ],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/observability",
+            &[(
+                OBSERVABILITY_FILTER_NAME,
+                &processing_mode_json(
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_BODY_STREAMED,
+                    OBSERVED_BODY_STREAMED,
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_HEADER_SEND,
+                ),
+                Some(true),
+            )],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        json!({
+            "match": {
+                "prefix": "/",
+            },
+            "route": {
+                "cluster": UPSTREAM_PRIMARY_CLUSTER,
+            },
+        }),
+    ];
+
     json!({
         "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
         "stat_prefix": "conformance_http",
@@ -351,139 +582,23 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
             "name": "conformance_routes",
             "virtual_hosts": [
                 {
-                    "name": "conformance_vhost",
-                    "domains": ["*"],
+                    "name": "secondary_vhost",
+                    "domains": ["secondary.local", "secondary.local:*"],
                     "routes": [
-                        route_json("/mode/disabled", mode, Some(false), true, UPSTREAM_PRIMARY_CLUSTER),
-                        route_json("/mode/buffered", mode, Some(false), false, UPSTREAM_PRIMARY_CLUSTER),
-                        route_json(
-                            "/mode/buffered-partial",
-                            &processing_mode_json(
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_BODY_BUFFERED_PARTIAL,
-                                OBSERVED_BODY_BUFFERED_PARTIAL,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                            ),
-                            Some(false),
-                            false,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/mode/streamed",
-                            &processing_mode_json(
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_BODY_STREAMED,
-                                OBSERVED_BODY_STREAMED,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                            ),
-                            Some(false),
-                            false,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/mode/trailers",
-                            &processing_mode_json(
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_BODY_STREAMED,
-                                OBSERVED_BODY_STREAMED,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                            ),
-                            Some(false),
-                            false,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/mode/none",
-                            &processing_mode_json(
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_BODY_NONE,
-                                OBSERVED_BODY_NONE,
-                                OBSERVED_HEADER_SKIP,
-                                OBSERVED_HEADER_SKIP,
-                            ),
-                            Some(false),
-                            false,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/mode/skip-req-headers",
-                            &processing_mode_json(
-                                OBSERVED_HEADER_SKIP,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_BODY_NONE,
-                                OBSERVED_BODY_BUFFERED,
-                                OBSERVED_HEADER_SKIP,
-                                OBSERVED_HEADER_SKIP,
-                            ),
-                            Some(false),
-                            false,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/profile/timeout-fail-closed",
-                            mode,
-                            Some(false),
-                            true,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/profile/timeout-fail-open",
-                            mode,
-                            Some(true),
-                            true,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/profile/abort-fail-closed",
-                            mode,
-                            Some(false),
-                            true,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/profile/abort-fail-open",
-                            mode,
-                            Some(true),
-                            true,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/profile/chained",
-                            mode,
-                            Some(false),
-                            true,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
-                        route_json(
-                            "/profile/observability",
-                            &processing_mode_json(
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_BODY_STREAMED,
-                                OBSERVED_BODY_STREAMED,
-                                OBSERVED_HEADER_SEND,
-                                OBSERVED_HEADER_SEND,
-                            ),
-                            Some(true),
-                            true,
-                            UPSTREAM_PRIMARY_CLUSTER,
-                        ),
                         {
                             "match": {
                                 "prefix": "/",
                             },
                             "route": {
-                                "cluster": UPSTREAM_PRIMARY_CLUSTER,
+                                "cluster": UPSTREAM_SECONDARY_CLUSTER,
                             },
                         },
                     ],
+                },
+                {
+                    "name": "conformance_vhost",
+                    "domains": ["*"],
+                    "routes": primary_routes,
                 },
             ],
         },
@@ -491,13 +606,38 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
     })
 }
 
-fn cluster_json(name: &str, host: &str, port: u16) -> Value {
+fn cluster_json(name: &str, host: &str, port: u16, is_grpc: bool) -> Value {
+    let protocol_options = if is_grpc {
+        json!({
+            "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+                "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+                "explicit_http_config": {
+                    "http2_protocol_options": {},
+                },
+            },
+        })
+    } else {
+        json!({
+            "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+                "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+                "use_downstream_protocol_config": {
+                    "http_protocol_options": {
+                        "enable_trailers": true,
+                    },
+                    "http2_protocol_options": {},
+                },
+            },
+        })
+    };
     json!({
         "name": name,
+        "type": "LOGICAL_DNS",
+        "dns_lookup_family": "V4_ONLY",
         "connect_timeout": {
             "seconds": 2,
         },
         "lb_policy": "ROUND_ROBIN",
+        "typed_extension_protocol_options": protocol_options,
         "load_assignment": {
             "cluster_name": name,
             "endpoints": [
@@ -655,8 +795,8 @@ mod tests {
             .and_then(|rc| rc.get("virtual_hosts"))
             .and_then(|v| v.as_array())
             .expect("virtual hosts");
-        assert_eq!(virtual_hosts.len(), 1);
-        let vhost = &virtual_hosts[0];
+        assert_eq!(virtual_hosts.len(), 2);
+        let vhost = &virtual_hosts[1];
         let routes = vhost
             .get("routes")
             .and_then(|r| r.as_array())
