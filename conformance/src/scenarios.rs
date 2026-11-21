@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use envoy_extproc_sdk::{
     AllHeaders, BodySendMode, Error, HeaderSendMode, HeaderValue, ModeOverride, ProtocolConfig,
@@ -37,6 +38,10 @@ pub const SCENARIO_DYNAMIC_METADATA_AND_ATTRIBUTES: &str = "dynamic_metadata_and
 pub const SCENARIO_META_CHAIN_ALLOWLIST: &str = "meta-chain-allowlist";
 pub const SCENARIO_META_IMMEDIATE_DENY: &str = "meta-immediate-deny";
 pub const SCENARIO_CEL_ATTRIBUTES_PERSIST: &str = "cel-attrs-persist";
+pub const SCENARIO_TIMEOUT_OVERRIDE_EXTEND: &str = "timeout-override-extend";
+pub const SCENARIO_TIMEOUT_OVERRIDE_MULTI: &str = "timeout-override-multi";
+pub const SCENARIO_TIMEOUT_OVERRIDE_EXCEED: &str = "timeout-override-exceed";
+pub const SCENARIO_TIMEOUT_OVERRIDE_NO_MAX: &str = "timeout-override-no-max";
 
 /// Scenario handler for `immediate_response_request_headers`: responds with
 /// an immediate response (status 200, `x-scenario-response` header, empty body)
@@ -717,6 +722,22 @@ pub fn scenario_handlers() -> Vec<(String, Arc<dyn CaseHandler>)> {
             SCENARIO_CEL_ATTRIBUTES_PERSIST.to_string(),
             cel_attributes_persist_handler(Arc::new(Mutex::new(HashMap::new()))),
         ),
+        (
+            "timeout-override-extend".to_string(),
+            timeout_override_extend_handler(),
+        ),
+        (
+            "timeout-override-multi".to_string(),
+            timeout_override_multi_handler(),
+        ),
+        (
+            "timeout-override-exceed".to_string(),
+            timeout_override_exceed_handler(),
+        ),
+        (
+            "timeout-override-no-max".to_string(),
+            timeout_override_no_max_handler(),
+        ),
     ]
 }
 
@@ -753,6 +774,107 @@ pub fn mode_override_allowlist_denied_handler(
     saw_body: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<dyn CaseHandler> {
     Arc::new(ModeOverrideAllowlistDeniedScenarioHandler { saw_body })
+}
+
+/// Scenario handler for the `override_message_timeout` conformance scenario:
+/// extends the current phase's message timeout and adds a verification header
+/// during the request headers phase, then continues the exchange.
+pub fn timeout_override_extend_handler() -> Arc<dyn CaseHandler> {
+    Arc::new(TimeoutOverrideExtendScenarioHandler)
+}
+
+/// Scenario handler for the `override_message_timeout` conformance scenario:
+/// extends the message timeout in each phase of the exchange, then replaces the
+/// request body during the buffered body phase.
+pub fn timeout_override_multi_handler() -> Arc<dyn CaseHandler> {
+    Arc::new(TimeoutOverrideMultiScenarioHandler)
+}
+
+/// Scenario handler for the `override_message_timeout` conformance scenario:
+/// requests a message timeout extension beyond the filter's `max_message_timeout`,
+/// so the override is ignored and the base message timer expires mid-phase.
+pub fn timeout_override_exceed_handler() -> Arc<dyn CaseHandler> {
+    Arc::new(TimeoutOverrideExceedScenarioHandler)
+}
+
+/// Scenario handler for the `override_message_timeout` conformance scenario:
+/// requests a message timeout extension while the filter's `max_message_timeout`
+/// is unset, so the override is ignored and the base message timer expires
+/// mid-phase.
+pub fn timeout_override_no_max_handler() -> Arc<dyn CaseHandler> {
+    Arc::new(TimeoutOverrideNoMaxScenarioHandler)
+}
+
+struct TimeoutOverrideExtendScenarioHandler;
+
+impl CaseHandler for TimeoutOverrideExtendScenarioHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.override_message_timeout(Duration::from_millis(1_000))?;
+        ctx.add_header(
+            "x-extended",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"true".to_vec()),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+struct TimeoutOverrideMultiScenarioHandler;
+
+impl CaseHandler for TimeoutOverrideMultiScenarioHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.override_message_timeout(Duration::from_millis(1_000))?;
+        ctx.continue_request()
+    }
+
+    fn request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+        if body != b"raw-slow" {
+            return Err(format!("unexpected request body {body:?}").into());
+        }
+        ctx.override_message_timeout(Duration::from_millis(1_000))?;
+        ctx.replace_body(b"extended-both")?;
+        ctx.continue_request()
+    }
+}
+
+struct TimeoutOverrideExceedScenarioHandler;
+
+impl CaseHandler for TimeoutOverrideExceedScenarioHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.override_message_timeout(Duration::from_millis(3_000))?;
+        // Hold the phase open past the filter's base `message_timeout` (150ms)
+        // so the ignored override surfaces as a message timeout.
+        std::thread::sleep(Duration::from_millis(1_000));
+        ctx.continue_request()
+    }
+}
+
+struct TimeoutOverrideNoMaxScenarioHandler;
+
+impl CaseHandler for TimeoutOverrideNoMaxScenarioHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        ctx.override_message_timeout(Duration::from_millis(1_000))?;
+        std::thread::sleep(Duration::from_millis(1_000));
+        ctx.continue_request()
+    }
 }
 
 /// Scenario handler factory for the `protocol_config` default-mode-override

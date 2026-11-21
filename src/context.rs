@@ -27,6 +27,14 @@ use envoy_types::pb::google::protobuf::{Any, Struct, Value};
 use crate::headers::AllHeaders;
 use crate::Error;
 
+/// Sends an interim phase response to envoy, e.g. an
+/// [`override_message_timeout`](RequestContext::override_message_timeout)
+/// interim response. Implemented as a boxed closure by the streaming phase task
+/// that owns the context; `None` when interim sends are not possible for the
+/// current exchange (e.g. a context driven outside a phase task, or during envoy
+/// observability mode).
+pub(crate) type InterimSend = Box<dyn Fn(&ProcessingResponse) -> Result<(), Error> + Send + Sync>;
+
 /// Phase in which a request is being processed, as numbered by the
 /// `envoy.service.ext_proc.v3` protocol. Values are the protocol's phase
 /// numbers, as used by `envoy`'s ext_proc filter.
@@ -512,6 +520,27 @@ pub struct RequestContext {
     /// been initialized. `None` until the phase is initialized (e.g. before the
     /// request headers phase runs).
     pub(crate) phase_header_keys: Option<HashSet<String>>,
+
+    /// Sends interim phase responses to envoy, e.g. for an
+    /// [`override_message_timeout`](RequestContext::override_message_timeout)
+    /// extension, when one has been wired for the current stream. Installed by
+    /// the streaming phase task that owns the context; `None` when interim
+    /// sends are not possible for the current exchange (e.g. a context driven
+    /// outside a phase task, or during envoy observability mode).
+    pub(crate) send_timeout_override: Option<InterimSend>,
+
+    /// Error from the most recent interim phase response send for the current
+    /// phase, if any, e.g. an `override_message_timeout` interim response that
+    /// failed to send. Consumed by
+    /// [`process_phase`](crate::server::GenericExtProcServer::process_phase)
+    /// once the phase completes, ahead of phase error handling, so that an
+    /// interim send failure is handled as a send error rather than a phase
+    /// error.
+    pub(crate) interim_send_error: Option<Error>,
+
+    /// Whether an `override_message_timeout` was already sent for the current
+    /// phase. Reset by [`reset_phase`](RequestContext::reset_phase).
+    pub(crate) timeout_extended: bool,
 }
 
 impl RequestContext {
@@ -539,6 +568,9 @@ impl RequestContext {
             req_header_keys: HashSet::new(),
             resp_header_keys: HashSet::new(),
             phase_header_keys: None,
+            send_timeout_override: None,
+            interim_send_error: None,
+            timeout_extended: false,
         }
     }
 
@@ -550,6 +582,8 @@ impl RequestContext {
         self.observability_mode = false;
         self.phase_header_keys = None;
         self.response.reset();
+        self.interim_send_error = None;
+        self.timeout_extended = false;
         Ok(())
     }
 
@@ -579,6 +613,25 @@ impl RequestContext {
         self.data
             .get::<T>()
             .ok_or_else(|| format!("{} does not exist", std::any::type_name::<T>()).into())
+    }
+
+    /// Take and clear the pending interim phase response send error, if any.
+    ///
+    /// Called by
+    /// [`process_phase`](crate::server::GenericExtProcServer::process_phase)
+    /// once the phase completes, ahead of phase error handling, so that an
+    /// interim send failure (e.g. an `override_message_timeout` interim response
+    /// that failed to send) is handled as a send error rather than a phase
+    /// error.
+    pub(crate) fn take_interim_send_error(&mut self) -> Option<Error> {
+        self.interim_send_error.take()
+    }
+
+    /// Whether a pending interim phase response send error exists, without
+    /// consuming it. Used by phase dispatch to tell an interim-send failure
+    /// apart from a phase error before deciding whether to count a phase error.
+    pub(crate) fn has_interim_send_error(&self) -> bool {
+        self.interim_send_error.is_some()
     }
 
     /// Whether to clear the route cache after the current phase.
@@ -650,6 +703,89 @@ impl RequestContext {
             request_trailer_mode: HeaderSendMode::Skip,
             response_trailer_mode: HeaderSendMode::Skip,
         })
+    }
+
+    /// Request an `override_message_timeout` for the current phase, asking the
+    /// data plane to replace the current phase's message timer with `timeout`.
+    ///
+    /// Envoy honors the override by immediately sending an interim
+    /// [`ProcessingResponse`] with `override_message_timeout` set mid-phase,
+    /// before the processor returns its phase response, stopping the original
+    /// message timer and starting a new one with the requested duration while
+    /// keeping the data plane ext_proc filter state machine intact. The override
+    /// requires the envoy `ext_proc` filter to be configured with
+    /// `max_message_timeout >= timeout >= 1ms`.
+    ///
+    /// The override may be expressed at most once per phase, and is a no-op
+    /// (Ok) when the exchange runs in envoy `observability_mode`; the duplicate
+    /// call is still rejected. It is cleared by
+    /// [`reset_phase`](RequestContext::reset_phase), so a later phase of the
+    /// same exchange may request its own override.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the timeout is below 1ms, when there is no active
+    /// phase, when an override was already sent for the phase, when no interim
+    /// send is wired for the current exchange, or when the interim response
+    /// could not be sent.
+    pub fn override_message_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
+        if timeout < Duration::from_millis(1) {
+            return Err(format!(
+                "override_message_timeout must be >= 1ms, got {}",
+                timeout.as_millis()
+            )
+            .into());
+        }
+        if self.phase == RequestPhase::Undetermined {
+            return Err("override_message_timeout requires an active request phase".into());
+        }
+        if self.timeout_extended {
+            return Err("override_message_timeout already sent in current phase".into());
+        }
+        if self.observability_mode {
+            self.timeout_extended = true;
+            return Ok(());
+        }
+        let Some(send) = self.send_timeout_override.as_ref() else {
+            return Err("override_message_timeout requires an active gRPC stream".into());
+        };
+        let resp = self.new_timeout_override_response(self.phase, timeout)?;
+        if let Err(send_err) = send(&resp) {
+            // Record the interim send error for the phase task to handle, then
+            // propagate a failure so phase processing stops.
+            self.interim_send_error = Some(send_err);
+            return Err("override_message_timeout interim response send failed".into());
+        }
+        self.timeout_extended = true;
+        Ok(())
+    }
+
+    /// Build the interim [`ProcessingResponse`] that asks envoy to extend the
+    /// current phase's message timeout to `timeout`, as an empty "continue"
+    /// response carrying the override.
+    ///
+    /// The data plane ignores every other field of the interim response; only
+    /// `override_message_timeout` is honored.
+    fn new_timeout_override_response(
+        &self,
+        phase: RequestPhase,
+        timeout: Duration,
+    ) -> Result<ProcessingResponse, Error> {
+        if timeout < Duration::from_millis(1) {
+            return Err(format!(
+                "override_message_timeout must be >= 1ms, got {}",
+                timeout.as_millis()
+            )
+            .into());
+        }
+        let mut resp = self.empty_continue_response(phase)?.ok_or_else(|| {
+            "override_message_timeout requires an active request phase".to_string()
+        })?;
+        resp.override_message_timeout = Some(envoy_types::pb::google::protobuf::Duration {
+            seconds: timeout.as_secs() as i64,
+            nanos: timeout.subsec_nanos() as i32,
+        });
+        Ok(resp)
     }
 
     /// Merge an inbound envoy [`Metadata`] context into the current context,
@@ -1209,6 +1345,7 @@ impl Default for RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_default_phase_if_invalid() {
@@ -2231,5 +2368,108 @@ mod tests {
             rc.attributes.get("request.protocol"),
             Some(&string_value("HTTP/2"))
         );
+    }
+
+    #[test]
+    fn test_override_message_timeout_validation_guards() {
+        // Timeouts below 1ms are rejected, with and without a wired send.
+        for bad in [Duration::from_nanos(0), Duration::from_nanos(999)] {
+            let mut rc = RequestContext::new();
+            rc.reset_phase().unwrap();
+            rc.set_phase(RequestPhase::RequestHeaders);
+            rc.send_timeout_override = Some(Box::new(|_resp: &ProcessingResponse| Ok(())));
+            assert!(rc.override_message_timeout(bad).is_err());
+        }
+
+        // An override requires an active phase, a wired send, and is at most
+        // once per phase.
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.send_timeout_override = Some(Box::new(|_resp: &ProcessingResponse| Ok(())));
+        assert!(rc
+            .override_message_timeout(Duration::from_millis(50))
+            .is_err());
+
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        assert!(rc
+            .override_message_timeout(Duration::from_millis(50))
+            .is_err());
+
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        rc.send_timeout_override = Some(Box::new(|_resp: &ProcessingResponse| Ok(())));
+        rc.override_message_timeout(Duration::from_millis(50))
+            .unwrap();
+        assert!(rc
+            .override_message_timeout(Duration::from_millis(25))
+            .is_err());
+    }
+
+    #[test]
+    fn test_override_message_timeout_sends_interim_across_phases_and_resets() {
+        // An interim `override_message_timeout` response is sent through the
+        // wired send, carrying the requested duration, at most once per phase,
+        // and the once-per-phase state resets for the next phase.
+        for phase in [
+            RequestPhase::RequestHeaders,
+            RequestPhase::RequestBody,
+            RequestPhase::RequestTrailers,
+            RequestPhase::ResponseHeaders,
+            RequestPhase::ResponseBody,
+            RequestPhase::ResponseTrailers,
+        ] {
+            let mut rc = RequestContext::new();
+            rc.reset_phase().unwrap();
+            rc.set_phase(phase);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            rc.send_timeout_override = Some(Box::new({
+                let sent = sent.clone();
+                move |resp: &ProcessingResponse| {
+                    sent.lock().unwrap().push(resp.clone());
+                    Ok(())
+                }
+            }));
+            rc.override_message_timeout(Duration::from_millis(500))
+                .unwrap();
+            assert_eq!(sent.lock().unwrap().len(), 1);
+            let resp = sent.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                resp.override_message_timeout,
+                Some(envoy_types::pb::google::protobuf::Duration {
+                    seconds: 0,
+                    nanos: 500_000_000,
+                })
+            );
+            assert!(rc.take_interim_send_error().is_none());
+
+            assert!(rc
+                .override_message_timeout(Duration::from_millis(250))
+                .is_err());
+
+            rc.reset_phase().unwrap();
+            rc.set_phase(phase);
+            rc.override_message_timeout(Duration::from_millis(200))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_override_message_timeout_observability_mode_is_noop() {
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        rc.observability_mode = true;
+        rc.send_timeout_override = Some(Box::new(|_resp: &ProcessingResponse| Ok(())));
+        assert!(rc
+            .override_message_timeout(Duration::from_millis(500))
+            .is_ok());
+        assert!(rc.take_interim_send_error().is_none());
+        // The once-per-phase guard still applies in observability mode.
+        assert!(rc
+            .override_message_timeout(Duration::from_millis(250))
+            .is_err());
     }
 }

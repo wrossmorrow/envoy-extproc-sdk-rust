@@ -20,7 +20,9 @@ use envoy_conformance::{
     mode_override_default_from_protocol_config_handler, mode_override_disabled_handler,
     mode_override_full_resp_handler, mode_override_handler, mode_override_resp_stream_handler,
     mode_override_skip_handler, protocol_config_handler, register_scenario_handlers,
-    start_conformance_extproc_server, start_envoy_runner, upstream_host_for_runner, CaseHandler,
+    start_conformance_extproc_server, start_envoy_runner, timeout_override_exceed_handler,
+    timeout_override_extend_handler, timeout_override_multi_handler,
+    timeout_override_no_max_handler, upstream_host_for_runner, CaseHandler,
     ConformanceExtProcServer, ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho,
     UpstreamServer,
 };
@@ -1829,6 +1831,106 @@ fn message_timeout_fail_closed_and_fail_open() {
         .await;
         assert_eq!(open.status, StatusCode::OK);
         assert_no_spurious(h).await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 19. Per-message timeout override (override_message_timeout)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn override_message_timeout() {
+    run_conformance(|h| async move {
+        // Sub-scenario: extend the deadline beyond the base message timeout and
+        // add a verification header during the request headers phase; the
+        // interim override response is delivered mid-phase and the phase
+        // continues with the final response.
+        {
+            let case_id = "timeout-override-extend";
+            h.default_proc
+                .register(case_id, timeout_override_extend_handler());
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::GET,
+                "/profile/timeout-override/extend",
+                &[("x-conformance-case", case_id)],
+                full_body(b""),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(
+                echo.headers
+                    .get("x-extended")
+                    .and_then(|v| v.first())
+                    .map(|v| v.as_str()),
+                Some("true"),
+                "unexpected echo headers: {:?}",
+                echo.headers
+            );
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: each phase may extend the message timeout once, then
+        // the buffered request body is replaced during the body phase.
+        {
+            let case_id = "timeout-override-multi";
+            h.default_proc
+                .register(case_id, timeout_override_multi_handler());
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/timeout-override/multi",
+                &[("x-conformance-case", case_id)],
+                full_body(b"raw-slow"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(echo.body, "extended-both");
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: a requested extension beyond the filter's
+        // `max_message_timeout` is ignored, so the base message timer expires
+        // mid-phase and the exchange fails closed with a 504.
+        {
+            let case_id = "timeout-override-exceed";
+            h.default_proc
+                .register(case_id, timeout_override_exceed_handler());
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::GET,
+                "/profile/timeout-override/exceed",
+                &[("x-conformance-case", case_id)],
+                full_body(b""),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::GATEWAY_TIMEOUT);
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: with the filter's `max_message_timeout` unset the
+        // override is ignored and the base message timer expires mid-phase.
+        {
+            let case_id = "timeout-override-no-max";
+            h.default_proc
+                .register(case_id, timeout_override_no_max_handler());
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::GET,
+                "/profile/timeout-fail-closed/no-max",
+                &[("x-conformance-case", case_id)],
+                full_body(b""),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::GATEWAY_TIMEOUT);
+            assert_no_spurious(h).await;
+        }
     });
 }
 

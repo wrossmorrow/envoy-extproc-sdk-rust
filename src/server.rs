@@ -163,6 +163,37 @@ impl GenericExtProcServer {
         rc.reset_phase()?;
         let mut phase = RequestPhase::Undetermined;
         let outcome = self.dispatch_phase(proc_req, rc, &mut phase).await;
+
+        // An interim response send failure (e.g. an `override_message_timeout`
+        // extension that could not be delivered) takes precedence over phase
+        // errors for the phase that produced it: the data plane never got the
+        // interim response, so the phase outcome is moot.
+        if let Some(send_err) = rc.take_interim_send_error() {
+            if is_stream_cancelled(Some(&send_err)) {
+                // The interim send was cancelled (the client or envoy tore the
+                // stream down): graceful end, not a processing error. Notify the
+                // error handler so the processor can clean up, and end the phase
+                // without sending a response.
+                self.processor.error_handler(rc, phase, send_err).await;
+                tracing::debug!(
+                    "Timeout override send cancelled: phase {}",
+                    rc.get_phase_name()
+                );
+                return Ok((None, phase));
+            }
+            self.metrics.response_send_errors.inc();
+            tracing::error!(
+                "Send OverrideMessageTimeout error: phase {}",
+                rc.get_phase_name()
+            );
+            let err = Status::unknown(format!(
+                "failed to send timeout override to envoy: {send_err}"
+            ))
+            .into();
+            self.processor.error_handler(rc, phase, send_err).await;
+            return Err(err);
+        }
+
         if let Err(e) = outcome {
             if self
                 .options
@@ -384,7 +415,14 @@ impl GenericExtProcServer {
         .await;
 
         if outcome.is_err() {
-            metrics.phase_errors.inc_by(1.0);
+            // An interim `override_message_timeout` send failure (which the
+            // phase method produces by propagating the error from
+            // `override_message_timeout`) takes precedence over counting a phase
+            // error: the interim response itself failed, and the outcome below is
+            // handled through the interim-send error handling.
+            if !rc.has_interim_send_error() {
+                metrics.phase_errors.inc_by(1.0);
+            }
         }
 
         outcome
@@ -682,6 +720,18 @@ async fn run_phase_task(
 ) {
     let mut incoming = incoming;
     let mut rc = RequestContext::new();
+    // Wire the interim response send used by `override_message_timeout` into the
+    // phase context, so interim responses (e.g. an `override_message_timeout`
+    // extension) can be delivered to envoy mid-phase.
+    let interim_tx = tx.clone();
+    rc.send_timeout_override = Some(Box::new(
+        move |resp: &ProcessingResponse| -> Result<(), Error> {
+            interim_tx
+                .send(Ok(resp.clone()))
+                .map_err(|e| format!("failed to send interim processing response to envoy: {e}"))?;
+            Ok(())
+        },
+    ));
     loop {
         let Some(req) = incoming.next().await else {
             break;
@@ -1845,6 +1895,268 @@ mod tests {
         let decoded = ProcessingResponse::decode(&bytes[..])
             .expect("outbound ProcessingResponse must decode");
         assert_eq!(decoded, *response);
+    }
+
+    // External processor that requests an `override_message_timeout` during the
+    // request headers phase, then adds a header and continues.
+    struct TimeoutOverrideProcessor {
+        name: String,
+        opts: Option<ProcessingOptions>,
+        error_phase: Arc<Mutex<Option<RequestPhase>>>,
+        error: Arc<Mutex<Option<Error>>>,
+    }
+
+    impl TimeoutOverrideProcessor {
+        fn new(name: &str, opts: Option<ProcessingOptions>) -> Self {
+            Self {
+                name: name.to_string(),
+                opts,
+                error_phase: Arc::new(Mutex::new(None)),
+                error: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RequestProcessor for TimeoutOverrideProcessor {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn options(&self) -> &ProcessingOptions {
+            self.opts.as_ref().unwrap()
+        }
+        async fn process_request_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.override_message_timeout(Duration::from_millis(500))?;
+            ctx.add_header(
+                "x-after-extend",
+                &HeaderValue {
+                    value: String::new(),
+                    raw_value: Some(b"true".to_vec()),
+                },
+            )?;
+            ctx.continue_request()
+        }
+        async fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn error_handler(&self, _ctx: &mut RequestContext, phase: RequestPhase, err: Error) {
+            *self.error_phase.lock().unwrap() = Some(phase);
+            *self.error.lock().unwrap() = Some(err);
+        }
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_override_message_timeout_sends_interim_then_phase_response() {
+        // The interim `override_message_timeout` response is delivered through
+        // the wired send, then the phase's final response (here a header
+        // mutation) is delivered for the phase.
+        let proc = Arc::new(TimeoutOverrideProcessor::new(
+            "timeout-override",
+            Some(ProcessingOptions::new()),
+        ));
+        let server = GenericExtProcServer::new(
+            "timeout-override".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        rc.send_timeout_override = Some(Box::new({
+            let sent = sent.clone();
+            move |resp: &ProcessingResponse| {
+                sent.lock().unwrap().push(resp.clone());
+                Ok(())
+            }
+        }));
+
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            let interim = sent.last().unwrap().clone();
+            assert_eq!(
+                interim.override_message_timeout,
+                Some(envoy_types::pb::google::protobuf::Duration {
+                    seconds: 0,
+                    nanos: 500_000_000,
+                })
+            );
+        }
+        assert!(rc.take_interim_send_error().is_none());
+
+        let resp = resp.expect("expected a phase response");
+        assert!(matches!(
+            resp.response,
+            Some(ResponseOneof::RequestHeaders(_))
+        ));
+        let (hm, _) = rc.resolved_header_mutation();
+        let hm = hm.expect("expected a resolved header mutation");
+        assert_eq!(hm.set_headers.len(), 1);
+        assert_eq!(
+            hm.set_headers[0].header.as_ref().unwrap().key,
+            "x-after-extend"
+        );
+        assert_eq!(
+            hm.set_headers[0].header.as_ref().unwrap().raw_value,
+            b"true".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_override_message_timeout_interim_send_cancelled_is_graceful() {
+        // A cancellation while sending the interim `override_message_timeout`
+        // response is a graceful end: notify the error handler, end the phase
+        // without a response, and count no errors.
+        let proc = Arc::new(TimeoutOverrideProcessor::new(
+            "timeout-override",
+            Some(ProcessingOptions::new()),
+        ));
+        let server = GenericExtProcServer::new(
+            "timeout-override".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.send_timeout_override = Some(Box::new(|_resp: &ProcessingResponse| {
+            Err(tonic::Status::cancelled("context canceled").into())
+        }));
+
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_none());
+        assert_eq!(
+            *proc.error_phase.lock().unwrap(),
+            Some(RequestPhase::RequestHeaders)
+        );
+        let err = proc
+            .error
+            .lock()
+            .unwrap()
+            .take()
+            .expect("expected an error");
+        assert!(is_stream_cancelled(Some(&err)));
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_response_send_errors")
+            .expect("expected response send errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_errored_streams")
+            .expect("expected errored streams family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_override_message_timeout_interim_send_failure_errors_stream() {
+        // A transport failure while sending the interim `override_message_timeout`
+        // response is a send error: it must be reported through the send-error
+        // metric, the error handler, and a stream error, without counting a
+        // phase error.
+        let proc = Arc::new(TimeoutOverrideProcessor::new(
+            "timeout-override",
+            Some(ProcessingOptions::new()),
+        ));
+        let server = GenericExtProcServer::new(
+            "timeout-override".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.send_timeout_override = Some(Box::new(|_resp: &ProcessingResponse| {
+            Err(tonic::Status::unavailable("transport closed").into())
+        }));
+
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "GET")])),
+            false,
+        ))));
+        let err = server.process_phase(&req, &mut rc).await.unwrap_err();
+        assert!(!err.to_string().is_empty());
+
+        assert_eq!(
+            *proc.error_phase.lock().unwrap(),
+            Some(RequestPhase::RequestHeaders)
+        );
+        assert!(proc.error.lock().unwrap().is_some());
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_response_send_errors")
+            .expect("expected response send errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 0.0);
     }
 
     #[tokio::test]
