@@ -42,6 +42,8 @@ pub use scenarios::{
     mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,
     mode_override_resp_stream_handler, mode_override_skip_handler,
     post_with_body_mode_none_handler, protocol_config_handler, register_scenario_handlers,
-    scenario_handler, scenario_handlers,
+    scenario_handler, scenario_handlers, timeout_override_exceed_handler,
+    timeout_override_extend_handler, timeout_override_multi_handler,
+    timeout_override_no_max_handler,
 };
 pub use upstream::{UpstreamEcho, UpstreamServer};

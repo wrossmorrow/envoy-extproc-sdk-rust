@@ -21,6 +21,7 @@ const EXTPROC_SEND_BODY_NO_WAIT_FILTER_NAME: &str = "extproc_send_body_no_wait";
 const EXTPROC_META_FIRST_FILTER_NAME: &str = "extproc_meta_first";
 const EXTPROC_META_SECOND_FILTER_NAME: &str = "extproc_meta_second";
 const EXTPROC_ATTRIBUTES_FILTER_NAME: &str = "extproc_attributes";
+const EXTPROC_TIMEOUT_OVERRIDE_FILTER_NAME: &str = "extproc_timeout_override";
 
 const OBSERVED_HEADER_SEND: &str = "SEND";
 const OBSERVED_HEADER_SKIP: &str = "SKIP";
@@ -312,6 +313,14 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &["response.code".to_string()],
         true,
     ));
+    http_filters.push(ext_proc_filter_json_with_max_timeout(
+        EXTPROC_TIMEOUT_OVERRIDE_FILTER_NAME,
+        DEFAULT_EXT_PROC_CLUSTER,
+        150,
+        1500,
+        &default_mode,
+        true,
+    ));
     http_filters.push(json!({
         "name": ROUTER_FILTER_NAME,
         "typed_config": {
@@ -479,6 +488,38 @@ fn ext_proc_filter_json_with_dynamic_metadata(
         let values: Vec<Value> = response_attributes.iter().map(|s| json!(s)).collect();
         filter["typed_config"]["response_attributes"] = Value::Array(values);
     }
+    filter
+}
+
+/// Build an ext_proc filter JSON with a `max_message_timeout`, for the
+/// `override_message_timeout` conformance scenario. The filter is disabled by
+/// default and enabled per-route by the `/profile/timeout-override` profile
+/// route. `message_timeout` is kept short (150ms) so the scenario can observe
+/// the interim override extend the deadline past Envoy's base timer.
+fn ext_proc_filter_json_with_max_timeout(
+    name: &str,
+    cluster_name: &str,
+    message_timeout_ms: u64,
+    max_message_timeout_ms: u64,
+    mode: &Value,
+    disabled: bool,
+) -> Value {
+    let mut filter = ext_proc_filter_json(
+        name,
+        cluster_name,
+        false, // failure_mode_allow: fail closed on phase errors (e.g. message timeout)
+        message_timeout_ms,
+        false, // observability_mode
+        disabled,
+        mode,
+        false, // allow_mode_override
+        None,  // allowed_override_modes
+        false, // send_body_without_waiting_for_header_response
+    );
+    filter["typed_config"]["max_message_timeout"] = json!({
+        "seconds": max_message_timeout_ms / 1000,
+        "nanos": (max_message_timeout_ms % 1000) * 1_000_000,
+    });
     filter
 }
 
@@ -809,6 +850,11 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
             attributes_route["name"] = json!("conformance_attributes_route");
             attributes_route
         },
+        profile_route_json(
+            "/profile/timeout-override",
+            &[(EXTPROC_TIMEOUT_OVERRIDE_FILTER_NAME, mode, Some(false))],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
         route_json(
             "/mode/none/protocol-config",
             &processing_mode_json(
@@ -1075,7 +1121,7 @@ mod tests {
             .get("http_filters")
             .and_then(|f| f.as_array())
             .expect("http_filters");
-        assert_eq!(filters.len(), 14);
+        assert_eq!(filters.len(), 15);
         assert!(filters
             .iter()
             .find(|f| f.get("name").and_then(|n| n.as_str())

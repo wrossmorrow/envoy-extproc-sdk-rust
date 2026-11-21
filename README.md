@@ -290,6 +290,25 @@ _ = ctx.set_dynamic_metadata_namespace("com.acme.extproc", &HashMap::from([(
 ```
 Use `ctx.clear_dynamic_metadata()` to discard pending outbound metadata for the current phase. Note that envoy ignores returned namespaces unless they are listed in `metadata_options.receiving_namespaces.untyped`, and `protobuf.Struct` converts Go integer values to `float64` when read back via `AsMap()`.
 
+### Per-Message Timeout Override
+
+To request extra processing time on Envoy's current message timer mid-phase, call `ctx.override_message_timeout(...)` before slow work in a processor callback:
+```rust
+use std::time::Duration;
+
+if err := ctx.override_message_timeout(Duration::from_millis(750)); err != nil {
+    return err;
+}
+```
+This immediately sends an interim `ProcessingResponse` with `override_message_timeout` set (at most once per phase; no-op when the context runs in envoy `observability_mode`) and requires `max_message_timeout >= timeout >= 1ms` on the envoy `ext_proc` filter (`max_message_timeout` defaults to `0`, disabling overrides).
+
+> [!WARNING]
+> **`ext_proc` runs inline on Envoy's request/response hot path.** Think carefully before extending per-message timeouts in production:
+> - **Inline head-of-line blocking**: holding an `ext_proc` phase open keeps downstream connections, Envoy filter state, and any `BUFFERED` HTTP request/response bodies pinned in memory.
+> - **Concurrency amplification (Little's Law)**: multiplying per-request dwell time multiplies active concurrent gRPC streams at steady RPS — size the server's `MaxConcurrentStreams`, Envoy cluster `http2_protocol_options` / circuit breakers, and overall Envoy route timeouts together or slow calls will cascade into `503`/`504` failures.
+> - **Extra gRPC round-trip**: the interim override transmits an additional frame on the stream before the phase's final `ProcessingResponse`; gate it behind slow-path conditions rather than calling it unconditionally on every request.
+> - **Silent ignore when out of bounds**: if `max_message_timeout` is unset (`0`) or smaller than the requested duration (or `< 1ms`), Envoy increments `override_message_timeout_ignored` and keeps the original `message_timeout`.
+
 ## Conformance
 
 This repository includes a purpose-built [conformance](conformance) suite that exercises the SDK against live Envoy proxies, and tracks `ext_proc` v3 feature coverage across an Envoy version matrix.
