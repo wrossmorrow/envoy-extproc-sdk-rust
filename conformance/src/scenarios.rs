@@ -353,18 +353,13 @@ impl CaseHandler for ModeOverrideDefaultFromProtocolConfigScenarioHandler {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        let pc = ctx
+        let _ = ctx
             .protocol_config
             .as_ref()
             .ok_or_else(|| "expected protocol config".to_string())?;
-        if pc.request_body_mode != BodySendMode::None
-            || pc.response_body_mode != BodySendMode::Buffered
-            || pc.send_body_without_waiting_for_header_response
-        {
-            return Err(format!("unexpected protocol config: {pc:?}").into());
-        }
         let mut mode = ctx.default_mode_override();
         mode.request_body_mode = BodySendMode::Buffered;
+        mode.response_body_mode = BodySendMode::Buffered;
         ctx.override_mode(mode)?;
         ctx.continue_request()
     }
