@@ -53,6 +53,23 @@ struct ConformanceHarness {
 
 static HARNESS: OnceLock<Option<ConformanceHarness>> = OnceLock::new();
 
+impl ConformanceHarness {
+    /// The Envoy version this harness booted (or the resolved default when no
+    /// Envoy was started, e.g. when the harness skipped the live run).
+    fn booted_version(&self) -> String {
+        self.envoy
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|e| e.version().to_string())
+            .unwrap_or_else(default_version)
+    }
+}
+
+fn default_version() -> String {
+    envoy_conformance::resolve_envoy_version(None).unwrap_or_else(|_| "v1.40-latest".to_string())
+}
+
 fn hv(s: &str) -> HeaderValue {
     HeaderValue {
         value: s.to_string(),
@@ -199,15 +216,77 @@ fn get_harness() -> Option<&'static ConformanceHarness> {
         .as_ref()
 }
 
+fn test_key() -> String {
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_string();
+    if name.contains("::") {
+        name
+    } else {
+        format!("{}::{}", env!("CARGO_CRATE_NAME"), name)
+    }
+}
+
+fn outcomes() -> &'static Mutex<HashMap<String, envoy_conformance::report::TestOutcome>> {
+    static OUTCOMES: OnceLock<Mutex<HashMap<String, envoy_conformance::report::TestOutcome>>> =
+        OnceLock::new();
+    OUTCOMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_outcome(test: &str, outcome: envoy_conformance::report::TestOutcome) {
+    outcomes().lock().unwrap().insert(test.to_string(), outcome);
+}
+
+/// Write the accumulated conformance outcomes to `results-<version>.json` as
+/// JSON-lines, in the `go test -json`-style shape consumed by the report
+/// aggregator (`conformance report`).
+fn write_conformance_results(version: &str) -> Result<(), String> {
+    let outcomes = outcomes().lock().unwrap();
+    let mut tests: Vec<(&String, &envoy_conformance::report::TestOutcome)> =
+        outcomes.iter().collect();
+    tests.sort_by(|a, b| a.0.cmp(b.0));
+    let mut content = String::new();
+    for (test, outcome) in tests {
+        let action = match outcome {
+            envoy_conformance::report::TestOutcome::Pass => "pass",
+            envoy_conformance::report::TestOutcome::Fail => "fail",
+            envoy_conformance::report::TestOutcome::Skip => "skip",
+        };
+        let line = serde_json::to_string(&serde_json::json!({
+            "Action": action,
+            "Package": "envoy-conformance",
+            "Test": test,
+        }))
+        .map_err(|e| format!("marshal conformance outcome: {e}"))?;
+        content.push_str(&line);
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        std::fs::write(format!("results-{version}.json"), content)
+            .map_err(|e| format!("write conformance results file: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_conformance<F, Fut>(f: F)
 where
     F: FnOnce(&'static ConformanceHarness) -> Fut,
     Fut: Future<Output = ()>,
 {
+    let test = test_key();
     let Some(h) = get_harness() else {
+        record_outcome(&test, envoy_conformance::report::TestOutcome::Skip);
+        if let Err(e) = write_conformance_results(&default_version()) {
+            panic!("failed to write conformance results: {e}");
+        }
         return;
     };
     h.rt.block_on(f(h));
+    record_outcome(&test, envoy_conformance::report::TestOutcome::Pass);
+    if let Err(e) = write_conformance_results(&h.booted_version()) {
+        panic!("failed to write conformance results: {e}");
+    }
 }
 
 struct ResponseData {
