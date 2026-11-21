@@ -165,6 +165,8 @@ The `RequestContext` is initialized with request data when request headers are r
 * an accumulator `Duration` _for the time spent in external processing_
 * a flag `EndOfStream` from gRPC messages for header and body phases
 * a flag `ProtocolConfig` (`Option<ProtocolConfig>`) reflecting `ProcessingRequest.protocol_config` sent by envoy on the first message of the stream (`RequestBodyMode`, `ResponseBodyMode`, and `SendBodyWithoutWaitingForHeaderResponse`), retained across all phases of that stream
+* `Metadata` (`HashMap<String, HashMap<String, Value>>`) and `TypedMetadata` (`HashMap<String, Any>`) holding dynamic metadata forwarded by envoy (`metadata_options.forwarding_namespaces`), merged across phases of the stream
+* `Attributes` (`HashMap<String, Value>`) holding evaluated envoy/CEL `request_attributes` and `response_attributes` flattened by attribute name (e.g. `request.protocol`, `xds.route_name`, `response.code`), merged across phases of the stream
 
 This context is carried through every request phase, meaning that data can be shared _across_ phases particularly in the generic slot `data` for arbitrary values. Data is stored in a type-keyed map ([`http::Extensions`](https://docs.rs/http/latest/http/struct.Extensions.html)) so values are strongly typed rather than string-keyed trait objects. Define and access data with the `RequestContext::set_value` and `RequestContext::get_value` methods, which take and return typed values. See the [data](#data) or [digest](#digest) examples.
 
@@ -265,6 +267,28 @@ Or skip all remaining phases for a fast-path request:
 _ = rc.skip_remaining_phases()?;
 ```
 Use `clear_mode_override()` to undo a pending override in the same header phase. Note that Envoy's `ProcessingMode` proto has no "keep default" body enum (`BodySendMode::None` means "do not send"), so when calling `override_mode` during the request headers phase, either set both the request and response body modes explicitly or start from `mode := rc.default_mode_override()` (which pre-populates both body modes from `rc.protocol_config`). See the [masker](#masker) example for a processor that pairs dynamic mode overrides with buffered JSON body replacement.
+
+### Dynamic Metadata & Attributes
+
+When envoy configures `metadata_options.forwarding_namespaces`, `request_attributes`, or `response_attributes` on the `ext_proc` filter, envoy includes those values on incoming `ProcessingRequest` messages and the SDK merges them across all phases of the stream onto:
+* `ctx.Metadata` (`HashMap<String, HashMap<String, Value>>`) — untyped filter metadata keyed by namespace
+* `ctx.TypedMetadata` (`HashMap<String, Any>`) — typed filter metadata keyed by namespace
+* `ctx.Attributes` (`HashMap<String, Value>`) — evaluated CEL attributes flattened by attribute name
+
+To emit metadata back to downstream envoy filters or access logs (also attached to `CancelRequest` immediate responses), set it on the current phase:
+```rust
+use envoy_types::pb::google::protobuf::{Value, value::Kind};
+
+let tenant = Value { kind: Some(Kind::StringValue("acme".to_string())) };
+_ = ctx.set_dynamic_metadata("com.acme.extproc", "tenant", tenant)?;
+
+let risk_score = Value { kind: Some(Kind::NumberValue(0.1)) };
+_ = ctx.set_dynamic_metadata_namespace("com.acme.extproc", &HashMap::from([(
+    "risk_score".to_string(),
+    risk_score,
+)]))?;
+```
+Use `ctx.clear_dynamic_metadata()` to discard pending outbound metadata for the current phase. Note that envoy ignores returned namespaces unless they are listed in `metadata_options.receiving_namespaces.untyped`, and `protobuf.Struct` converts Go integer values to `float64` when read back via `AsMap()`.
 
 ## Conformance
 
