@@ -268,7 +268,7 @@ fn ext_proc_filter_json(
     json!({
         "name": name,
         "typed_config": {
-            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProc",
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
             "grpc_service": {
                 "envoy_grpc": {
                     "cluster_name": cluster_name,
@@ -294,9 +294,7 @@ fn ext_proc_overrides_json(mode: &Value, failure_mode_allow: Option<bool>) -> Va
     if let Some(failure_mode_allow) = failure_mode_allow {
         override_value["failure_mode_allow"] = json!(failure_mode_allow);
     }
-    json!({
-        "override": override_value,
-    })
+    override_value
 }
 
 fn route_json(
@@ -309,7 +307,7 @@ fn route_json(
     if disabled {
         return json!({
             "match": {
-                "path_prefix": prefix,
+                "prefix": prefix,
             },
             "route": {
                 "cluster": cluster,
@@ -317,16 +315,14 @@ fn route_json(
             "typed_per_filter_config": {
                 EXTPROC_FILTER_NAME: {
                     "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-                    "override": {
-                        "disabled": true,
-                    },
+                    "disabled": true,
                 },
             },
         });
     }
     json!({
         "match": {
-            "path_prefix": prefix,
+            "prefix": prefix,
         },
         "route": {
             "cluster": cluster,
@@ -334,7 +330,7 @@ fn route_json(
         "typed_per_filter_config": {
             EXTPROC_FILTER_NAME: {
                 "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-                "override": ext_proc_overrides_json(mode, failure_mode_allow),
+                "overrides": ext_proc_overrides_json(mode, failure_mode_allow),
             },
         },
     })
@@ -342,7 +338,7 @@ fn route_json(
 
 fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
     json!({
-        "@type": "type.googleapis.com/envoy.extensions.filters.http_connection_manager.v3.HttpConnectionManager",
+        "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
         "stat_prefix": "conformance_http",
         "codec_type": "AUTO",
         "http_protocol_options": {
@@ -481,7 +477,7 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
                         ),
                         {
                             "match": {
-                                "path_prefix": "/",
+                                "prefix": "/",
                             },
                             "route": {
                                 "cluster": UPSTREAM_PRIMARY_CLUSTER,
@@ -612,7 +608,7 @@ mod tests {
                 .get("@type")
                 .and_then(|t| t.as_str())
                 .expect("typed_config @type"),
-            "type.googleapis.com/envoy.extensions.filters.http_connection_manager.v3.HttpConnectionManager"
+            "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
         );
         let filters = typed
             .get("http_filters")
@@ -669,7 +665,7 @@ mod tests {
             .iter()
             .map(|r| {
                 r.get("match")
-                    .and_then(|m| m.get("path_prefix"))
+                    .and_then(|m| m.get("prefix"))
                     .and_then(|p| p.as_str())
                     .unwrap_or_default()
             })
