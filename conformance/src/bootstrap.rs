@@ -274,8 +274,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         5_000,
         &default_mode,
         Some(&json!({
-            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.MetadataOptions",
-            "receivingNamespaces": {
+            "receiving_namespaces": {
                 "untyped": ["com.conformance.extproc"],
             },
         })),
@@ -289,8 +288,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         5_000,
         &default_mode,
         Some(&json!({
-            "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.MetadataOptions",
-            "forwardingNamespaces": {
+            "forwarding_namespaces": {
                 "untyped": ["com.conformance.extproc", "com.conformance.unallowed"],
             },
         })),
@@ -471,15 +469,15 @@ fn ext_proc_filter_json_with_dynamic_metadata(
         false,
     );
     if let Some(metadata_options) = metadata_options {
-        filter["typed_config"]["metadataOptions"] = metadata_options.clone();
+        filter["typed_config"]["metadata_options"] = metadata_options.clone();
     }
     if !request_attributes.is_empty() {
         let values: Vec<Value> = request_attributes.iter().map(|s| json!(s)).collect();
-        filter["typed_config"]["requestAttributes"] = Value::Array(values);
+        filter["typed_config"]["request_attributes"] = Value::Array(values);
     }
     if !response_attributes.is_empty() {
         let values: Vec<Value> = response_attributes.iter().map(|s| json!(s)).collect();
-        filter["typed_config"]["responseAttributes"] = Value::Array(values);
+        filter["typed_config"]["response_attributes"] = Value::Array(values);
     }
     filter
 }
@@ -1197,11 +1195,11 @@ mod tests {
         let meta_first = find_filter(EXTPROC_META_FIRST_FILTER_NAME);
         let receiving_namespaces = meta_first
             .get("typed_config")
-            .and_then(|t| t.get("metadataOptions"))
-            .and_then(|m| m.get("receivingNamespaces"))
+            .and_then(|t| t.get("metadata_options"))
+            .and_then(|m| m.get("receiving_namespaces"))
             .and_then(|m| m.get("untyped"))
             .and_then(|v| v.as_array())
-            .expect("meta first receivingNamespaces");
+            .expect("meta first receiving_namespaces");
         assert_eq!(receiving_namespaces.len(), 1);
         assert_eq!(
             receiving_namespaces[0].as_str(),
@@ -1210,11 +1208,11 @@ mod tests {
         let meta_second = find_filter(EXTPROC_META_SECOND_FILTER_NAME);
         let forwarding_namespaces = meta_second
             .get("typed_config")
-            .and_then(|t| t.get("metadataOptions"))
-            .and_then(|m| m.get("forwardingNamespaces"))
+            .and_then(|t| t.get("metadata_options"))
+            .and_then(|m| m.get("forwarding_namespaces"))
             .and_then(|m| m.get("untyped"))
             .and_then(|v| v.as_array())
-            .expect("meta second forwardingNamespaces");
+            .expect("meta second forwarding_namespaces");
         assert_eq!(forwarding_namespaces.len(), 2);
         assert_eq!(
             forwarding_namespaces[0].as_str(),
@@ -1227,17 +1225,17 @@ mod tests {
         let attributes = find_filter(EXTPROC_ATTRIBUTES_FILTER_NAME);
         let request_attributes = attributes
             .get("typed_config")
-            .and_then(|t| t.get("requestAttributes"))
+            .and_then(|t| t.get("request_attributes"))
             .and_then(|v| v.as_array())
-            .expect("attributes requestAttributes");
+            .expect("attributes request_attributes");
         assert_eq!(request_attributes.len(), 5);
         assert_eq!(request_attributes[0].as_str(), Some("request.path"));
         assert_eq!(request_attributes[4].as_str(), Some("xds.route_name"));
         let response_attributes = attributes
             .get("typed_config")
-            .and_then(|t| t.get("responseAttributes"))
+            .and_then(|t| t.get("response_attributes"))
             .and_then(|v| v.as_array())
-            .expect("attributes responseAttributes");
+            .expect("attributes response_attributes");
         assert_eq!(response_attributes.len(), 1);
         assert_eq!(response_attributes[0].as_str(), Some("response.code"));
 
