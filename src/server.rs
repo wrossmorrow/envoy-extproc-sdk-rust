@@ -772,7 +772,8 @@ mod tests {
     use prometheus::Registry;
 
     use crate::context::{
-        default_phase_if_invalid, request_phase_to_string, RequestContext, RequestPhase,
+        default_phase_if_invalid, request_phase_to_string, BodySendMode, HeaderSendMode,
+        ModeOverride, RequestContext, RequestPhase,
     };
     use crate::headers::AllHeaders;
 
@@ -1100,6 +1101,262 @@ mod tests {
         fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    // Test processor that expresses a dynamic mode override (and optional
+    // header mutations) during the request headers phase, and may error during
+    // the request body phase.
+    struct ModeOverrideProcessor {
+        name: String,
+        opts: Option<ProcessingOptions>,
+        override_mode: Option<ModeOverride>,
+        added_headers: Vec<(String, Vec<u8>)>,
+        error_in_request_body: bool,
+    }
+
+    impl ModeOverrideProcessor {
+        fn new(
+            name: &str,
+            opts: Option<ProcessingOptions>,
+            override_mode: Option<ModeOverride>,
+            added_headers: Vec<(String, Vec<u8>)>,
+            error_in_request_body: bool,
+        ) -> Self {
+            Self {
+                name: name.to_string(),
+                opts,
+                override_mode,
+                added_headers,
+                error_in_request_body,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RequestProcessor for ModeOverrideProcessor {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn options(&self) -> &ProcessingOptions {
+            self.opts.as_ref().unwrap()
+        }
+        async fn process_request_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            for (n, v) in &self.added_headers {
+                ctx.add_header(
+                    n,
+                    &HeaderValue {
+                        value: String::new(),
+                        raw_value: Some(v.clone()),
+                    },
+                )?;
+            }
+            if let Some(mode) = &self.override_mode {
+                ctx.override_mode(*mode)?;
+            }
+            ctx.continue_request()
+        }
+        async fn process_request_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_request_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            if self.error_in_request_body {
+                return Err("mode override rejected in body phase".into());
+            }
+            ctx.continue_request()
+        }
+        async fn process_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn process_response_trailers(
+            &self,
+            ctx: &mut RequestContext,
+            _trailers: &AllHeaders,
+        ) -> Result<(), Error> {
+            ctx.continue_request()
+        }
+        async fn error_handler(
+            &self,
+            _ctx: &mut RequestContext,
+            _phase: RequestPhase,
+            _err: Error,
+        ) {
+        }
+        fn close(&self, _grace_period_seconds: i32) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_mode_override_propagates_and_headers() {
+        // An external processor that overrides the mode during the request
+        // headers phase must surface it on the envoy-facing response, alongside
+        // the header mutations it accumulated.
+        let proc = Arc::new(ModeOverrideProcessor::new(
+            "mode-override",
+            Some(ProcessingOptions::new()),
+            Some(ModeOverride {
+                response_header_mode: HeaderSendMode::Default,
+                request_body_mode: BodySendMode::Buffered,
+                response_body_mode: BodySendMode::Streamed,
+                request_trailer_mode: HeaderSendMode::Send,
+                response_trailer_mode: HeaderSendMode::Skip,
+            }),
+            vec![("x-checked".to_string(), b"true".to_vec())],
+            false,
+        ));
+        let server = GenericExtProcServer::new(
+            "mode-override".to_string(),
+            proc.clone(),
+            Some(ProcessingOptions::new()),
+            Metrics::new(),
+        );
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        let req = processing_request(Some(ProcessingRequestOneof::RequestHeaders(http_headers(
+            Some(&envoy_header_map(&[(":method", "POST")])),
+            false,
+        ))));
+        let (resp, phase) = server.process_phase(&req, &mut rc).await.unwrap();
+        assert_eq!(phase, RequestPhase::RequestHeaders);
+        assert!(resp.is_some());
+        assert!(matches!(
+            resp.as_ref().unwrap().response,
+            Some(ResponseOneof::RequestHeaders(_))
+        ));
+        let response = resp.as_ref().unwrap();
+        let mo = response
+            .mode_override
+            .as_ref()
+            .expect("expected mode override on request headers response");
+        assert_eq!(mo.response_header_mode, i32::from(HeaderSendMode::Default));
+        assert_eq!(mo.request_body_mode, i32::from(BodySendMode::Buffered));
+        assert_eq!(mo.response_body_mode, i32::from(BodySendMode::Streamed));
+        assert_eq!(mo.request_trailer_mode, i32::from(HeaderSendMode::Send));
+        assert_eq!(mo.response_trailer_mode, i32::from(HeaderSendMode::Skip));
+
+        let (hm, _) = rc.resolved_header_mutation();
+        let hm = hm.expect("expected a resolved header mutation");
+        assert_eq!(hm.set_headers.len(), 1);
+        assert_eq!(hm.set_headers[0].header.as_ref().unwrap().key, "x-checked");
+        assert_eq!(
+            hm.set_headers[0].header.as_ref().unwrap().raw_value,
+            b"true".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_phase_mode_override_rejected_in_body_phase() {
+        // A mode override expressed during the request body phase must be
+        // rejected; with abort-on-failure the phase error propagates and is
+        // counted, and the exchange ends errored.
+        let server = Arc::new(GenericExtProcServer::new(
+            "mode-override".to_string(),
+            Arc::new(ModeOverrideProcessor::new(
+                "mode-override",
+                Some(ProcessingOptions::new()),
+                Some(ModeOverride {
+                    response_header_mode: HeaderSendMode::Default,
+                    request_body_mode: BodySendMode::Buffered,
+                    response_body_mode: BodySendMode::Streamed,
+                    request_trailer_mode: HeaderSendMode::Send,
+                    response_trailer_mode: HeaderSendMode::Skip,
+                }),
+                vec![],
+                true,
+            )),
+            Some(ProcessingOptions {
+                abort_on_processor_failure: true,
+                ..ProcessingOptions::new()
+            }),
+            Metrics::new(),
+        ));
+
+        let (in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<ProcessingRequest, tonic::Status>>(1);
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task_server = server.clone();
+        tokio::spawn(async move {
+            run_phase_task(
+                task_server,
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(in_rx)),
+                out_tx,
+            )
+            .await;
+        });
+
+        let mut stream = ProcessStream {
+            server: server.clone(),
+            rx: out_rx,
+            errored: false,
+        };
+
+        in_tx
+            .send(Ok(processing_request(Some(
+                ProcessingRequestOneof::RequestBody(HttpBody {
+                    body: b"payload".to_vec(),
+                    end_of_stream: true,
+                    end_of_stream_without_message: false,
+                    grpc_message_compressed: false,
+                    drain_complete: false,
+                }),
+            ))))
+            .await
+            .unwrap();
+        in_tx
+            .send(Ok(processing_request(Some(
+                ProcessingRequestOneof::RequestHeaders(http_headers(
+                    Some(&envoy_header_map(&[(":method", "POST")])),
+                    false,
+                )),
+            ))))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out waiting for the phase response")
+            .expect("stream ended before a phase response was produced");
+        assert!(response.is_err());
+
+        drop(in_tx);
+        drop(stream);
+
+        let registry = Registry::new();
+        server.metrics.register(&registry).unwrap();
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_phase_errors_total")
+            .expect("expected phase errors family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
+        let family = families
+            .iter()
+            .find(|f| f.name() == "extproc_errored_streams")
+            .expect("expected errored streams family");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value(), 1.0);
     }
 
     #[tokio::test]

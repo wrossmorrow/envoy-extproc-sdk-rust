@@ -42,8 +42,11 @@ pub mod tester;
 
 pub use context::HeaderAppendAction;
 pub use context::{
-    default_phase_if_invalid, request_phase_to_string, HeaderValue, PhaseResponse, RequestContext,
-    RequestPhase,
+    default_phase_if_invalid, request_phase_to_string, HeaderValue, ModeOverride, PhaseResponse,
+    RequestContext, RequestPhase,
+};
+pub use envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::processing_mode::{
+    BodySendMode, HeaderSendMode,
 };
 pub use headers::AllHeaders;
 pub use health::HealthServer;

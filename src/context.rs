@@ -8,6 +8,10 @@ use http::Extensions;
 pub use envoy_types::pb::envoy::config::core::v3::header_value_option::HeaderAppendAction;
 use envoy_types::pb::envoy::config::core::v3::HeaderValue as EnvoyHeaderValue;
 use envoy_types::pb::envoy::config::core::v3::HeaderValueOption;
+pub use envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::processing_mode::{
+    BodySendMode, HeaderSendMode,
+};
+use envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::ProcessingMode;
 use envoy_types::pb::envoy::service::ext_proc::v3::body_mutation::Mutation as BodyMutationMutation;
 use envoy_types::pb::envoy::service::ext_proc::v3::processing_response::Response as ProcessingResponseResponse;
 use envoy_types::pb::envoy::service::ext_proc::v3::BodyMutation;
@@ -259,6 +263,61 @@ pub fn build_header_values_from_map(
     out
 }
 
+/// A dynamic processing mode override, as requested by an external processor
+/// via [`override_mode`](RequestContext::override_mode), and surfaced to envoy
+/// as [`ProcessingResponse::mode_override`](envoy_types::pb::envoy::service::ext_proc::v3::ProcessingResponse::mode_override).
+///
+/// Envoy only honors overrides while the `ext_proc` filter is configured with
+/// `allow_mode_override: true`, and only during the phases where an override
+/// may be expressed (see [`override_mode`](RequestContext::override_mode)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct ModeOverride {
+    /// How envoy should send response headers in subsequent phases. Use
+    /// [`HeaderSendMode::Default`] to keep the filter's configured mode.
+    pub response_header_mode: HeaderSendMode,
+    /// How envoy should send request bodies in subsequent phases. Use
+    /// [`BodySendMode::None`] to not send the body at all.
+    pub request_body_mode: BodySendMode,
+    /// How envoy should send response bodies in subsequent phases. Use
+    /// [`BodySendMode::None`] to not send the body at all.
+    pub response_body_mode: BodySendMode,
+    /// How envoy should send request trailers in subsequent phases. Use
+    /// [`HeaderSendMode::Default`] to keep the filter's configured mode, or
+    /// [`HeaderSendMode::Skip`] to not send them.
+    pub request_trailer_mode: HeaderSendMode,
+    /// How envoy should send response trailers in subsequent phases. Use
+    /// [`HeaderSendMode::Default`] to keep the filter's configured mode, or
+    /// [`HeaderSendMode::Skip`] to not send them.
+    pub response_trailer_mode: HeaderSendMode,
+}
+
+impl ModeOverride {
+    /// Convert the override into envoy's [`ProcessingMode`], validating that
+    /// every mode value is one envoy accepts. Envoy has no "keep default" body
+    /// mode (`BodySendMode::None` means "do not send"), so callers overriding
+    /// during the request headers phase should set both body modes explicitly.
+    pub fn to_envoy_processing_mode(&self) -> Result<ProcessingMode, Error> {
+        let response_header_mode = HeaderSendMode::try_from(self.response_header_mode as i32)
+            .map_err(|_| "invalid mode override: unknown response header mode".to_string())?;
+        let request_trailer_mode = HeaderSendMode::try_from(self.request_trailer_mode as i32)
+            .map_err(|_| "invalid mode override: unknown request trailer mode".to_string())?;
+        let response_trailer_mode = HeaderSendMode::try_from(self.response_trailer_mode as i32)
+            .map_err(|_| "invalid mode override: unknown response trailer mode".to_string())?;
+        let request_body_mode = BodySendMode::try_from(self.request_body_mode as i32)
+            .map_err(|_| "invalid mode override: unknown request body mode".to_string())?;
+        let response_body_mode = BodySendMode::try_from(self.response_body_mode as i32)
+            .map_err(|_| "invalid mode override: unknown response body mode".to_string())?;
+        Ok(ProcessingMode {
+            request_header_mode: i32::from(HeaderSendMode::Default),
+            response_header_mode: i32::from(response_header_mode),
+            request_body_mode: i32::from(request_body_mode),
+            response_body_mode: i32::from(response_body_mode),
+            request_trailer_mode: i32::from(request_trailer_mode),
+            response_trailer_mode: i32::from(response_trailer_mode),
+        })
+    }
+}
+
 /// The mutable, phase-scoped response being assembled by a processor.
 #[derive(Clone, Default)]
 pub struct PhaseResponse {
@@ -270,6 +329,10 @@ pub struct PhaseResponse {
     pub continue_request: Option<CommonResponse>,
     /// An immediate response to the data plane, if set.
     pub immediate_response: Option<ImmediateResponse>,
+    /// The dynamic mode override pending for the current phase, attached to
+    /// the header responses envoy accepts alongside `mode_override`. Cleared
+    /// by [`reset_phase`](RequestContext::reset_phase).
+    pub mode_override: Option<ProcessingMode>,
     /// Whether to clear the route cache after the current phase.
     pub clear_route_cache: bool,
 }
@@ -285,6 +348,7 @@ impl PhaseResponse {
         self.body_mutation = None;
         self.continue_request = None;
         self.immediate_response = None;
+        self.mode_override = None;
         self.clear_route_cache = false;
     }
 }
@@ -423,6 +487,66 @@ impl RequestContext {
         self.response.clear_route_cache = false;
     }
 
+    /// Override how envoy sends headers, bodies, and trailers in subsequent
+    /// phases of the current request/response, via envoy's
+    /// `ProcessingResponse.mode_override`.
+    ///
+    /// Only the request headers and response headers phases accept an
+    /// override (the phases in which envoy lets a processor express one);
+    /// errors are returned for every other phase without mutating state. The
+    /// override is attached to the next phase response envoy sends for this
+    /// exchange, and cleared by [`reset_phase`](RequestContext::reset_phase).
+    ///
+    /// Requires the envoy `ext_proc` filter to be configured with
+    /// `allow_mode_override: true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called during a phase that does not accept
+    /// overrides, or when a mode value is not valid for envoy.
+    pub fn override_mode(&mut self, mode: ModeOverride) -> Result<(), Error> {
+        let allows_override = matches!(
+            self.phase,
+            RequestPhase::Undetermined
+                | RequestPhase::RequestHeaders
+                | RequestPhase::ResponseHeaders
+        );
+        if !allows_override {
+            return Err(format!(
+                "mode_override is only supported during header phases, not {}",
+                self.get_phase_name()
+            )
+            .into());
+        }
+        let envoy_mode = mode.to_envoy_processing_mode()?;
+        self.response.mode_override = Some(envoy_mode);
+        Ok(())
+    }
+
+    /// Clear any pending mode override for the current phase, without sending
+    /// a response. See [`override_mode`](RequestContext::override_mode).
+    pub fn clear_mode_override(&mut self) {
+        self.response.mode_override = None;
+    }
+
+    /// Skip all remaining phases of the current request/response, via envoy's
+    /// `ProcessingResponse.mode_override`, and continue the exchange without
+    /// further processing. See [`override_mode`](RequestContext::override_mode).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current phase does not accept an override, or
+    /// when the resulting mode values are not valid for envoy.
+    pub fn skip_remaining_phases(&mut self) -> Result<(), Error> {
+        self.override_mode(ModeOverride {
+            response_header_mode: HeaderSendMode::Skip,
+            request_body_mode: BodySendMode::None,
+            response_body_mode: BodySendMode::None,
+            request_trailer_mode: HeaderSendMode::Skip,
+            response_trailer_mode: HeaderSendMode::Skip,
+        })
+    }
+
     /// Build the [`ProcessingResponse`] for the given phase, honoring an
     /// immediate response set by the processor when the phase allows it, and
     /// otherwise returning a "continue" response.
@@ -497,6 +621,14 @@ impl RequestContext {
 
         Ok(Some(ProcessingResponse {
             response,
+            mode_override: if matches!(
+                phase,
+                RequestPhase::RequestHeaders | RequestPhase::ResponseHeaders
+            ) {
+                self.response.mode_override
+            } else {
+                None
+            },
             ..Default::default()
         }))
     }
@@ -952,13 +1084,201 @@ mod tests {
             body_mutation: None,
             immediate_response: None,
             continue_request: None,
+            mode_override: None,
             clear_route_cache: true,
         };
         pr.reset();
         assert!(pr.header_mutation.is_some());
         assert!(pr.continue_request.is_none());
         assert!(pr.immediate_response.is_none());
+        assert!(pr.mode_override.is_none());
         assert!(!pr.clear_route_cache);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic processing mode overrides (envoy `ProcessingResponse.mode_override`)
+    // -----------------------------------------------------------------------
+
+    fn envoy_processing_mode(
+        mode: &ModeOverride,
+    ) -> envoy_types::pb::envoy::extensions::filters::http::ext_proc::v3::ProcessingMode {
+        mode.to_envoy_processing_mode()
+            .expect("expected valid mode override")
+    }
+
+    #[test]
+    fn test_mode_override_to_envoy_processing_mode() {
+        // A dynamic override expresses how envoy should send subsequent phases;
+        // the request header mode is always DEFAULT (envoy ignores overrides
+        // for the phase that produced them).
+        let mode = ModeOverride {
+            response_header_mode: HeaderSendMode::Default,
+            request_body_mode: BodySendMode::Buffered,
+            response_body_mode: BodySendMode::Streamed,
+            request_trailer_mode: HeaderSendMode::Send,
+            response_trailer_mode: HeaderSendMode::Skip,
+        };
+        let pm = envoy_processing_mode(&mode);
+        assert_eq!(pm.request_header_mode, i32::from(HeaderSendMode::Default));
+        assert_eq!(pm.response_header_mode, i32::from(HeaderSendMode::Default));
+        assert_eq!(pm.request_body_mode, i32::from(BodySendMode::Buffered));
+        assert_eq!(pm.response_body_mode, i32::from(BodySendMode::Streamed));
+        assert_eq!(pm.request_trailer_mode, i32::from(HeaderSendMode::Send));
+        assert_eq!(pm.response_trailer_mode, i32::from(HeaderSendMode::Skip));
+
+        // Skipping every remaining phase (the SkipRemainingPhases shortcut)
+        // maps onto the envoy wire values.
+        let skip = ModeOverride {
+            response_header_mode: HeaderSendMode::Skip,
+            request_body_mode: BodySendMode::None,
+            response_body_mode: BodySendMode::None,
+            request_trailer_mode: HeaderSendMode::Skip,
+            response_trailer_mode: HeaderSendMode::Skip,
+        };
+        let pm = envoy_processing_mode(&skip);
+        assert_eq!(pm.request_header_mode, i32::from(HeaderSendMode::Default));
+        assert_eq!(pm.response_header_mode, i32::from(HeaderSendMode::Skip));
+        assert_eq!(pm.request_body_mode, i32::from(BodySendMode::None));
+        assert_eq!(pm.response_body_mode, i32::from(BodySendMode::None));
+        assert_eq!(pm.request_trailer_mode, i32::from(HeaderSendMode::Skip));
+        assert_eq!(pm.response_trailer_mode, i32::from(HeaderSendMode::Skip));
+    }
+
+    #[test]
+    fn test_override_mode_allowed_phases_and_rejected_phases() {
+        // Overrides may be expressed during the request headers and response
+        // headers phases (and while undetermined), and must be rejected during
+        // body and trailer phases without mutating state.
+        for phase in [
+            RequestPhase::Undetermined,
+            RequestPhase::RequestHeaders,
+            RequestPhase::ResponseHeaders,
+        ] {
+            let mut rc = RequestContext::new();
+            rc.reset_phase().unwrap();
+            rc.set_phase(phase);
+            assert!(rc.override_mode(ModeOverride::default()).is_ok());
+            assert!(rc.skip_remaining_phases().is_ok());
+        }
+
+        for phase in [
+            RequestPhase::RequestBody,
+            RequestPhase::ResponseBody,
+            RequestPhase::RequestTrailers,
+            RequestPhase::ResponseTrailers,
+        ] {
+            let mut rc = RequestContext::new();
+            rc.reset_phase().unwrap();
+            rc.set_phase(phase);
+            assert!(rc
+                .override_mode(ModeOverride::default())
+                .err()
+                .is_some_and(|e| e
+                    .to_string()
+                    .contains("mode_override is only supported during header phases")));
+            assert!(rc.skip_remaining_phases().is_err());
+            assert!(rc.response.mode_override.is_none());
+        }
+    }
+
+    #[test]
+    fn test_override_mode_stores_accepted_override_and_replaces_it() {
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        assert!(rc
+            .override_mode(ModeOverride {
+                response_header_mode: HeaderSendMode::Default,
+                request_body_mode: BodySendMode::Buffered,
+                response_body_mode: BodySendMode::Streamed,
+                request_trailer_mode: HeaderSendMode::Send,
+                response_trailer_mode: HeaderSendMode::Skip,
+            })
+            .is_ok());
+        assert!(rc
+            .response
+            .mode_override
+            .as_ref()
+            .is_some_and(|m| m.request_body_mode == i32::from(BodySendMode::Buffered)));
+
+        // A later accepted override replaces the pending one for the phase.
+        assert!(rc
+            .override_mode(ModeOverride {
+                response_header_mode: HeaderSendMode::Skip,
+                request_body_mode: BodySendMode::None,
+                response_body_mode: BodySendMode::Buffered,
+                request_trailer_mode: HeaderSendMode::Skip,
+                response_trailer_mode: HeaderSendMode::Skip,
+            })
+            .is_ok());
+        assert!(rc
+            .response
+            .mode_override
+            .as_ref()
+            .is_some_and(|m| m.response_header_mode == i32::from(HeaderSendMode::Skip)));
+        assert!(rc
+            .response
+            .mode_override
+            .as_ref()
+            .is_some_and(|m| m.request_body_mode == i32::from(BodySendMode::None)));
+    }
+
+    #[test]
+    fn test_get_response_propagates_mode_override_and_clears_it() {
+        for phase in [RequestPhase::RequestHeaders, RequestPhase::ResponseHeaders] {
+            let mut rc = RequestContext::new();
+            rc.reset_phase().unwrap();
+            rc.set_phase(phase);
+            assert!(rc
+                .override_mode(ModeOverride {
+                    response_header_mode: HeaderSendMode::Skip,
+                    request_body_mode: BodySendMode::Buffered,
+                    response_body_mode: BodySendMode::Streamed,
+                    request_trailer_mode: HeaderSendMode::Send,
+                    response_trailer_mode: HeaderSendMode::Skip,
+                })
+                .is_ok());
+
+            let resp = rc.get_response(phase).unwrap().unwrap();
+            let mo = resp.mode_override.as_ref().expect("expected mode override");
+            assert_eq!(mo.response_header_mode, i32::from(HeaderSendMode::Skip));
+            assert_eq!(mo.request_body_mode, i32::from(BodySendMode::Buffered));
+            assert_eq!(mo.response_body_mode, i32::from(BodySendMode::Streamed));
+            assert_eq!(mo.request_trailer_mode, i32::from(HeaderSendMode::Send));
+            assert_eq!(mo.response_trailer_mode, i32::from(HeaderSendMode::Skip));
+
+            rc.clear_mode_override();
+            let resp = rc.get_response(phase).unwrap().unwrap();
+            assert!(resp.mode_override.is_none());
+
+            assert!(rc.skip_remaining_phases().is_ok());
+            assert!(rc.reset_phase().is_ok());
+            let resp = rc.get_response(phase).unwrap().unwrap();
+            assert!(resp.mode_override.is_none());
+        }
+    }
+
+    #[test]
+    fn test_get_response_omits_mode_override_for_immediate_response() {
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        assert!(rc
+            .override_mode(ModeOverride {
+                response_header_mode: HeaderSendMode::Default,
+                request_body_mode: BodySendMode::Buffered,
+                response_body_mode: BodySendMode::None,
+                request_trailer_mode: HeaderSendMode::Default,
+                response_trailer_mode: HeaderSendMode::Default,
+            })
+            .is_ok());
+        rc.cancel_request(429, &HashMap::new(), &[]).unwrap();
+        let resp = rc
+            .get_response(RequestPhase::RequestHeaders)
+            .unwrap()
+            .unwrap();
+        assert!(resp.mode_override.is_none());
+        assert!(resp.response.is_some());
     }
 
     #[test]
