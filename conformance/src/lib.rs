@@ -36,9 +36,10 @@ pub use report::{
 pub use scenarios::{
     buffered_body_replace_grow_and_shrink_handler, get_nobody_mode_none_handler,
     immediate_response_request_headers_handler, mode_override_allowlist_denied_handler,
-    mode_override_allowlist_ok_handler, mode_override_disabled_handler,
-    mode_override_full_resp_handler, mode_override_handler, mode_override_resp_stream_handler,
-    mode_override_skip_handler, post_with_body_mode_none_handler, register_scenario_handlers,
+    mode_override_allowlist_ok_handler, mode_override_default_from_protocol_config_handler,
+    mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,
+    mode_override_resp_stream_handler, mode_override_skip_handler,
+    post_with_body_mode_none_handler, protocol_config_handler, register_scenario_handlers,
     scenario_handler, scenario_handlers,
 };
 pub use upstream::{UpstreamEcho, UpstreamServer};

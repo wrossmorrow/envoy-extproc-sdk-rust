@@ -164,6 +164,7 @@ The `RequestContext` is initialized with request data when request headers are r
 * the request processing stream start time in `Started`
 * an accumulator `Duration` _for the time spent in external processing_
 * a flag `EndOfStream` from gRPC messages for header and body phases
+* a flag `ProtocolConfig` (`Option<ProtocolConfig>`) reflecting `ProcessingRequest.protocol_config` sent by envoy on the first message of the stream (`RequestBodyMode`, `ResponseBodyMode`, and `SendBodyWithoutWaitingForHeaderResponse`), retained across all phases of that stream
 
 This context is carried through every request phase, meaning that data can be shared _across_ phases particularly in the generic slot `data` for arbitrary values. Data is stored in a type-keyed map ([`http::Extensions`](https://docs.rs/http/latest/http/struct.Extensions.html)) so values are strongly typed rather than string-keyed trait objects. Define and access data with the `RequestContext::set_value` and `RequestContext::get_value` methods, which take and return typed values. See the [data](#data) or [digest](#digest) examples.
 
@@ -263,7 +264,7 @@ Or skip all remaining phases for a fast-path request:
 ```rust
 _ = rc.skip_remaining_phases()?;
 ```
-Use `clear_mode_override()` to undo a pending override in the same header phase. Note that Envoy's `ProcessingMode` proto has no "keep default" body enum (`BodySendMode::None` means "do not send"), so when calling `override_mode` during the request headers phase, set both the request and response body modes explicitly. See the [masker](#masker) example for a processor that pairs dynamic mode overrides with buffered JSON body replacement.
+Use `clear_mode_override()` to undo a pending override in the same header phase. Note that Envoy's `ProcessingMode` proto has no "keep default" body enum (`BodySendMode::None` means "do not send"), so when calling `override_mode` during the request headers phase, either set both the request and response body modes explicitly or start from `mode := rc.default_mode_override()` (which pre-populates both body modes from `rc.protocol_config`). See the [masker](#masker) example for a processor that pairs dynamic mode overrides with buffered JSON body replacement.
 
 ## Conformance
 
