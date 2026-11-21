@@ -69,7 +69,7 @@ jobs:
           cargo test --manifest-path Cargo.toml -v
       - name: Upload conformance results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-results-${{ matrix.envoy }}
           path: conformance/results-${{ matrix.envoy }}.json
@@ -83,7 +83,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
       - name: Download conformance results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: conformance-results-*
           merge-multiple: true
@@ -96,7 +96,7 @@ jobs:
           cargo run --manifest-path Cargo.toml --bin report -- --results-dir ./ --markdown-out "${GITHUB_STEP_SUMMARY}" --json-out conformance-summary.json
       - name: Upload conformance summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-summary
           path: conformance/conformance-summary.json
