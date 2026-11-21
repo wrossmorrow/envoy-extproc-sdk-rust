@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::bootstrap::{build_bootstrap_json, BootstrapParams};
 use envoy_extproc_sdk::Error;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes as HyperBytes;
@@ -170,6 +171,23 @@ pub async fn check_docker_available() -> Result<(), Error> {
     Ok(())
 }
 
+fn bootstrap_json_from_cfg(cfg: &EnvoyConfig) -> Result<String, Error> {
+    if !cfg.bootstrap_json.is_empty() {
+        return Ok(cfg.bootstrap_json.clone());
+    }
+    build_bootstrap_json(&BootstrapParams {
+        version: cfg.version.clone(),
+        upstream_host: cfg.upstream_host.clone(),
+        primary_upstream_port: cfg.primary_upstream_port,
+        secondary_upstream_port: cfg.secondary_upstream_port,
+        ext_proc_port: cfg.ext_proc_port,
+        abort_ext_proc_port: cfg.abort_ext_proc_port,
+        secondary_ext_proc_port: cfg.secondary_ext_proc_port,
+        listener_port: cfg.listener_port,
+        admin_port: cfg.admin_port,
+    })
+}
+
 fn http_client() -> Client<HttpConnector, Full<HyperBytes>> {
     Client::builder(TokioExecutor::new()).build_http()
 }
@@ -275,8 +293,9 @@ async fn start_binary_envoy(
         cfg.admin_port
     };
 
+    let bootstrap_json = bootstrap_json_from_cfg(cfg)?;
     let mut cmd = Command::new(envoy_bin);
-    cmd.args(["--config-yaml", &cfg.bootstrap_json])
+    cmd.args(["--config-yaml", &bootstrap_json])
         .args(["--log-level", "warn"])
         .args(["--concurrency", "2"])
         .stdout(std::process::Stdio::piped())
@@ -326,6 +345,7 @@ async fn start_binary_envoy(
 
 async fn start_docker_envoy(version: &str, cfg: &EnvoyConfig) -> Result<EnvoyRunner, Error> {
     check_docker_available().await?;
+    let bootstrap_json = bootstrap_json_from_cfg(cfg)?;
     let container_name = format!("extproc-conformance-{}", std::process::id());
     let run_cmd = Command::new("docker")
         .args([
@@ -340,7 +360,7 @@ async fn start_docker_envoy(version: &str, cfg: &EnvoyConfig) -> Result<EnvoyRun
         .args(["-p", &format!("127.0.0.1::{}", DOCKER_LISTENER_PORT)])
         .args(["-p", &format!("127.0.0.1::{}", DOCKER_ADMIN_PORT)])
         .arg("envoyproxy/envoy")
-        .args(["envoy", "--config-yaml", &cfg.bootstrap_json])
+        .args(["envoy", "--config-yaml", &bootstrap_json])
         .args(["--log-level", "warn"])
         .args(["--concurrency", "2"])
         .output()

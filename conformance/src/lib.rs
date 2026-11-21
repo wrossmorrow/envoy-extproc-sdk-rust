@@ -8,6 +8,7 @@
 //! [`envoy_extproc_sdk::GenericExtProcServer`] against a running Envoy
 //! instance.
 
+pub mod bootstrap;
 pub mod envoy_runner;
 pub mod envoy_versions;
 pub mod features;
@@ -15,6 +16,7 @@ pub mod processor;
 pub mod report;
 pub mod upstream;
 
+pub use bootstrap::{build_bootstrap, build_bootstrap_json, BootstrapParams};
 pub use envoy_runner::{check_docker_available, start_envoy_runner, EnvoyConfig, EnvoyRunner};
 pub use envoy_versions::{
     load_envoy_versions, resolve_envoy_version, sync_envoy_versions_from_eol, EnvoyVersionManifest,
