@@ -1,0 +1,37 @@
+[package]
+name = "envoy-conformance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Envoy conformance harness and reporting tooling for the envoy_extproc_sdk Rust crate"
+license = "Apache-2.0"
+
+[workspace]
+
+[[bin]]
+name = "report"
+path = "src/bin/report.rs"
+
+[[bin]]
+name = "sync-versions"
+path = "src/bin/sync-versions.rs"
+
+[dependencies]
+envoy_extproc_sdk = { path = ".." }
+envoy-types = "0.7.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["server", "transport", "codegen"] }
+prost = "0.14"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "server-auto", "http1", "http2", "tokio", "service"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+futures-util = "0.3"
+async-trait = "0.1"
+prometheus = "0.14"
+tracing = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }

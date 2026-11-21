@@ -1,6 +1,6 @@
 //! Request context, phase bookkeeping, and phase responses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use http::Extensions;
@@ -132,12 +132,112 @@ impl HeaderValue {
         if !self.is_valid() {
             return Err(format!("invalid header value for {}", name).into());
         }
-        Ok(HeaderValueOption {
+        let mut option = HeaderValueOption {
             header: Some(self.to_envoy_header_value(name)),
             append: None,
             append_action: action as i32,
             keep_empty_value: false,
-        })
+        };
+        // Envoy's ext_proc MutationUtils::applyHeaderMutations evaluates the
+        // deprecated HeaderValueOption.append (defaulting to false) rather than
+        // append_action (envoyproxy/envoy#48886). Setting Append=true for
+        // APPEND_IF_EXISTS_OR_ADD preserves append behavior without colliding
+        // with a non-zero append_action.
+        option.append = append_flag_for_action(action);
+        Ok(option)
+    }
+}
+
+fn append_flag_for_action(
+    action: HeaderAppendAction,
+) -> Option<envoy_types::pb::google::protobuf::BoolValue> {
+    if action == HeaderAppendAction::AppendIfExistsOrAdd {
+        Some(envoy_types::pb::google::protobuf::BoolValue { value: true })
+    } else {
+        None
+    }
+}
+
+/// The set of lower-cased header names observed in a phase, as sent by
+/// envoy, used to enforce `ADD_IF_ABSENT` and `OVERWRITE_IF_EXISTS` semantics
+/// while envoy's ext_proc filter ignores `HeaderValueOption.append_action`
+/// (envoyproxy/envoy#48886).
+pub(crate) fn header_key_set(h: &AllHeaders) -> HashSet<String> {
+    h.headers.keys().map(|k| k.to_lowercase()).collect()
+}
+
+/// Resolve the header mutation for a phase against the set of header names
+/// known to exist in that phase. Envoy ignores
+/// `HeaderValueOption.append_action`, so `AddHeader`/`AddHeaders`
+/// (`ADD_IF_ABSENT`) and `UpdateHeader`/`UpdateHeaders` with
+/// `OVERWRITE_IF_EXISTS` are enforced here by filtering the mutation set.
+///
+/// Returns the resolved mutation and the post-mutation key set. The key set
+/// reflects removals and adds applied by the mutation, and is the state the
+/// next phase of the same kind should be evaluated against. `known` is never
+/// mutated; the returned set is the post-mutation state.
+pub(crate) fn resolve_header_mutation(
+    hm: &Option<HeaderMutation>,
+    known: &Option<HashSet<String>>,
+) -> (Option<HeaderMutation>, Option<HashSet<String>>) {
+    let Some(hm) = hm else {
+        return (None, None);
+    };
+    let Some(known) = known else {
+        return (Some(hm.clone()), None);
+    };
+
+    let mut state: HashSet<String> = known.clone();
+    for rm in &hm.remove_headers {
+        let k = rm.to_lowercase();
+        // Envoy ignores attempts to remove pseudo-headers or the host header.
+        if !k.starts_with(':') && k != "host" {
+            state.remove(&k);
+        }
+    }
+
+    let mut filtered: Vec<HeaderValueOption> = Vec::with_capacity(hm.set_headers.len());
+    for ho in &hm.set_headers {
+        let k = ho
+            .header
+            .as_ref()
+            .map(|h| h.key.to_lowercase())
+            .unwrap_or_default();
+        let exists = state.contains(&k);
+        if ho.append_action == HeaderAppendAction::AddIfAbsent as i32 {
+            if exists {
+                continue;
+            }
+            state.insert(k);
+            filtered.push(ho.clone());
+        } else if ho.append_action == HeaderAppendAction::OverwriteIfExists as i32 {
+            if !exists {
+                continue;
+            }
+            filtered.push(ho.clone());
+        } else {
+            state.insert(k);
+            filtered.push(ho.clone());
+        }
+    }
+
+    (
+        Some(HeaderMutation {
+            set_headers: filtered,
+            remove_headers: hm.remove_headers.clone(),
+        }),
+        Some(state),
+    )
+}
+
+/// Resolve the phase's header mutation against the phase header key set, and
+/// return the post-mutation key set for the following phase(s) of the same
+/// kind.
+impl RequestContext {
+    pub(crate) fn resolved_header_mutation(
+        &self,
+    ) -> (Option<HeaderMutation>, Option<HashSet<String>>) {
+        resolve_header_mutation(&self.response.header_mutation, &self.phase_header_keys)
     }
 }
 
@@ -215,6 +315,13 @@ pub struct RequestContext {
     /// Whether the current phase message was the last of its kind.
     pub end_of_stream: bool,
 
+    /// Whether the current exchange is running in envoy `observability_mode`,
+    /// reflecting `ProcessingRequest.observability_mode`. When `true`,
+    /// processor callbacks run for observation and the SDK suppresses
+    /// `ProcessingResponse` sends (keeping envoy's `spurious_msgs_received ==
+    /// 0`).
+    pub observability_mode: bool,
+
     /// Arbitrary custom values shared across phases of a request, stored in a
     /// type-keyed map ([`http::Extensions`]) so values are strongly typed
     /// rather than string-keyed trait objects.
@@ -224,6 +331,22 @@ pub struct RequestContext {
     pub phase: RequestPhase,
     /// Response being assembled for the current phase.
     pub response: PhaseResponse,
+
+    /// Header names observed for the current phase, tracked so that
+    /// `ADD_IF_ABSENT` and `OVERWRITE_IF_EXISTS` semantics can be enforced
+    /// while envoy's ext_proc filter ignores `HeaderValueOption.append_action`
+    /// (envoyproxy/envoy#48886). Populated when the phase is initialized and
+    /// updated after each phase's mutations are resolved.
+    pub(crate) req_header_keys: HashSet<String>,
+
+    /// Header names observed for the current response phase, tracked for the
+    /// same reasons as [`RequestContext::req_header_keys`].
+    pub(crate) resp_header_keys: HashSet<String>,
+
+    /// The header names known to exist at the current phase, if the phase has
+    /// been initialized. `None` until the phase is initialized (e.g. before the
+    /// request headers phase runs).
+    pub(crate) phase_header_keys: Option<HashSet<String>>,
 }
 
 impl RequestContext {
@@ -240,9 +363,13 @@ impl RequestContext {
             started: Instant::now(),
             duration: Duration::ZERO,
             end_of_stream: false,
+            observability_mode: false,
             data: Extensions::new(),
             phase: RequestPhase::Undetermined,
             response: PhaseResponse::default(),
+            req_header_keys: HashSet::new(),
+            resp_header_keys: HashSet::new(),
+            phase_header_keys: None,
         }
     }
 
@@ -251,6 +378,8 @@ impl RequestContext {
     pub fn reset_phase(&mut self) -> Result<(), Error> {
         self.phase = RequestPhase::Undetermined;
         self.end_of_stream = false;
+        self.observability_mode = false;
+        self.phase_header_keys = None;
         self.response.reset();
         Ok(())
     }
@@ -321,9 +450,10 @@ impl RequestContext {
             }
         }
 
+        let (hm, _) = self.resolved_header_mutation();
         self.response.continue_request = Some(CommonResponse {
             status: 0, // CommonResponse::ResponseStatus::Continue
-            header_mutation: self.response.header_mutation.clone(),
+            header_mutation: hm.clone(),
             body_mutation: self.response.body_mutation.clone(),
             trailers: None,
             clear_route_cache: self.response.clear_route_cache,
@@ -352,12 +482,12 @@ impl RequestContext {
             )),
             RequestPhase::RequestTrailers => Some(ProcessingResponseResponse::RequestTrailers(
                 envoy_types::pb::envoy::service::ext_proc::v3::TrailersResponse {
-                    header_mutation: self.response.header_mutation.clone(),
+                    header_mutation: hm.clone(),
                 },
             )),
             RequestPhase::ResponseTrailers => Some(ProcessingResponseResponse::ResponseTrailers(
                 envoy_types::pb::envoy::service::ext_proc::v3::TrailersResponse {
-                    header_mutation: self.response.header_mutation.clone(),
+                    header_mutation: hm.clone(),
                 },
             )),
             RequestPhase::Undetermined => {
@@ -465,9 +595,10 @@ impl RequestContext {
     /// response and wait for further phase messages.
     pub fn continue_request(&mut self) -> Result<(), Error> {
         self.response.immediate_response = None;
+        let (hm, _) = self.resolved_header_mutation();
         self.response.continue_request = Some(CommonResponse {
             status: 0, // CommonResponse::ResponseStatus::Continue
-            header_mutation: self.response.header_mutation.clone(),
+            header_mutation: hm.clone(),
             body_mutation: self.response.body_mutation.clone(),
             trailers: None,
             clear_route_cache: self.response.clear_route_cache,
@@ -505,10 +636,9 @@ impl RequestContext {
         hv: &HeaderValue,
         action: HeaderAppendAction,
     ) -> Result<(), Error> {
-        let envoy_hv = hv.to_envoy_header_value(name);
         let option = HeaderValueOption {
-            header: Some(envoy_hv),
-            append: None,
+            header: Some(hv.to_envoy_header_value(name)),
+            append: append_flag_for_action(action),
             append_action: action as i32,
             keep_empty_value: false,
         };
@@ -547,11 +677,12 @@ impl RequestContext {
         headers: &HashMap<String, HeaderValue>,
         action: HeaderAppendAction,
     ) -> Result<(), Error> {
-        let mut options = Vec::new();
+        let append = append_flag_for_action(action);
+        let mut options = Vec::with_capacity(headers.len());
         for (n, hv) in headers {
             options.push(HeaderValueOption {
                 header: Some(hv.to_envoy_header_value(n)),
-                append: None,
+                append,
                 append_action: action as i32,
                 keep_empty_value: false,
             });
@@ -1029,6 +1160,157 @@ mod tests {
                 HeaderAppendAction::AddIfAbsent
             )
             .is_err());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_to_envoy_header_value_option_append_flag() {
+        // Envoy's ext_proc filter evaluates the deprecated HeaderValueOption
+        // `append` (defaulting to false) rather than `append_action`
+        // (envoyproxy/envoy#48886), so the SDK must set `append = true` for
+        // APPEND_IF_EXISTS_OR_ADD to preserve append behavior.
+        let hv = HeaderValue {
+            value: String::new(),
+            raw_value: Some(b"v".to_vec()),
+        };
+
+        let ho = hv
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::AppendIfExistsOrAdd)
+            .unwrap();
+        assert_eq!(
+            ho.append_action,
+            HeaderAppendAction::AppendIfExistsOrAdd as i32
+        );
+        assert!(ho.append.as_ref().map(|b| b.value).unwrap_or(false));
+
+        let ho = hv
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::AddIfAbsent)
+            .unwrap();
+        assert_eq!(ho.append_action, HeaderAppendAction::AddIfAbsent as i32);
+        assert!(ho.append.is_none());
+
+        let ho = hv
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::OverwriteIfExistsOrAdd)
+            .unwrap();
+        assert_eq!(
+            ho.append_action,
+            HeaderAppendAction::OverwriteIfExistsOrAdd as i32
+        );
+        assert!(ho.append.is_none());
+
+        let ho = hv
+            .to_envoy_header_value_option("x-foo", HeaderAppendAction::OverwriteIfExists)
+            .unwrap();
+        assert_eq!(
+            ho.append_action,
+            HeaderAppendAction::OverwriteIfExists as i32
+        );
+        assert!(ho.append.is_none());
+    }
+
+    #[test]
+    fn test_resolve_header_mutation_enforces_add_if_absent_and_overwrite_if_exists() {
+        let mut rc = RequestContext::new();
+        rc.reset_phase().unwrap();
+        rc.set_phase(RequestPhase::RequestHeaders);
+        rc.phase_header_keys = Some(
+            [":authority", "host", "x-existing", "x-remove-then-add"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+        rc.response.header_mutation = Some(HeaderMutation {
+            set_headers: Vec::new(),
+            remove_headers: Vec::new(),
+        });
+
+        rc.add_header(
+            "x-existing",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"ignored".to_vec()),
+            },
+        )
+        .unwrap(); // ADD_IF_ABSENT on an existing key: skipped
+        rc.add_header(
+            "x-absent",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"first".to_vec()),
+            },
+        )
+        .unwrap();
+        rc.add_header(
+            "x-absent",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"second".to_vec()),
+            },
+        )
+        .unwrap(); // ADD_IF_ABSENT on an existing key: skipped
+        rc.update_header(
+            "x-missing",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"nope".to_vec()),
+            },
+            HeaderAppendAction::OverwriteIfExists,
+        )
+        .unwrap(); // OVERWRITE_IF_EXISTS on a missing key: skipped
+        rc.update_header(
+            "x-existing",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"replaced".to_vec()),
+            },
+            HeaderAppendAction::OverwriteIfExists,
+        )
+        .unwrap(); // OVERWRITE_IF_EXISTS on an existing key: applied
+        rc.remove_header("x-remove-then-add").unwrap();
+        rc.add_header(
+            "x-remove-then-add",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"fresh".to_vec()),
+            },
+        )
+        .unwrap(); // re-added after removal: applied
+        rc.remove_header(":authority").unwrap(); // pseudo-headers cannot be removed
+
+        let (hm, next) = rc.resolved_header_mutation();
+        let set = hm
+            .clone()
+            .expect("expected a resolved mutation")
+            .set_headers;
+        assert_eq!(set.len(), 3);
+        assert_eq!(set[0].append_action, HeaderAppendAction::AddIfAbsent as i32);
+        assert_eq!(set[0].header.as_ref().unwrap().key, "x-absent");
+        assert_eq!(set[0].header.as_ref().unwrap().raw_value, b"first".to_vec());
+        assert_eq!(
+            set[1].append_action,
+            HeaderAppendAction::OverwriteIfExists as i32
+        );
+        assert_eq!(set[1].header.as_ref().unwrap().key, "x-existing");
+        assert_eq!(
+            set[1].header.as_ref().unwrap().raw_value,
+            b"replaced".to_vec()
+        );
+        assert_eq!(set[2].append_action, HeaderAppendAction::AddIfAbsent as i32);
+        assert_eq!(set[2].header.as_ref().unwrap().key, "x-remove-then-add");
+        assert_eq!(set[2].header.as_ref().unwrap().raw_value, b"fresh".to_vec());
+
+        let next = next.expect("expected a post-mutation key set");
+        assert!(next.contains("x-absent"));
+        assert!(next.contains("x-existing"));
+        assert!(next.contains("x-remove-then-add"));
+        assert!(next.contains(":authority")); // pseudo-headers are not removable
+        assert!(next.contains("host"));
+        assert!(!next.contains("x-missing"));
+
+        // The resolution is deterministic across repeated phases.
+        let (hm2, next2) = rc.resolved_header_mutation();
+        assert_eq!(hm, hm2);
+        assert_eq!(next, next2.expect("expected a post-mutation key set"));
     }
 
     #[test]

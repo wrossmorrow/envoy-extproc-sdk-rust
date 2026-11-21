@@ -1,7 +1,19 @@
 # Task runner for the envoy extproc SDK Rust port.
 
+k6_image := env_var_or_default("K6_IMAGE", "grafana/k6:1.0.0")
+
 default:
     @just --list
+
+# tidy up modules
+tidy-all:
+    cargo tidy
+    cargo tidy --manifest-path conformance/Cargo.toml
+
+# verify all modules are tidy with no diff
+check-tidy:
+    just tidy-all
+    git diff --exit-code -- Cargo.toml Cargo.lock conformance/Cargo.toml conformance/Cargo.lock
 
 # Format the Rust sources.
 fmt:
@@ -26,6 +38,10 @@ clippy:
 # Run the unit test suite. Integration tests under tests/ drive a running
 # server and are run separately via `just integration-test`.
 test:
+    cargo test --lib
+
+# Run the unit test suite (alias of `just test`).
+unit-test:
     cargo test --lib
 
 # Run the integration test suite. Brings up the docker compose harness
@@ -56,8 +72,8 @@ build-example:
 # Run a k6 load test script from loadtest/ against the containerized stack
 # (envoy -> extproc -> echo upstream). Usage: just loadtest <script> [k6 args...]
 loadtest *args="smoke.js":
-    docker pull grafana/k6
-    docker run --rm --network host -v "$(pwd)/loadtest:/scripts" grafana/k6 run /scripts/{{args}}
+    docker pull {{k6_image}}
+    docker run --rm --network host -v "$(pwd)/loadtest:/scripts" {{k6_image}} run /scripts/{{args}}
 
 # Run the k6 smoke load test against the full containerized envoy chain.
 loadtest-smoke:
@@ -97,3 +113,31 @@ loadtest-grpc-smoke:
 # extproc server. Usage: just loadtest-grpc-burst [concurrency]
 loadtest-grpc-burst concurrency:
     cargo run --bin extproc-loadgen -- --iterations {{concurrency}} --concurrency {{concurrency}}
+
+# Run the Envoy conformance suite against the default supported Envoy version
+# (or $ENVOY_VERSION / $ENVOY_BIN if set).
+conformance *flags="-v":
+    cargo test --manifest-path conformance/Cargo.toml {{flags}}
+
+# Run the Envoy conformance suite against a specific Envoy image tag (e.g. v1.40-latest).
+conformance-version envoy_version *flags="-v":
+    ENVOY_VERSION={{envoy_version}} cargo test --manifest-path conformance/Cargo.toml {{flags}}
+
+# Run the Envoy conformance suite sequentially across every supported Envoy version in conformance/envoy-versions.json.
+conformance-matrix *flags="-v":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for v in $(jq -r '.supported[]' conformance/envoy-versions.json); do
+        echo "=== Envoy Conformance: ${v} ==="
+        ENVOY_VERSION="${v}" cargo test --manifest-path conformance/Cargo.toml {{flags}}
+    done
+
+# Run the supported Envoy conformance matrix, emit JSON/Markdown reports, and update CONFORMANCE.md.
+conformance-report:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --manifest-path conformance/Cargo.toml --bin report -- --results-dir conformance --markdown-out conformance-report.md --json-out conformance-summary.json --update-conformance-md CONFORMANCE.md
+
+# Sync conformance/envoy-versions.json with active Envoy releases from endoflife.date.
+sync-envoy-versions:
+    cargo run --manifest-path conformance/Cargo.toml --bin sync-versions -- --write conformance/envoy-versions.json

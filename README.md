@@ -16,6 +16,10 @@ The SDK is implemented as the `envoy_extproc_sdk` crate and uses the [`envoy-typ
 
 Several examples are provided here in the [examples](#examples), which can be reviewed to examine usage patterns.
 
+> Upgrading from a `v0.2.x` release? See [MIGRATION.md](MIGRATION.md); this release adds the exported server constructor and observability mode and enforces header append actions.
+>
+> Looking for supported Envoy versions, `ext_proc` v3 feature coverage, or the conformance roadmap? See [CONFORMANCE.md](CONFORMANCE.md) and [docs/CONFORMANCE_PLAN.md](docs/CONFORMANCE_PLAN.md).
+
 ## Usage
 
 ### TL;DR
@@ -236,9 +240,22 @@ These are the two options currently available in `envoy` ExtProcs: replace a chu
 
 The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/context/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/context/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
 
+## Conformance
+
+This repository includes a purpose-built [conformance](conformance) suite that exercises the SDK against live Envoy proxies, and tracks `ext_proc` v3 feature coverage across an Envoy version matrix.
+
+- **Routine tests** cover the fast unit and integration smoke suites (`cargo test`, the Docker Compose stack in [`tests/`](tests)).
+- **Purposeful conformance** runs live Envoy (`envoyproxy/envoy:<version>`) through an in-process SDK server and in-process upstream, driven by scenario tests. It is executed intentionally via [`just conformance`](Justfile), on release tags, on a weekly schedule, and on conformance changes via the [conformance workflow](.github/workflows/conformance.yaml).
+
+See [CONFORMANCE.md](CONFORMANCE.md) for the version baseline and the generated feature coverage matrix, and [docs/CONFORMANCE_PLAN.md](docs/CONFORMANCE_PLAN.md) for the full conformance architecture and roadmap.
+
+## Migration Notes
+
+Release-to-release behavior changes and SDK-surface additions are documented in [MIGRATION.md](MIGRATION.md).
+
 ## Examples
 
-The examples from the Go SDK (`examples/noop.go`, `examples/trivial.go`, `examples/timer.go`, `examples/data.go`, `examples/digest.go`, `examples/dedup.go`, `examples/masker.go`, `examples/echo.go`, and `examples/router.go`) have been ported to Rust as example binaries. The example server binary is [`src/bin/extproc-example.rs`](src/bin/extproc-example.rs); run a specific example with `just run-example example="<name>"` or `cargo run --bin extproc-example -- <name>`.
+The examples from the Go SDK (`examples/noop.rs`, `examples/trivial.rs`, `examples/timer.rs`, `examples/data.rs`, `examples/digest.rs`, `examples/dedup.rs`, `examples/masker.rs`, `examples/echo.rs`, and `examples/router.rs`) have been ported to Rust as example binaries. The example server binary is [`src/bin/extproc-example.rs`](src/bin/extproc-example.rs); run a specific example with `just run-example example="<name>"` or `cargo run --bin extproc-example -- <name>`.
 
 The compose setup under [`examples/`](examples/) runs `envoy` (see [`examples/envoy.yaml`](examples/envoy.yaml)), a mock echo server, and the example processors, mirroring the Go SDK's `examples/` setup.
 

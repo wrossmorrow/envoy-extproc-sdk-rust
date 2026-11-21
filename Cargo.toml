@@ -1,6 +1,6 @@
 [package]
 name = "envoy_extproc_sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.90"
 description = "Envoy External Processor SDK for Rust (gRPC, tokio/tonic)"
@@ -40,6 +40,7 @@ regex = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+prost = "0.14"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"

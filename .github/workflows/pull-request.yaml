@@ -12,7 +12,7 @@ jobs:
         toolchain: ["${{ vars.RUST_MSRV }}", "${{ vars.RUST_STABLE }}"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -20,6 +20,7 @@ jobs:
       - name: Check build(s)
         run: |
           cargo check --all-targets
+          cargo check --manifest-path conformance/Cargo.toml --all-targets
       # tests/Dockerfile is covered by the integration job, but o/w examples/Dockerfile not covered
       - name: Check example image build
         run: |
@@ -29,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +45,7 @@ jobs:
         toolchain: ["${{ vars.RUST_MSRV }}", "${{ vars.RUST_STABLE }}"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
