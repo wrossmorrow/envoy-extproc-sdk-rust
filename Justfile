@@ -136,7 +136,7 @@ conformance-matrix *flags="-v":
 conformance-report:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo run --manifest-path conformance/Cargo.toml --bin report -- --results-dir conformance --markdown-out conformance-report.md --json-out conformance-summary.json --update-conformance-md ../CONFORMANCE.md
+    cargo run --manifest-path conformance/Cargo.toml --bin report -- --results-dir conformance --markdown-out conformance-report.md --json-out conformance-summary.json --update-conformance-md CONFORMANCE.md
 
 # Sync conformance/envoy-versions.json with active Envoy releases from endoflife.date.
 sync-envoy-versions:

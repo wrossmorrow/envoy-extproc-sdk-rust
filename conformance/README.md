@@ -44,7 +44,7 @@ Run sequentially across all supported Envoy versions in `envoy-versions.json`:
 just conformance-matrix
 ```
 
-Run the matrix, generate JSON/Markdown summaries, and refresh `../CONFORMANCE.md`:
+Run the matrix, generate JSON/Markdown summaries, and refresh `CONFORMANCE.md`:
 
 ```sh
 just conformance-report
@@ -63,5 +63,3 @@ just sync-envoy-versions
 | `ENVOY_VERSION` | `default` in `envoy-versions.json` | Envoy image tag (`envoyproxy/envoy:<ENVOY_VERSION>`) |
 | `ENVOY_BIN` | *(empty)* | Path to a local Envoy binary (skips Docker when set) |
 | `CONFORMANCE_REQUIRE_ENVOY` | `0` | Set to `1` to fail instead of skipping when neither Docker nor `ENVOY_BIN` is available |
-| `CONFORMANCE_STRICT_APPEND_ACTION` | `0` | Set to `1` to enable strict `AddHeader`/`AppendHeader` assertions reproducing the Envoy `append_action` gap |
-| `CONFORMANCE_STRICT_OBSERVABILITY` | `0` | Set to `1` to enable strict `observability_mode: true` assertions reproducing the SDK response-suppression gap |

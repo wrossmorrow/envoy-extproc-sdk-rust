@@ -310,10 +310,11 @@ paired with a declarative feature manifest:
    spec surface.
 2. **Structured Per-Version Artifacts**:
    - Each CI matrix leg runs the conformance suite
-     (`ENVOY_VERSION=${envoy} cargo test -v -json ./... > results-${envoy}.json`) and
-     uploads the artifact (along with Envoy `:9901/stats` and container logs on
-     failure).
-3. **Fan-In Aggregator** ([conformance/cmd/report](../conformance/cmd/report)):
+     (`ENVOY_VERSION=${envoy} just conformance`) and the harness emits
+     `results-${envoy}.json` (JSON-lines of conformance outcomes) which is
+     uploaded as an artifact (along with Envoy `:9901/stats` and container logs
+     on failure).
+3. **Fan-In Aggregator** ([conformance/src/bin/report](../conformance/src/bin/report)):
    - Consumes `conformance/features.yaml` + all `results-*.json` artifacts and
      produces three outputs:
      1. **CI Run Summary** (`$GITHUB_STEP_SUMMARY`): Writes a **Capability × Envoy
@@ -350,7 +351,7 @@ paired with a declarative feature manifest:
      Envoy `:9901/stats` `spurious_msgs_received == 0` checks.
 3. **Phase 3 — Reporting & Release Automation**:
    - Add `conformance/features.yaml` and the report tooling
-     ([conformance/cmd/report](../conformance/cmd/report)) (`$GITHUB_STEP_SUMMARY` +
+     ([conformance/src/bin/report](../conformance/src/bin/report)) (`$GITHUB_STEP_SUMMARY` +
      generated [CONFORMANCE.md](../CONFORMANCE.md) updates).
    - Clean up multi-crate/Dockerfile build hygiene and enable the weekly Envoy
      release-window sync workflow + Renovate config.
