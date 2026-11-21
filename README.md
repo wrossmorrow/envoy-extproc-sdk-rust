@@ -240,6 +240,31 @@ These are the two options currently available in `envoy` ExtProcs: replace a chu
 
 The Rust port also provides whole-body variants, [`replace_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/context/struct.RequestContext.html#method.replace_body) and [`clear_body`](https://docs.rs/envoy_extproc_sdk/latest/envoy_extproc_sdk/context/struct.RequestContext.html#method.clear_body), which replace (or clear) the entire body and update the `Content-Length` header accordingly.
 
+### Dynamic Mode Override
+
+When Envoy configures the `ext_proc` filter with `allow_mode_override: true`, the request headers and response headers phases can override how Envoy processes subsequent phases of that request:
+```rust
+(rc: &mut RequestContext).override_mode(mode: ModeOverride) -> Result<(), Error>
+(rc: &mut RequestContext).clear_mode_override() -> ()
+(rc: &mut RequestContext).skip_remaining_phases() -> Result<(), Error>
+```
+```rust
+use envoy_extproc_sdk::{BodySendMode, HeaderSendMode, ModeOverride};
+
+_ = rc.override_mode(ModeOverride {
+    response_header_mode: HeaderSendMode::Default,
+    request_body_mode: BodySendMode::Buffered,
+    response_body_mode: BodySendMode::Buffered,
+    request_trailer_mode: HeaderSendMode::Default,
+    response_trailer_mode: HeaderSendMode::Default,
+})?;
+```
+Or skip all remaining phases for a fast-path request:
+```rust
+_ = rc.skip_remaining_phases()?;
+```
+Use `clear_mode_override()` to undo a pending override in the same header phase. Note that Envoy's `ProcessingMode` proto has no "keep default" body enum (`BodySendMode::None` means "do not send"), so when calling `override_mode` during the request headers phase, set both the request and response body modes explicitly. See the [masker](#masker) example for a processor that pairs dynamic mode overrides with buffered JSON body replacement.
+
 ## Conformance
 
 This repository includes a purpose-built [conformance](conformance) suite that exercises the SDK against live Envoy proxies, and tracks `ext_proc` v3 feature coverage across an Envoy version matrix.
@@ -336,7 +361,7 @@ The `DedupRequestProcessor` defined in `src/bin/processors/dedup.rs` computes a 
 
 ### Masker
 
-The `MaskerRequestProcessor` defined in `src/bin/processors/masker.rs` is an example of body modification with `RequestContext::replace_body`/`replace_body_chunk`. Basically, this ExtProc examines JSON request bodies (requiring buffered bodies) and masks (with `****` for simplicity) fields with paths matching a static spec. This mimics using edge functionality to protect client-side or server-side data.
+The `MaskerRequestProcessor` defined in `src/bin/processors/masker.rs` combines dynamic mode overrides (`RequestContext::override_mode` and `RequestContext::skip_remaining_phases`) with whole-body modification (`RequestContext::replace_body`). Paired with `allow_mode_override: true` and `NONE` default body modes in `examples/envoy.yaml`, it inspects `content-type` headers in `process_request_headers` and `process_response_headers` so Envoy only buffers JSON bodies when mask paths are configured for that direction (skipping non-JSON payloads and unneeded phases), then masks matching JSON paths with `****`. This mimics using edge functionality to protect client-side or server-side data without buffering every payload on the route.
 
 ### Echo
 

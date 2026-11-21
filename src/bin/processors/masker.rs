@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use envoy_extproc_sdk::{
-    AllHeaders, Error, ProcessingOptions, RequestContext, RequestPhase, RequestProcessor,
+    AllHeaders, BodySendMode, Error, HeaderSendMode, ModeOverride, ProcessingOptions,
+    RequestContext, RequestPhase, RequestProcessor,
 };
 use serde_json::{Map, Value};
 
@@ -24,6 +25,13 @@ impl MaskerRequestProcessor {
                 ("response".to_string(), Vec::new()),
             ]),
         }
+    }
+
+    fn wants_response_headers(&self) -> bool {
+        if !self.masked["response"].is_empty() {
+            return true;
+        }
+        self.opts.update_ext_proc_header || self.opts.update_duration_header
     }
 
     fn mask_body(&self, json_paths: &[String], body: &[u8]) -> Result<Vec<u8>, Error> {
@@ -76,8 +84,34 @@ impl RequestProcessor for MaskerRequestProcessor {
     async fn process_request_headers(
         &self,
         ctx: &mut RequestContext,
-        _headers: &AllHeaders,
+        headers: &AllHeaders,
     ) -> Result<(), Error> {
+        let want_req_body =
+            !ctx.end_of_stream && !self.masked["request"].is_empty() && is_maybe_json(headers);
+        let want_resp_headers = self.wants_response_headers();
+
+        if !want_req_body && !want_resp_headers {
+            ctx.skip_remaining_phases()?;
+            return ctx.continue_request();
+        }
+
+        let resp_hdr_mode = if want_resp_headers {
+            HeaderSendMode::Send
+        } else {
+            HeaderSendMode::Skip
+        };
+        let req_body_mode = if want_req_body {
+            BodySendMode::Buffered
+        } else {
+            BodySendMode::None
+        };
+        ctx.override_mode(ModeOverride {
+            response_header_mode: resp_hdr_mode,
+            request_body_mode: req_body_mode,
+            response_body_mode: BodySendMode::None,
+            request_trailer_mode: HeaderSendMode::Skip,
+            response_trailer_mode: HeaderSendMode::Skip,
+        })?;
         ctx.continue_request()
     }
 
@@ -106,9 +140,19 @@ impl RequestProcessor for MaskerRequestProcessor {
     async fn process_response_headers(
         &self,
         ctx: &mut RequestContext,
-        _headers: &AllHeaders,
+        headers: &AllHeaders,
     ) -> Result<(), Error> {
         ctx.set_value(ctx.all_headers.clone())?;
+        let want_response_body = !self.masked["response"].is_empty() && is_maybe_json(headers);
+        if want_response_body {
+            ctx.override_mode(ModeOverride {
+                response_header_mode: HeaderSendMode::Send,
+                request_body_mode: BodySendMode::None,
+                response_body_mode: BodySendMode::Buffered,
+                request_trailer_mode: HeaderSendMode::Skip,
+                response_trailer_mode: HeaderSendMode::Skip,
+            })?;
+        }
         ctx.continue_request()
     }
 

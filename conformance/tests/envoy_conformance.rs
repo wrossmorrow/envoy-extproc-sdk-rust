@@ -14,9 +14,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use envoy_conformance::{
-    check_docker_available, register_scenario_handlers, start_conformance_extproc_server,
-    start_envoy_runner, upstream_host_for_runner, CaseHandler, ConformanceExtProcServer,
-    ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
+    check_docker_available, mode_override_allowlist_denied_handler, mode_override_allowlist_ok_handler,
+    mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,
+    mode_override_resp_stream_handler, mode_override_skip_handler, register_scenario_handlers,
+    start_conformance_extproc_server, start_envoy_runner, upstream_host_for_runner, CaseHandler,
+    ConformanceExtProcServer, ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
 };
 use envoy_extproc_sdk::{
     AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
@@ -1105,6 +1107,204 @@ fn http1_trailers_roundtrip() {
 fn h2c_trailers_roundtrip() {
     run_conformance(|h| async move {
         run_trailers_roundtrip(h, &h.h2c, "h2c_trailers_roundtrip", false).await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 10. Dynamic mode override (mode_override)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mode_override() {
+    run_conformance(|h| async move {
+        // Sub-scenario: opt in to BUFFERED bodies and trailers for a full
+        // exchange via a dynamic mode override during the request headers phase,
+        // then replace the bodies and trailers.
+        {
+            let case_id = "mode-override-full-req";
+            h.default_proc
+                .register(case_id, mode_override_handler());
+            let body = chunked_body_with_trailers(
+                vec![b"raw-req".to_vec()],
+                vec![("x-req-tr", "orig-req")],
+            );
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/mode-override/full",
+                &[
+                    ("x-conformance-case", case_id),
+                    ("x-upstream-trailer-x-resp-tr", "orig-resp"),
+                    ("content-type", "application/json"),
+                ],
+                body,
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(echo.body, "mutated-req");
+            assert_eq!(
+                resp.trailers
+                    .get("x-resp-tr")
+                    .and_then(|v| v.to_str().ok()),
+                Some("mutated-resp-tr"),
+                "unexpected response trailers: {:?}",
+                resp.trailers
+            );
+            assert_eq!(
+                resp.trailers
+                    .get("x-resp-added-tr")
+                    .and_then(|v| v.to_str().ok()),
+                Some("added")
+            );
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: replace the response body via a BUFFERED mode override
+        // expressed during the request headers phase.
+        {
+            let case_id = "mode-override-full-resp";
+            h.default_proc
+                .register(case_id, mode_override_full_resp_handler());
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/mode-override/full",
+                &[
+                    ("x-conformance-case", case_id),
+                    ("x-upstream-raw-body", "raw-resp"),
+                ],
+                full_body(b"raw-req"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            assert_eq!(resp.body, b"mutated-resp");
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: skip all remaining phases via SkipRemainingPhases,
+        // after adding a header during the request headers phase.
+        {
+            let case_id = "mode-override-skip";
+            h.default_proc
+                .register(case_id, mode_override_skip_handler());
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/mode-override/skip",
+                &[("x-conformance-case", case_id)],
+                full_body(b"untouched"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(echo.body, "untouched");
+            assert_eq!(
+                echo.headers
+                    .get("x-fast-path")
+                    .and_then(|v| v.first())
+                    .map(|v| v.as_str()),
+                Some("yes"),
+                "unexpected echo headers: {:?}",
+                echo.headers
+            );
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: opt in to a STREAMED response body mode during the
+        // response headers phase and replace the streamed chunks.
+        {
+            let case_id = "mode-override-resp-stream";
+            h.default_proc
+                .register(case_id, mode_override_resp_stream_handler());
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::GET,
+                "/profile/mode-override/resp-stream",
+                &[
+                    ("x-conformance-case", case_id),
+                    ("x-upstream-raw-body", "part1-part2-part3"),
+                    ("x-upstream-chunks", "3"),
+                ],
+                full_body(b""),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            assert_eq!(resp.body, b"PART1-PART2-PART3");
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: when the filter is configured without allow_mode_override
+        // (baseline NONE body mode), the override is ignored and the exchange
+        // continues on the baseline.
+        {
+            let case_id = "mode-override-disabled";
+            h.default_proc
+                .register(case_id, mode_override_disabled_handler());
+
+            let resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/mode/none/override-disabled",
+                &[("x-conformance-case", case_id)],
+                full_body(b"no-override"),
+            )
+            .await;
+            assert_eq!(resp.status, StatusCode::OK);
+            let echo = decode_echo(&resp.body);
+            assert_eq!(echo.body, "no-override");
+            assert_no_spurious(h).await;
+        }
+
+        // Sub-scenario: allowed_override_modes accepts the override and the
+        // body phase runs; a disallowed override is dropped and the body phase
+        // does not run.
+        {
+            let allowed_case = "mode-override-allowlist-ok";
+            let allowed_saw_body = Arc::new(AtomicBool::new(false));
+            h.default_proc.register(
+                allowed_case,
+                mode_override_allowlist_ok_handler(allowed_saw_body.clone()),
+            );
+            let allowed_resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/mode-override-allowlist/check",
+                &[("x-conformance-case", allowed_case)],
+                full_body(b"probe"),
+            )
+            .await;
+            assert_eq!(allowed_resp.status, StatusCode::OK);
+            assert!(allowed_saw_body.load(Ordering::SeqCst));
+
+            let denied_case = "mode-override-allowlist-denied";
+            let denied_saw_body = Arc::new(AtomicBool::new(false));
+            h.default_proc.register(
+                denied_case,
+                mode_override_allowlist_denied_handler(denied_saw_body.clone()),
+            );
+            let denied_resp = send_request(
+                &h.http1,
+                &h.proxy_url,
+                Method::POST,
+                "/profile/mode-override-allowlist/check",
+                &[("x-conformance-case", denied_case)],
+                full_body(b"probe"),
+            )
+            .await;
+            assert_eq!(denied_resp.status, StatusCode::OK);
+            assert!(!denied_saw_body.load(Ordering::SeqCst));
+            assert_no_spurious(h).await;
+        }
     });
 }
 

@@ -15,6 +15,8 @@ const UPSTREAM_PRIMARY_CLUSTER: &str = "upstream_primary";
 const UPSTREAM_SECONDARY_CLUSTER: &str = "upstream_secondary";
 
 const OBSERVABILITY_FILTER_NAME: &str = "envoy.filters.http.ext_proc.observability";
+const EXTPROC_MODE_OVERRIDE_FILTER_NAME: &str = "extproc_mode_override";
+const EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME: &str = "extproc_mode_override_allowlist";
 
 const OBSERVED_HEADER_SEND: &str = "SEND";
 const OBSERVED_HEADER_SKIP: &str = "SKIP";
@@ -96,6 +98,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         false,
         &default_mode,
+        false,
+        None,
     );
 
     let default_cluster = cluster_json(
@@ -138,6 +142,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         true,
         &default_mode,
+        false,
+        None,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.short_timeout_fail_open",
@@ -147,6 +153,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         true,
         &default_mode,
+        false,
+        None,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.abort",
@@ -156,6 +164,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         true,
         &default_mode,
+        false,
+        None,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.chain_first",
@@ -165,6 +175,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         true,
         &default_mode,
+        false,
+        None,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.chain_second",
@@ -174,6 +186,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         true,
         &default_mode,
+        false,
+        None,
     ));
     http_filters.push(ext_proc_filter_json(
         OBSERVABILITY_FILTER_NAME,
@@ -190,6 +204,8 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
             OBSERVED_HEADER_SEND,
             OBSERVED_HEADER_SEND,
         ),
+        false,
+        None,
     ));
     http_filters.push(json!({
         "name": ROUTER_FILTER_NAME,
@@ -197,6 +213,35 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
             "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
         },
     }));
+    http_filters.push(ext_proc_filter_json(
+        EXTPROC_MODE_OVERRIDE_FILTER_NAME,
+        DEFAULT_EXT_PROC_CLUSTER,
+        false,
+        5000,
+        false,
+        true,
+        &none_processing_mode_json(),
+        true,
+        None,
+    ));
+    let mode_override_allowed_modes = vec![json!({
+        "response_header_mode": OBSERVED_HEADER_SEND,
+        "request_body_mode": OBSERVED_BODY_STREAMED,
+        "response_body_mode": OBSERVED_BODY_NONE,
+        "request_trailer_mode": OBSERVED_HEADER_SKIP,
+        "response_trailer_mode": OBSERVED_HEADER_SKIP,
+    })];
+    http_filters.push(ext_proc_filter_json(
+        EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME,
+        DEFAULT_EXT_PROC_CLUSTER,
+        false,
+        5000,
+        false,
+        true,
+        &none_processing_mode_json(),
+        true,
+        Some(&mode_override_allowed_modes),
+    ));
 
     let hcm = http_connection_manager_json(&default_mode, &http_filters);
 
@@ -260,6 +305,18 @@ fn processing_mode_json(
     })
 }
 
+fn none_processing_mode_json() -> Value {
+    json!({
+        "request_header_mode": OBSERVED_HEADER_SEND,
+        "response_header_mode": OBSERVED_HEADER_SEND,
+        "request_body_mode": OBSERVED_BODY_NONE,
+        "response_body_mode": OBSERVED_BODY_NONE,
+        "request_trailer_mode": OBSERVED_HEADER_SKIP,
+        "response_trailer_mode": OBSERVED_HEADER_SKIP,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ext_proc_filter_json(
     name: &str,
     cluster_name: &str,
@@ -268,6 +325,8 @@ fn ext_proc_filter_json(
     observability_mode: bool,
     disabled: bool,
     mode: &Value,
+    allow_mode_override: bool,
+    allowed_override_modes: Option<&Vec<Value>>,
 ) -> Value {
     let seconds = message_timeout_ms / 1000;
     let nanos = (message_timeout_ms % 1000) * 1_000_000;
@@ -294,6 +353,10 @@ fn ext_proc_filter_json(
     });
     if disabled {
         filter["disabled"] = json!(true);
+    }
+    filter["typed_config"]["allow_mode_override"] = json!(allow_mode_override);
+    if let Some(modes) = allowed_override_modes {
+        filter["typed_config"]["allowed_override_modes"] = Value::Array(modes.clone());
     }
     filter
 }
@@ -558,6 +621,16 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
             )],
             UPSTREAM_PRIMARY_CLUSTER,
         ),
+        profile_route_json(
+            "/profile/mode-override",
+            &[(EXTPROC_MODE_OVERRIDE_FILTER_NAME, &none_processing_mode_json(), None)],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/mode-override-allowlist",
+            &[(EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME, &none_processing_mode_json(), None)],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
         json!({
             "match": {
                 "prefix": "/",
@@ -754,7 +827,27 @@ mod tests {
             .get("http_filters")
             .and_then(|f| f.as_array())
             .expect("http_filters");
-        assert_eq!(filters.len(), 8);
+        assert_eq!(filters.len(), 10);
+        assert!(filters
+            .iter()
+            .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(EXTPROC_MODE_OVERRIDE_FILTER_NAME))
+            .expect("mode override filter")
+            .get("typed_config")
+            .and_then(|t| t.get("allow_mode_override"))
+            .and_then(|v| v.as_bool())
+            .expect("mode override allow_mode_override"));
+        assert_eq!(
+            filters
+                .iter()
+                .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME))
+                .expect("mode override allowlist filter")
+                .get("typed_config")
+                .and_then(|t| t.get("allowed_override_modes"))
+                .and_then(|v| v.as_array())
+                .expect("mode override allowed_override_modes")
+                .len(),
+            1
+        );
         assert_eq!(
             filters[0]
                 .get("name")
