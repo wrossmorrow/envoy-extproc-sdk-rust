@@ -2,11 +2,13 @@
 //! behavior for the envoy-driven conformance scenarios, and helpers to build
 //! scenario handlers for the cases covered by the feature manifest.
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use envoy_extproc_sdk::{
-    AllHeaders, BodySendMode, Error, HeaderSendMode, HeaderValue, ModeOverride, RequestContext,
+    AllHeaders, BodySendMode, Error, HeaderSendMode, HeaderValue, ModeOverride, ProtocolConfig,
+    RequestContext,
 };
 use envoy_types::pb::envoy::r#type::v3::HttpStatus;
 use envoy_types::pb::envoy::service::ext_proc::v3::body_mutation::Mutation as BodyMutationMutation;
@@ -28,6 +30,7 @@ pub const SCENARIO_MODE_OVERRIDE_DISABLED: &str = "mode_override_disabled";
 pub const SCENARIO_MODE_OVERRIDE_FULL_RESP: &str = "mode-override-full-resp";
 pub const SCENARIO_MODE_OVERRIDE_ALLOWLIST_OK: &str = "mode-override-allowlist-ok";
 pub const SCENARIO_MODE_OVERRIDE_ALLOWLIST_DENIED: &str = "mode-override-allowlist-denied";
+pub const SCENARIO_PROTOCOL_CONFIG: &str = "protocol_config";
 
 /// Scenario handler for `immediate_response_request_headers`: responds with
 /// an immediate response (status 200, `x-scenario-response` header, empty body)
@@ -336,6 +339,54 @@ struct ModeOverrideAllowlistDeniedScenarioHandler {
     saw_body: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Scenario handler for the `protocol_config` default-mode-override sub-scenario:
+/// starts from the context's default mode override (pre-populated from the
+/// captured protocol configuration) and overrides the request body mode,
+/// preserving the response body mode until overridden.
+struct ModeOverrideDefaultFromProtocolConfigScenarioHandler {
+    saw_response_body: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CaseHandler for ModeOverrideDefaultFromProtocolConfigScenarioHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        let pc = ctx
+            .protocol_config
+            .as_ref()
+            .ok_or_else(|| "expected protocol config".to_string())?;
+        if pc.request_body_mode != BodySendMode::None
+            || pc.response_body_mode != BodySendMode::Buffered
+            || pc.send_body_without_waiting_for_header_response
+        {
+            return Err(format!("unexpected protocol config: {pc:?}").into());
+        }
+        let mut mode = ctx.default_mode_override();
+        mode.request_body_mode = BodySendMode::Buffered;
+        ctx.override_mode(mode)?;
+        ctx.continue_request()
+    }
+
+    fn request_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+        if body != b"raw-req" {
+            return Err(format!("unexpected request body {body:?}").into());
+        }
+        ctx.replace_body(b"mutated-req")?;
+        ctx.continue_request()
+    }
+
+    fn response_body(&self, ctx: &mut RequestContext, body: &[u8]) -> Result<(), Error> {
+        if body.is_empty() {
+            return Err("expected non-empty buffered ResponseBody".into());
+        }
+        self.saw_response_body
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ctx.continue_request()
+    }
+}
+
 impl CaseHandler for ModeOverrideAllowlistDeniedScenarioHandler {
     fn request_headers(
         &self,
@@ -404,6 +455,14 @@ pub fn scenario_handlers() -> Vec<(String, Arc<dyn CaseHandler>)> {
             SCENARIO_MODE_OVERRIDE_ALLOWLIST_DENIED.to_string(),
             mode_override_allowlist_denied_handler(Arc::new(AtomicBool::new(false))),
         ),
+        (
+            SCENARIO_PROTOCOL_CONFIG.to_string(),
+            protocol_config_handler(Arc::new(Mutex::new(HashMap::new()))),
+        ),
+        (
+            "mode-override-default-from-protocol-config".to_string(),
+            mode_override_default_from_protocol_config_handler(Arc::new(AtomicBool::new(false))),
+        ),
     ]
 }
 
@@ -442,6 +501,105 @@ pub fn mode_override_allowlist_denied_handler(
     Arc::new(ModeOverrideAllowlistDeniedScenarioHandler { saw_body })
 }
 
+/// Scenario handler factory for the `protocol_config` default-mode-override
+/// sub-scenario.
+pub fn mode_override_default_from_protocol_config_handler(
+    saw_response_body: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<dyn CaseHandler> {
+    Arc::new(ModeOverrideDefaultFromProtocolConfigScenarioHandler { saw_response_body })
+}
+
+/// Scenario handler for the `protocol_config` conformance scenario: records
+/// the envoy protocol configuration observed across the phases of a
+/// request/response exchange, so the live-envoy conformance test can assert on
+/// the captured values.
+#[derive(Clone)]
+pub struct ProtocolConfigScenarioHandler {
+    observed: Arc<Mutex<HashMap<String, ProtocolConfig>>>,
+}
+
+impl ProtocolConfigScenarioHandler {
+    pub fn new() -> Self {
+        Self {
+            observed: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The phase → protocol configuration observations recorded so far, keyed
+    /// by phase name (e.g. `req_headers`, `resp_body`).
+    pub fn observations(&self) -> Arc<Mutex<HashMap<String, ProtocolConfig>>> {
+        self.observed.clone()
+    }
+
+    fn record(&self, phase: &str, ctx: &RequestContext) {
+        self.observed.lock().unwrap().insert(
+            phase.to_string(),
+            ctx.protocol_config.expect("expected protocol config"),
+        );
+    }
+}
+
+impl Default for ProtocolConfigScenarioHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CaseHandler for ProtocolConfigScenarioHandler {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.record("req_headers", ctx);
+        ctx.continue_request()
+    }
+
+    fn request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        self.record("req_body", ctx);
+        ctx.continue_request()
+    }
+
+    fn request_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        _trailers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.record("req_trailers", ctx);
+        ctx.continue_request()
+    }
+
+    fn response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.record("resp_headers", ctx);
+        ctx.continue_request()
+    }
+
+    fn response_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
+        self.record("resp_body", ctx);
+        ctx.continue_request()
+    }
+
+    fn response_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        _trailers: &AllHeaders,
+    ) -> Result<(), Error> {
+        self.record("resp_trailers", ctx);
+        ctx.continue_request()
+    }
+}
+
+/// Scenario handler factory for the `protocol_config` conformance scenario.
+pub fn protocol_config_handler(
+    recorder: Arc<Mutex<HashMap<String, ProtocolConfig>>>,
+) -> Arc<dyn CaseHandler> {
+    Arc::new(ProtocolConfigScenarioHandler { observed: recorder })
+}
+
 /// Register all conformance scenario handlers on a processor.
 pub fn register_scenario_handlers(processor: &ConformanceProcessor) -> Result<(), Error> {
     for (id, handler) in scenario_handlers() {
@@ -477,6 +635,37 @@ mod tests {
 
     fn set_phase(ctx: &mut RequestContext, phase: RequestPhase) {
         ctx.set_phase(phase);
+    }
+
+    #[tokio::test]
+    async fn protocol_config_scenario_records_observed_protocol_config() {
+        let processor = processor();
+        let recorder = Arc::new(Mutex::new(HashMap::new()));
+        processor.register(
+            SCENARIO_PROTOCOL_CONFIG,
+            protocol_config_handler(recorder.clone()),
+        );
+
+        let mut ctx = RequestContext::new();
+        set_phase(&mut ctx, RequestPhase::ResponseHeaders);
+        let _ = ctx.set_value(SCENARIO_PROTOCOL_CONFIG.to_string());
+        ctx.protocol_config = Some(ProtocolConfig {
+            request_body_mode: BodySendMode::Buffered,
+            response_body_mode: BodySendMode::Streamed,
+            send_body_without_waiting_for_header_response: true,
+        });
+        processor
+            .process_response_headers(&mut ctx, &all_headers_with_case(SCENARIO_PROTOCOL_CONFIG))
+            .await
+            .expect("protocol config scenario should continue");
+        assert_eq!(
+            recorder.lock().unwrap().get("resp_headers"),
+            Some(&ProtocolConfig {
+                request_body_mode: BodySendMode::Buffered,
+                response_body_mode: BodySendMode::Streamed,
+                send_body_without_waiting_for_header_response: true,
+            })
+        );
     }
 
     #[tokio::test]

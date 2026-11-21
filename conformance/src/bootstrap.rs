@@ -17,6 +17,7 @@ const UPSTREAM_SECONDARY_CLUSTER: &str = "upstream_secondary";
 const OBSERVABILITY_FILTER_NAME: &str = "envoy.filters.http.ext_proc.observability";
 const EXTPROC_MODE_OVERRIDE_FILTER_NAME: &str = "extproc_mode_override";
 const EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME: &str = "extproc_mode_override_allowlist";
+const EXTPROC_SEND_BODY_NO_WAIT_FILTER_NAME: &str = "extproc_send_body_no_wait";
 
 const OBSERVED_HEADER_SEND: &str = "SEND";
 const OBSERVED_HEADER_SKIP: &str = "SKIP";
@@ -100,6 +101,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &default_mode,
         false,
         None,
+        false,
     );
 
     let default_cluster = cluster_json(
@@ -144,6 +146,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &default_mode,
         false,
         None,
+        false,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.short_timeout_fail_open",
@@ -155,6 +158,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &default_mode,
         false,
         None,
+        false,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.abort",
@@ -166,6 +170,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &default_mode,
         false,
         None,
+        false,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.chain_first",
@@ -177,6 +182,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &default_mode,
         false,
         None,
+        false,
     ));
     http_filters.push(ext_proc_filter_json(
         "envoy.filters.http.ext_proc.chain_second",
@@ -188,6 +194,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &default_mode,
         false,
         None,
+        false,
     ));
     http_filters.push(ext_proc_filter_json(
         OBSERVABILITY_FILTER_NAME,
@@ -206,6 +213,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         ),
         false,
         None,
+        false,
     ));
     http_filters.push(ext_proc_filter_json(
         EXTPROC_MODE_OVERRIDE_FILTER_NAME,
@@ -217,6 +225,7 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &none_processing_mode_json(),
         true,
         None,
+        false,
     ));
     let mode_override_allowed_modes = vec![json!({
         "response_header_mode": OBSERVED_HEADER_SEND,
@@ -235,6 +244,26 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         &none_processing_mode_json(),
         true,
         Some(&mode_override_allowed_modes),
+        false,
+    ));
+    http_filters.push(ext_proc_filter_json(
+        EXTPROC_SEND_BODY_NO_WAIT_FILTER_NAME,
+        DEFAULT_EXT_PROC_CLUSTER,
+        false,
+        5000,
+        false,
+        true,
+        &processing_mode_json(
+            OBSERVED_HEADER_SEND,
+            OBSERVED_HEADER_SEND,
+            OBSERVED_BODY_STREAMED,
+            OBSERVED_BODY_STREAMED,
+            OBSERVED_HEADER_SEND,
+            OBSERVED_HEADER_SEND,
+        ),
+        false,
+        None,
+        true,
     ));
     http_filters.push(json!({
         "name": ROUTER_FILTER_NAME,
@@ -327,6 +356,7 @@ fn ext_proc_filter_json(
     mode: &Value,
     allow_mode_override: bool,
     allowed_override_modes: Option<&Vec<Value>>,
+    send_body_without_waiting_for_header_response: bool,
 ) -> Value {
     let seconds = message_timeout_ms / 1000;
     let nanos = (message_timeout_ms % 1000) * 1_000_000;
@@ -354,6 +384,8 @@ fn ext_proc_filter_json(
     if disabled {
         filter["disabled"] = json!(true);
     }
+    filter["typed_config"]["send_body_without_waiting_for_header_response"] =
+        json!(send_body_without_waiting_for_header_response);
     filter["typed_config"]["allow_mode_override"] = json!(allow_mode_override);
     if let Some(modes) = allowed_override_modes {
         filter["typed_config"]["allowed_override_modes"] = Value::Array(modes.clone());
@@ -639,6 +671,108 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
             )],
             UPSTREAM_PRIMARY_CLUSTER,
         ),
+        profile_route_json(
+            "/profile/mode-override-resp-buffered",
+            &[(
+                EXTPROC_MODE_OVERRIDE_FILTER_NAME,
+                &processing_mode_json(
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_BODY_NONE,
+                    OBSERVED_BODY_BUFFERED,
+                    OBSERVED_HEADER_SKIP,
+                    OBSERVED_HEADER_SKIP,
+                ),
+                None,
+            )],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        profile_route_json(
+            "/profile/send-body-without-waiting",
+            &[(
+                EXTPROC_SEND_BODY_NO_WAIT_FILTER_NAME,
+                &processing_mode_json(
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_BODY_STREAMED,
+                    OBSERVED_BODY_STREAMED,
+                    OBSERVED_HEADER_SEND,
+                    OBSERVED_HEADER_SEND,
+                ),
+                None,
+            )],
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/none/protocol-config",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_NONE,
+                OBSERVED_BODY_NONE,
+                OBSERVED_HEADER_SKIP,
+                OBSERVED_HEADER_SKIP,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/buffered/protocol-config",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_BUFFERED,
+                OBSERVED_BODY_BUFFERED,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/streamed/protocol-config",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_STREAMED,
+                OBSERVED_BODY_STREAMED,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/buffered-partial/protocol-config",
+            &processing_mode_json(
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_BUFFERED_PARTIAL,
+                OBSERVED_BODY_BUFFERED_PARTIAL,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_HEADER_SEND,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
+        route_json(
+            "/mode/skip-req-headers/protocol-config",
+            &processing_mode_json(
+                OBSERVED_HEADER_SKIP,
+                OBSERVED_HEADER_SEND,
+                OBSERVED_BODY_NONE,
+                OBSERVED_BODY_BUFFERED,
+                OBSERVED_HEADER_SKIP,
+                OBSERVED_HEADER_SKIP,
+            ),
+            Some(false),
+            false,
+            UPSTREAM_PRIMARY_CLUSTER,
+        ),
         json!({
             "match": {
                 "prefix": "/",
@@ -835,7 +969,7 @@ mod tests {
             .get("http_filters")
             .and_then(|f| f.as_array())
             .expect("http_filters");
-        assert_eq!(filters.len(), 10);
+        assert_eq!(filters.len(), 11);
         assert!(filters
             .iter()
             .find(|f| f.get("name").and_then(|n| n.as_str())
