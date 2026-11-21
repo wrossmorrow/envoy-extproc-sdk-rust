@@ -105,7 +105,7 @@ impl ConformanceProcessor {
     }
 
     /// Look up the handler registered under `id`.
-    fn lookup_by_id(&self, id: &str) -> Option<Arc<dyn CaseHandler>> {
+    pub(crate) fn lookup_by_id(&self, id: &str) -> Option<Arc<dyn CaseHandler>> {
         if id.is_empty() {
             return None;
         }

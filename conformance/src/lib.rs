@@ -14,6 +14,7 @@ pub mod envoy_versions;
 pub mod features;
 pub mod processor;
 pub mod report;
+pub mod scenarios;
 pub mod upstream;
 
 pub use bootstrap::{build_bootstrap, build_bootstrap_json, BootstrapParams};
@@ -22,9 +23,11 @@ pub use envoy_versions::{
     load_envoy_versions, resolve_envoy_version, sync_envoy_versions_from_eol, EnvoyVersionManifest,
 };
 pub use features::{load_features_manifest, FeatureSpec, FeatureStatus, FeaturesManifest};
+pub use processor::{CaseHandler, ConformanceProcessor};
 pub use report::{
     build_summary_report, load_results_dir, render_markdown_table, render_step_summary,
     update_conformance_doc, validate_strict, CellStatus, CellSummary, FeatureSummary,
     SummaryReport, TestOutcome, VersionResult, VersionTestRun,
 };
+pub use scenarios::{register_scenario_handlers, scenario_handler, scenario_handlers};
 pub use upstream::{UpstreamEcho, UpstreamServer};
