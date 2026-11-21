@@ -10,7 +10,9 @@
 
 pub mod envoy_versions;
 pub mod features;
+pub mod processor;
 pub mod report;
+pub mod upstream;
 
 pub use envoy_versions::{
     load_envoy_versions, resolve_envoy_version, sync_envoy_versions_from_eol, EnvoyVersionManifest,
@@ -21,3 +23,4 @@ pub use report::{
     update_conformance_doc, validate_strict, CellStatus, CellSummary, FeatureSummary,
     SummaryReport, TestOutcome, VersionResult, VersionTestRun,
 };
+pub use upstream::{UpstreamEcho, UpstreamServer};

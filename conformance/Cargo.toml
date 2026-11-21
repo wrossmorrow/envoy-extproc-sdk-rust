@@ -25,10 +25,12 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["server", "transport", "codegen"] }
 prost = "0.14"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "server-auto", "http1", "http2", "tokio", "service"] }
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
+futures-util = "0.3"
 async-trait = "0.1"
 prometheus = "0.14"
 tracing = "0.1"
