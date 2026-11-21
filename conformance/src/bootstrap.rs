@@ -207,12 +207,6 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         false,
         None,
     ));
-    http_filters.push(json!({
-        "name": ROUTER_FILTER_NAME,
-        "typed_config": {
-            "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
-        },
-    }));
     http_filters.push(ext_proc_filter_json(
         EXTPROC_MODE_OVERRIDE_FILTER_NAME,
         DEFAULT_EXT_PROC_CLUSTER,
@@ -242,6 +236,12 @@ pub fn build_bootstrap(params: &BootstrapParams) -> Result<Value, Error> {
         true,
         Some(&mode_override_allowed_modes),
     ));
+    http_filters.push(json!({
+        "name": ROUTER_FILTER_NAME,
+        "typed_config": {
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
+        },
+    }));
 
     let hcm = http_connection_manager_json(&default_mode, &http_filters);
 
@@ -622,13 +622,21 @@ fn http_connection_manager_json(mode: &Value, http_filters: &[Value]) -> Value {
             UPSTREAM_PRIMARY_CLUSTER,
         ),
         profile_route_json(
-            "/profile/mode-override",
-            &[(EXTPROC_MODE_OVERRIDE_FILTER_NAME, &none_processing_mode_json(), None)],
+            "/profile/mode-override-allowlist",
+            &[(
+                EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME,
+                &none_processing_mode_json(),
+                None,
+            )],
             UPSTREAM_PRIMARY_CLUSTER,
         ),
         profile_route_json(
-            "/profile/mode-override-allowlist",
-            &[(EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME, &none_processing_mode_json(), None)],
+            "/profile/mode-override",
+            &[(
+                EXTPROC_MODE_OVERRIDE_FILTER_NAME,
+                &none_processing_mode_json(),
+                None,
+            )],
             UPSTREAM_PRIMARY_CLUSTER,
         ),
         json!({
@@ -830,7 +838,8 @@ mod tests {
         assert_eq!(filters.len(), 10);
         assert!(filters
             .iter()
-            .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(EXTPROC_MODE_OVERRIDE_FILTER_NAME))
+            .find(|f| f.get("name").and_then(|n| n.as_str())
+                == Some(EXTPROC_MODE_OVERRIDE_FILTER_NAME))
             .expect("mode override filter")
             .get("typed_config")
             .and_then(|t| t.get("allow_mode_override"))
@@ -839,7 +848,8 @@ mod tests {
         assert_eq!(
             filters
                 .iter()
-                .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME))
+                .find(|f| f.get("name").and_then(|n| n.as_str())
+                    == Some(EXTPROC_MODE_OVERRIDE_ALLOWLIST_FILTER_NAME))
                 .expect("mode override allowlist filter")
                 .get("typed_config")
                 .and_then(|t| t.get("allowed_override_modes"))

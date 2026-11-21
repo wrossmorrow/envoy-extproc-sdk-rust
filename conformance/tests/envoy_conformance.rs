@@ -14,11 +14,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use envoy_conformance::{
-    check_docker_available, mode_override_allowlist_denied_handler, mode_override_allowlist_ok_handler,
-    mode_override_disabled_handler, mode_override_full_resp_handler, mode_override_handler,
-    mode_override_resp_stream_handler, mode_override_skip_handler, register_scenario_handlers,
-    start_conformance_extproc_server, start_envoy_runner, upstream_host_for_runner, CaseHandler,
-    ConformanceExtProcServer, ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
+    check_docker_available, mode_override_allowlist_denied_handler,
+    mode_override_allowlist_ok_handler, mode_override_disabled_handler,
+    mode_override_full_resp_handler, mode_override_handler, mode_override_resp_stream_handler,
+    mode_override_skip_handler, register_scenario_handlers, start_conformance_extproc_server,
+    start_envoy_runner, upstream_host_for_runner, CaseHandler, ConformanceExtProcServer,
+    ConformanceProcessor, EnvoyConfig, EnvoyRunner, UpstreamEcho, UpstreamServer,
 };
 use envoy_extproc_sdk::{
     AllHeaders, Error, HeaderValue, ProcessingOptions, RequestContext, RequestPhase,
@@ -1122,8 +1123,7 @@ fn mode_override() {
         // then replace the bodies and trailers.
         {
             let case_id = "mode-override-full-req";
-            h.default_proc
-                .register(case_id, mode_override_handler());
+            h.default_proc.register(case_id, mode_override_handler());
             let body = chunked_body_with_trailers(
                 vec![b"raw-req".to_vec()],
                 vec![("x-req-tr", "orig-req")],
@@ -1135,7 +1135,9 @@ fn mode_override() {
                 "/profile/mode-override/full",
                 &[
                     ("x-conformance-case", case_id),
-                    ("x-upstream-trailer-x-resp-tr", "orig-resp"),
+                    ("x-upstream-resp-trailer", "x-resp-tr=orig-resp"),
+                    ("trailer", "x-req-tr"),
+                    ("te", "trailers"),
                     ("content-type", "application/json"),
                 ],
                 body,
@@ -1145,9 +1147,7 @@ fn mode_override() {
             let echo = decode_echo(&resp.body);
             assert_eq!(echo.body, "mutated-req");
             assert_eq!(
-                resp.trailers
-                    .get("x-resp-tr")
-                    .and_then(|v| v.to_str().ok()),
+                resp.trailers.get("x-resp-tr").and_then(|v| v.to_str().ok()),
                 Some("mutated-resp-tr"),
                 "unexpected response trailers: {:?}",
                 resp.trailers

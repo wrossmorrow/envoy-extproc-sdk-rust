@@ -2,8 +2,8 @@
 //! behavior for the envoy-driven conformance scenarios, and helpers to build
 //! scenario handlers for the cases covered by the feature manifest.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use envoy_extproc_sdk::{
     AllHeaders, BodySendMode, Error, HeaderSendMode, HeaderValue, ModeOverride, RequestContext,
@@ -111,7 +111,11 @@ impl CaseHandler for NoopScenarioHandler {
 struct ModeOverrideFullRespScenarioHandler;
 
 impl CaseHandler for ModeOverrideFullRespScenarioHandler {
-    fn request_headers(&self, ctx: &mut RequestContext, _headers: &AllHeaders) -> Result<(), Error> {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
         ctx.override_mode(ModeOverride {
             response_header_mode: HeaderSendMode::Send,
             request_body_mode: BodySendMode::Buffered,
@@ -137,7 +141,11 @@ impl CaseHandler for ModeOverrideFullRespScenarioHandler {
 struct ModeOverrideScenarioHandler;
 
 impl CaseHandler for ModeOverrideScenarioHandler {
-    fn request_headers(&self, ctx: &mut RequestContext, _headers: &AllHeaders) -> Result<(), Error> {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
         ctx.override_mode(ModeOverride {
             response_header_mode: HeaderSendMode::Send,
             request_body_mode: BodySendMode::Buffered,
@@ -156,7 +164,11 @@ impl CaseHandler for ModeOverrideScenarioHandler {
         ctx.continue_request()
     }
 
-    fn request_trailers(&self, ctx: &mut RequestContext, trailers: &AllHeaders) -> Result<(), Error> {
+    fn request_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        trailers: &AllHeaders,
+    ) -> Result<(), Error> {
         let got = trailers
             .get("x-req-tr")
             .ok_or_else(|| "missing x-req-tr trailer".to_string())?;
@@ -173,11 +185,19 @@ impl CaseHandler for ModeOverrideScenarioHandler {
         ctx.continue_request()
     }
 
-    fn response_headers(&self, ctx: &mut RequestContext, _headers: &AllHeaders) -> Result<(), Error> {
+    fn response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
         ctx.continue_request()
     }
 
-    fn response_trailers(&self, ctx: &mut RequestContext, trailers: &AllHeaders) -> Result<(), Error> {
+    fn response_trailers(
+        &self,
+        ctx: &mut RequestContext,
+        trailers: &AllHeaders,
+    ) -> Result<(), Error> {
         let got = trailers
             .get("x-resp-tr")
             .ok_or_else(|| "missing x-resp-tr trailer".to_string())?;
@@ -213,10 +233,13 @@ impl CaseHandler for ModeOverrideSkipScenarioHandler {
         ctx: &mut RequestContext,
         _headers: &AllHeaders,
     ) -> Result<(), Error> {
-        ctx.add_header("x-fast-path", &HeaderValue {
-            value: String::new(),
-            raw_value: Some(b"yes".to_vec()),
-        })?;
+        ctx.add_header(
+            "x-fast-path",
+            &HeaderValue {
+                value: String::new(),
+                raw_value: Some(b"yes".to_vec()),
+            },
+        )?;
         ctx.skip_remaining_phases()
     }
 }
@@ -261,7 +284,11 @@ impl CaseHandler for ModeOverrideRespStreamScenarioHandler {
 struct ModeOverrideDisabledScenarioHandler;
 
 impl CaseHandler for ModeOverrideDisabledScenarioHandler {
-    fn request_headers(&self, ctx: &mut RequestContext, _headers: &AllHeaders) -> Result<(), Error> {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
         ctx.override_mode(ModeOverride {
             response_header_mode: HeaderSendMode::Send,
             request_body_mode: BodySendMode::Buffered,
@@ -280,7 +307,11 @@ struct ModeOverrideAllowlistOkScenarioHandler {
 }
 
 impl CaseHandler for ModeOverrideAllowlistOkScenarioHandler {
-    fn request_headers(&self, ctx: &mut RequestContext, _headers: &AllHeaders) -> Result<(), Error> {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
         ctx.override_mode(ModeOverride {
             response_header_mode: HeaderSendMode::Send,
             request_body_mode: BodySendMode::Streamed,
@@ -292,7 +323,8 @@ impl CaseHandler for ModeOverrideAllowlistOkScenarioHandler {
     }
 
     fn request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
-        self.saw_body.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.saw_body
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         ctx.continue_request()
     }
 }
@@ -305,7 +337,11 @@ struct ModeOverrideAllowlistDeniedScenarioHandler {
 }
 
 impl CaseHandler for ModeOverrideAllowlistDeniedScenarioHandler {
-    fn request_headers(&self, ctx: &mut RequestContext, _headers: &AllHeaders) -> Result<(), Error> {
+    fn request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &AllHeaders,
+    ) -> Result<(), Error> {
         ctx.override_mode(ModeOverride {
             response_header_mode: HeaderSendMode::Send,
             request_body_mode: BodySendMode::Buffered,
@@ -317,7 +353,8 @@ impl CaseHandler for ModeOverrideAllowlistDeniedScenarioHandler {
     }
 
     fn request_body(&self, ctx: &mut RequestContext, _body: &[u8]) -> Result<(), Error> {
-        self.saw_body.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.saw_body
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         ctx.continue_request()
     }
 }
@@ -342,10 +379,7 @@ pub fn scenario_handlers() -> Vec<(String, Arc<dyn CaseHandler>)> {
             SCENARIO_POST_WITH_BODY_MODE_NONE.to_string(),
             post_with_body_mode_none_handler(),
         ),
-        (
-            SCENARIO_MODE_OVERRIDE.to_string(),
-            mode_override_handler(),
-        ),
+        (SCENARIO_MODE_OVERRIDE.to_string(), mode_override_handler()),
         (
             "mode-override-full-resp".to_string(),
             mode_override_full_resp_handler(),
@@ -396,11 +430,15 @@ pub fn mode_override_disabled_handler() -> Arc<dyn CaseHandler> {
     Arc::new(ModeOverrideDisabledScenarioHandler)
 }
 
-pub fn mode_override_allowlist_ok_handler(saw_body: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn CaseHandler> {
+pub fn mode_override_allowlist_ok_handler(
+    saw_body: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<dyn CaseHandler> {
     Arc::new(ModeOverrideAllowlistOkScenarioHandler { saw_body })
 }
 
-pub fn mode_override_allowlist_denied_handler(saw_body: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn CaseHandler> {
+pub fn mode_override_allowlist_denied_handler(
+    saw_body: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<dyn CaseHandler> {
     Arc::new(ModeOverrideAllowlistDeniedScenarioHandler { saw_body })
 }
 
@@ -543,10 +581,17 @@ mod tests {
         });
         let _ = ctx.set_value(SCENARIO_MODE_OVERRIDE_SKIP.to_string());
         processor
-            .process_request_headers(&mut ctx, &all_headers_with_case(SCENARIO_MODE_OVERRIDE_SKIP))
+            .process_request_headers(
+                &mut ctx,
+                &all_headers_with_case(SCENARIO_MODE_OVERRIDE_SKIP),
+            )
             .await
             .expect("mode override skip scenario should continue");
-        let mo = ctx.response.mode_override.as_ref().expect("expected skip override");
+        let mo = ctx
+            .response
+            .mode_override
+            .as_ref()
+            .expect("expected skip override");
         assert_eq!(mo.response_header_mode, i32::from(HeaderSendMode::Skip));
         assert_eq!(mo.request_body_mode, i32::from(BodySendMode::None));
         assert_eq!(mo.response_body_mode, i32::from(BodySendMode::None));
@@ -557,17 +602,30 @@ mod tests {
     #[tokio::test]
     async fn mode_override_disabled_scenario_sets_override() {
         let processor = processor();
-        processor.register(SCENARIO_MODE_OVERRIDE_DISABLED, mode_override_disabled_handler());
+        processor.register(
+            SCENARIO_MODE_OVERRIDE_DISABLED,
+            mode_override_disabled_handler(),
+        );
 
         let mut ctx = RequestContext::new();
         set_phase(&mut ctx, RequestPhase::RequestHeaders);
         let _ = ctx.set_value(SCENARIO_MODE_OVERRIDE_DISABLED.to_string());
         processor
-            .process_request_headers(&mut ctx, &all_headers_with_case(SCENARIO_MODE_OVERRIDE_DISABLED))
+            .process_request_headers(
+                &mut ctx,
+                &all_headers_with_case(SCENARIO_MODE_OVERRIDE_DISABLED),
+            )
             .await
             .expect("mode override disabled scenario should continue");
         assert!(ctx.response.mode_override.is_some());
-        assert_eq!(ctx.response.mode_override.as_ref().unwrap().request_body_mode, i32::from(BodySendMode::Buffered));
+        assert_eq!(
+            ctx.response
+                .mode_override
+                .as_ref()
+                .unwrap()
+                .request_body_mode,
+            i32::from(BodySendMode::Buffered)
+        );
     }
 
     #[tokio::test]
@@ -586,7 +644,10 @@ mod tests {
         set_phase(&mut ctx, RequestPhase::RequestHeaders);
         let _ = ctx.set_value(SCENARIO_MODE_OVERRIDE_ALLOWLIST_OK.to_string());
         processor
-            .process_request_headers(&mut ctx, &all_headers_with_case(SCENARIO_MODE_OVERRIDE_ALLOWLIST_OK))
+            .process_request_headers(
+                &mut ctx,
+                &all_headers_with_case(SCENARIO_MODE_OVERRIDE_ALLOWLIST_OK),
+            )
             .await
             .expect("mode override allowlist ok scenario should continue");
         assert_eq!(
@@ -602,7 +663,10 @@ mod tests {
         set_phase(&mut ctx, RequestPhase::RequestHeaders);
         let _ = ctx.set_value(SCENARIO_MODE_OVERRIDE_ALLOWLIST_DENIED.to_string());
         processor
-            .process_request_headers(&mut ctx, &all_headers_with_case(SCENARIO_MODE_OVERRIDE_ALLOWLIST_DENIED))
+            .process_request_headers(
+                &mut ctx,
+                &all_headers_with_case(SCENARIO_MODE_OVERRIDE_ALLOWLIST_DENIED),
+            )
             .await
             .expect("mode override allowlist denied scenario should continue");
         assert_eq!(
