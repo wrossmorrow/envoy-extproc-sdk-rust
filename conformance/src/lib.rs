@@ -22,7 +22,8 @@ pub use envoy_runner::{
     check_docker_available, start_envoy_runner, upstream_host_for_runner, EnvoyConfig, EnvoyRunner,
 };
 pub use envoy_versions::{
-    load_envoy_versions, resolve_envoy_version, sync_envoy_versions_from_eol, EnvoyVersionManifest,
+    load_envoy_versions, resolve_envoy_version, sync_compose_yaml, sync_conformance_doc,
+    sync_envoy_versions_from_eol, sync_justfile, EnvoyVersionManifest,
 };
 pub use features::{load_features_manifest, FeatureSpec, FeatureStatus, FeaturesManifest};
 pub use processor::{
