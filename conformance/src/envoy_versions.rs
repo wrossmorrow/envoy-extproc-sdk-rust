@@ -179,6 +179,140 @@ pub fn sync_envoy_versions_from_eol(
     })
 }
 
+fn strip_latest_suffix(tag: &str) -> &str {
+    tag.strip_suffix("-latest").unwrap_or(tag)
+}
+
+fn replace_between(text: &str, prefix: &str, suffix: &str, replacement_value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(prefix) {
+        let after_prefix = &rest[start + prefix.len()..];
+        let line_end = after_prefix
+            .find(['\n', '\r'])
+            .unwrap_or(after_prefix.len());
+        if let Some(rel_end) = after_prefix[..line_end].find(suffix) {
+            out.push_str(&rest[..start + prefix.len()]);
+            out.push_str(replacement_value);
+            out.push_str(suffix);
+            rest = &after_prefix[rel_end + suffix.len()..];
+        } else {
+            out.push_str(&rest[..start + prefix.len()]);
+            rest = after_prefix;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn replace_until_eol(text: &str, prefix: &str, replacement_value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(prefix) {
+        let after_prefix = &rest[start + prefix.len()..];
+        let line_end = after_prefix
+            .find(['\n', '\r'])
+            .unwrap_or(after_prefix.len());
+        out.push_str(&rest[..start + prefix.len()]);
+        out.push_str(replacement_value);
+        rest = &after_prefix[line_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_minor_cycle(s: &str) -> bool {
+    let Some((maj, min)) = s.strip_prefix('v').and_then(|v| v.split_once('.')) else {
+        return false;
+    };
+    !maj.is_empty()
+        && !min.is_empty()
+        && maj.bytes().all(|b| b.is_ascii_digit())
+        && min.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn sync_matrix_range(text: &str, first_cycle: &str, last_cycle: &str) -> String {
+    const START_MARKER: &str = "| `";
+    const MID_MARKER: &str = "` \u{2013} `";
+    const END_MARKER: &str = "` + `dev` |";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(START_MARKER) {
+        let after_start = &rest[start + START_MARKER.len()..];
+        let line_end = after_start.find(['\n', '\r']).unwrap_or(after_start.len());
+        let line_slice = &after_start[..line_end];
+        if let Some(end_rel) = line_slice.find(END_MARKER) {
+            let between = &line_slice[..end_rel];
+            if let Some((first, second)) = between.split_once(MID_MARKER) {
+                if is_minor_cycle(first) && is_minor_cycle(second) {
+                    out.push_str(&rest[..start]);
+                    out.push_str(&format!(
+                        "| `{first_cycle}` \u{2013} `{last_cycle}` + `dev` |"
+                    ));
+                    rest = &after_start[end_rel + END_MARKER.len()..];
+                    continue;
+                }
+            }
+        }
+        out.push_str(&rest[..start + START_MARKER.len()]);
+        rest = after_start;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Update `compose.yaml` default `ENVOY_VERSION` image tags to match `manifest.default`.
+pub fn sync_compose_yaml(content: &str, manifest: &EnvoyVersionManifest) -> String {
+    let default = manifest.default.trim();
+    if default.is_empty() {
+        return content.to_string();
+    }
+    replace_between(content, "envoyproxy/envoy:${ENVOY_VERSION:-", "}", default)
+}
+
+/// Update `CONFORMANCE.md` default Envoy tag, integration/conformance examples,
+/// and supported minor-release range to match `manifest`.
+pub fn sync_conformance_doc(content: &str, manifest: &EnvoyVersionManifest) -> String {
+    let mut updated = content.to_string();
+    let default = manifest.default.trim();
+    if !default.is_empty() {
+        updated = replace_between(&updated, "envoyproxy/envoy:${ENVOY_VERSION:-", "}", default);
+        updated = replace_between(&updated, "defaults to `ENVOY_VERSION=", "`", default);
+        updated = replace_between(
+            &updated,
+            "ENVOY_VERSION=",
+            " just integration-test",
+            default,
+        );
+        updated = replace_until_eol(&updated, "just conformance-version ", default);
+    }
+    if let (Some(first), Some(last)) = (manifest.supported.first(), manifest.supported.last()) {
+        updated = sync_matrix_range(
+            &updated,
+            strip_latest_suffix(first),
+            strip_latest_suffix(last),
+        );
+    }
+    updated
+}
+
+/// Update `Justfile` `conformance-version` default argument and example comment
+/// to match `manifest.default`.
+pub fn sync_justfile(content: &str, manifest: &EnvoyVersionManifest) -> String {
+    let default = manifest.default.trim();
+    if default.is_empty() {
+        return content.to_string();
+    }
+    let updated = replace_between(
+        content,
+        "conformance-version envoy_version=\"",
+        "\"",
+        default,
+    );
+    replace_between(&updated, "specific Envoy image tag (e.g. ", ")", default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +366,132 @@ mod tests {
         assert_eq!(got.supported, want_supported);
         assert_eq!(got.default, "v1.40-latest");
         assert_eq!(got.canary, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn test_compose_docs_and_justfile_match_default_envoy_version() {
+        let manifest = EnvoyVersionManifest::load().expect("load envoy-versions.json");
+        let default_version = manifest.default.as_str();
+        assert!(!default_version.is_empty());
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("conformance parent should be repo root");
+
+        let expected_image = format!("envoyproxy/envoy:${{ENVOY_VERSION:-{default_version}}}");
+        for rel in ["examples/compose.yaml", "tests/compose.yaml"] {
+            let compose = std::fs::read_to_string(repo_root.join(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            assert!(
+                compose.contains(&expected_image),
+                "{rel} missing {expected_image}"
+            );
+        }
+
+        let conformance_doc =
+            std::fs::read_to_string(repo_root.join("CONFORMANCE.md")).expect("read CONFORMANCE.md");
+        assert!(
+            conformance_doc.contains(&expected_image),
+            "CONFORMANCE.md missing {expected_image}"
+        );
+        assert!(
+            conformance_doc.contains(&format!("defaults to `ENVOY_VERSION={default_version}`")),
+            "CONFORMANCE.md default ENVOY_VERSION prose out of sync"
+        );
+        assert!(
+            conformance_doc.contains(&format!(
+                "ENVOY_VERSION={default_version} just integration-test"
+            )),
+            "CONFORMANCE.md ENVOY_VERSION example out of sync"
+        );
+        assert!(
+            conformance_doc.contains(&format!("just conformance-version {default_version}")),
+            "CONFORMANCE.md conformance-version example out of sync"
+        );
+        let first_cycle = strip_latest_suffix(
+            manifest
+                .supported
+                .first()
+                .expect("supported should not be empty"),
+        );
+        let last_cycle = strip_latest_suffix(
+            manifest
+                .supported
+                .last()
+                .expect("supported should not be empty"),
+        );
+        let expected_range = format!("| `{first_cycle}` \u{2013} `{last_cycle}` + `dev` |");
+        assert!(
+            conformance_doc.contains(&expected_range),
+            "CONFORMANCE.md missing supported range {expected_range}"
+        );
+
+        let justfile = std::fs::read_to_string(repo_root.join("Justfile")).expect("read Justfile");
+        assert!(
+            justfile.contains(&format!(
+                "conformance-version envoy_version=\"{default_version}\""
+            )),
+            "Justfile conformance-version default out of sync"
+        );
+    }
+
+    #[test]
+    fn test_sync_helpers_rewrite_compose_docs_and_justfile() {
+        let manifest = EnvoyVersionManifest {
+            default: "v1.40-latest".to_string(),
+            supported: vec![
+                "v1.37-latest".to_string(),
+                "v1.38-latest".to_string(),
+                "v1.39-latest".to_string(),
+                "v1.40-latest".to_string(),
+            ],
+            canary: vec!["dev".to_string()],
+        };
+
+        let old_compose = "  envoy:\n    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.26-latest}\n";
+        let updated_compose = sync_compose_yaml(old_compose, &manifest);
+        assert_eq!(
+            updated_compose,
+            "  envoy:\n    image: envoyproxy/envoy:${ENVOY_VERSION:-v1.40-latest}\n"
+        );
+        assert_eq!(
+            sync_compose_yaml(&updated_compose, &manifest),
+            updated_compose
+        );
+
+        let old_doc = concat!(
+            "| Routine CI & Examples Envoy | `envoyproxy/envoy:${ENVOY_VERSION:-v1.26-latest}` | note |\n",
+            "| Multi-Version Matrix | `v1.35` \u{2013} `v1.38` + `dev` | notes |\n",
+            "Run (defaults to `ENVOY_VERSION=v1.26-latest`):\n",
+            "ENVOY_VERSION=v1.26-latest just integration-test\n",
+            "just conformance-version v1.26-latest\n",
+        );
+        let updated_doc = sync_conformance_doc(old_doc, &manifest);
+        assert_eq!(
+            updated_doc,
+            concat!(
+                "| Routine CI & Examples Envoy | `envoyproxy/envoy:${ENVOY_VERSION:-v1.40-latest}` | note |\n",
+                "| Multi-Version Matrix | `v1.37` \u{2013} `v1.40` + `dev` | notes |\n",
+                "Run (defaults to `ENVOY_VERSION=v1.40-latest`):\n",
+                "ENVOY_VERSION=v1.40-latest just integration-test\n",
+                "just conformance-version v1.40-latest\n",
+            )
+        );
+        assert_eq!(sync_conformance_doc(&updated_doc, &manifest), updated_doc);
+
+        let old_just = concat!(
+            "# Run the Envoy conformance suite against a specific Envoy image tag (e.g. v1.26-latest).\n",
+            "conformance-version envoy_version=\"v1.26-latest\" *flags=\"-v\":\n",
+        );
+        let updated_just = sync_justfile(old_just, &manifest);
+        assert_eq!(
+            updated_just,
+            concat!(
+                "# Run the Envoy conformance suite against a specific Envoy image tag (e.g. v1.40-latest).\n",
+                "conformance-version envoy_version=\"v1.40-latest\" *flags=\"-v\":\n",
+            )
+        );
+        assert_eq!(sync_justfile(&updated_just, &manifest), updated_just);
     }
 }
 

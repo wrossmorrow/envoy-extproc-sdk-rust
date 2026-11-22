@@ -15,7 +15,7 @@ Verification in this repository is intentionally split into two tiers:
 | :--- | :--- | :--- |
 | Rust Toolchain (`rust-version`) | `1.90` | Minimum supported Rust version in [Cargo.toml](Cargo.toml) |
 | `envoy-types` crate | `0.7.7` | Compile-time `ext_proc` v3 protobuf definitions |
-| Routine CI Envoy (`tests/compose.yaml`) | `v1.40-latest` | Default tag in [tests/compose.yaml](tests/compose.yaml); override with `ENVOY_VERSION` |
+| Routine CI & Examples Envoy ([tests/compose.yaml](tests/compose.yaml), [examples/compose.yaml](examples/compose.yaml)) | `envoyproxy/envoy:${ENVOY_VERSION:-v1.40-latest}` | Default tag in [tests/compose.yaml](tests/compose.yaml) and [examples/compose.yaml](examples/compose.yaml), synced with `default` in [conformance/envoy-versions.json](conformance/envoy-versions.json); override with `ENVOY_VERSION` |
 | Multi-Version Matrix ([conformance/envoy-versions.json](conformance/envoy-versions.json)) | `v1.37` – `v1.40` + `dev` | Active 12-month supported Envoy minor releases plus `dev` canary |
 
 > [!NOTE]

@@ -1,8 +1,14 @@
 //! `conformance sync-versions` command: sync the supported Envoy version
 //! manifest from the endoflife.date API.
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::process::Command;
 use std::time::SystemTime;
+
+use envoy_conformance::{
+    sync_compose_yaml, sync_conformance_doc, sync_justfile, EnvoyVersionManifest,
+};
 
 const DEFAULT_EOL_URL: &str = "https://endoflife.date/api/envoy.json";
 
@@ -75,5 +81,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "synced {}: default={} supported={:?} canary={:?}",
         write_path, manifest.default, manifest.supported, manifest.canary
     );
+
+    if let Ok(manifest_path) = std::fs::canonicalize(&write_path) {
+        if let Some(manifest_dir) = manifest_path.parent() {
+            if manifest_dir.file_name() == Some(OsStr::new("conformance")) {
+                if let Some(repo_root) = manifest_dir.parent() {
+                    sync_repo_files(repo_root, &manifest)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+type SyncFn = fn(&str, &EnvoyVersionManifest) -> String;
+
+fn sync_repo_files(repo_root: &Path, manifest: &EnvoyVersionManifest) -> Result<(), String> {
+    let targets: [(&str, SyncFn); 4] = [
+        ("examples/compose.yaml", sync_compose_yaml),
+        ("tests/compose.yaml", sync_compose_yaml),
+        ("CONFORMANCE.md", sync_conformance_doc),
+        ("Justfile", sync_justfile),
+    ];
+    for (rel_path, sync_fn) in targets {
+        let path = repo_root.join(rel_path);
+        if !path.exists() {
+            continue;
+        }
+        let original =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {rel_path}: {e}"))?;
+        let updated = sync_fn(&original, manifest);
+        if updated != original {
+            std::fs::write(&path, updated).map_err(|e| format!("write {rel_path}: {e}"))?;
+            println!("updated {rel_path}");
+        }
+    }
     Ok(())
 }

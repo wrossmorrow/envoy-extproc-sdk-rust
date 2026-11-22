@@ -120,7 +120,7 @@ conformance *flags="-v":
     cargo test --manifest-path conformance/Cargo.toml {{flags}}
 
 # Run the Envoy conformance suite against a specific Envoy image tag (e.g. v1.40-latest).
-conformance-version envoy_version *flags="-v":
+conformance-version envoy_version="v1.40-latest" *flags="-v":
     ENVOY_VERSION={{envoy_version}} cargo test --manifest-path conformance/Cargo.toml {{flags}}
 
 # Run the Envoy conformance suite sequentially across every supported Envoy version in conformance/envoy-versions.json.
