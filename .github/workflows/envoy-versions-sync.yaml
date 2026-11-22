@@ -18,7 +18,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Sync envoy-versions.json
         working-directory: conformance
-        run: cargo run --manifest-path conformance/Cargo.toml --bin sync-versions -- --write envoy-versions.json
+        run: cargo run --manifest-path Cargo.toml --bin sync-versions -- --write envoy-versions.json
       - name: Create pull request
         uses: peter-evans/create-pull-request@v7
         with:

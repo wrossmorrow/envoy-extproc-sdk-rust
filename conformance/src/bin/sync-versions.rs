@@ -1,66 +1,30 @@
 //! `conformance sync-versions` command: sync the supported Envoy version
 //! manifest from the endoflife.date API.
 
+use std::process::Command;
 use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DEFAULT_EOL_URL: &str = "https://endoflife.date/api/envoy.json";
 
-async fn fetch_eol_json(url: &str) -> Result<String, String> {
-    // Minimal HTTP/1.1 GET over a TCP stream; no extra HTTP client dependency.
-    let authority = url
-        .split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("endoflife.date")
-        .to_string();
-    let path = if url.contains('/') {
-        url.split("://").nth(1).unwrap_or(url).to_string()
-    } else {
-        "/api/envoy.json".to_string()
-    };
-    let port = url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split(':').next())
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(443);
-    let addr = format!("{}:{}", authority, port);
-    let host_res = std::net::ToSocketAddrs::to_socket_addrs(&addr)
-        .map_err(|e| format!("resolve {}: {}", addr, e))?
-        .next()
-        .ok_or_else(|| format!("could not resolve {}", addr))?;
-
-    let mut stream = tokio::net::TcpStream::connect((host_res.ip().to_string(), port))
-        .await
-        .map_err(|e| format!("connect {}: {}", addr, e))?;
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: envoy-conformance-sync/0.1\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        path, authority
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|e| format!("write: {}", e))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|e| format!("read: {}", e))?;
-    let text = String::from_utf8_lossy(&response).to_string();
-    let status_line = text
-        .lines()
-        .next()
-        .ok_or_else(|| "empty response".to_string())?;
-    if !status_line.contains(" 200 ") {
-        return Err(format!("GET {} returned {}", path, status_line));
+fn fetch_eol_json(url: &str) -> Result<String, String> {
+    let output = Command::new("curl")
+        .args(["-fsSL", url])
+        .output()
+        .map_err(|e| format!("run curl {url}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "GET {url} failed ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
     }
-    let body_start = text
-        .find("\r\n\r\n")
-        .ok_or_else(|| "malformed response".to_string())?;
-    Ok(text[body_start + 4..].trim().to_string())
+    let body =
+        String::from_utf8(output.stdout).map_err(|e| format!("decode response from {url}: {e}"))?;
+    if body.trim().is_empty() {
+        return Err(format!("empty response from {url}"));
+    }
+    Ok(body)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,21 +56,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let eol_json = if from_file.is_empty() {
-        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("build runtime: {}", e))?;
-        rt.block_on(async { fetch_eol_json(&url).await })
-            .map_err(|e| format!("sync-versions: {}", e))?
+        fetch_eol_json(&url).map_err(|e| format!("sync-versions: {}", e))?
     } else {
         std::fs::read_to_string(&from_file).map_err(|e| format!("read {}: {}", from_file, e))?
     };
 
     let now = SystemTime::now();
-    let canary: Vec<String> = if from_file.is_empty() {
-        envoy_conformance::envoy_versions::EnvoyVersionManifest::load()
-            .map(|m| m.canary)
-            .map_err(|e| format!("sync-versions: {}", e))?
-    } else {
-        Vec::new()
-    };
+    let canary: Vec<String> = envoy_conformance::envoy_versions::EnvoyVersionManifest::load()
+        .map(|m| m.canary)
+        .map_err(|e| format!("sync-versions: {}", e))?;
     let manifest =
         envoy_conformance::envoy_versions::sync_envoy_versions_from_eol(&eol_json, now, &canary)
             .map_err(|e| format!("sync-versions: {}", e))?;
