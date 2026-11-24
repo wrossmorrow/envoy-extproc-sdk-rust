@@ -1,13 +1,13 @@
 sdk:
   - changed-files:
       - any-glob-to-any-file:
-          - '!(*_test).rs'
+          - 'src/**'
 
 tests:
   - changed-files:
       - any-glob-to-any-file:
-          - '*_test.rs'
           - 'tests/**'
+          - 'conformance/tests/**'
           - 'loadtest/**'
 
 conformance:
