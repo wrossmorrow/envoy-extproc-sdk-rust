@@ -27,7 +27,7 @@ jobs:
           docker run --rm -v "$PWD/tests/envoy.yaml:/etc/envoy/envoy.yaml:ro" \
             "envoyproxy/envoy:${default_envoy}" --mode validate -c /etc/envoy/envoy.yaml
       - name: Create pull request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/sync-envoy-versions
           commit-message: "chore(conformance): sync supported Envoy versions"
